@@ -245,12 +245,10 @@ __global__ void update_graph_kernel(
         // Raw Q·K scores have magnitude ~100 (since ||Q||, ||K|| ≈ √d ≈ 11)
         // So score differences among top-k are typically 5-20.
         //
-        // tau = 10.0 gives moderate sharpness:
-        //   scores [120, 115, 110, 105] → softmax ≈ [0.48, 0.29, 0.18, 0.11]
-        // This balances:
-        //   - Sharp enough to prefer high-attention neighbors
-        //   - Random enough to explore alternative paths (find bridges)
-        constexpr float TEMPERATURE = 10.0f;
+        // tau = 0.1 gives extremely sharp walks (nearly deterministic):
+        //   scores [120, 115, 110, 105] → softmax ≈ [1.0, 0.0, 0.0, 0.0]
+        // This is almost greedy selection of the highest-attention neighbor.
+        constexpr float TEMPERATURE = 0.1f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
@@ -346,7 +344,7 @@ __global__ void update_graph_kernel_fp32(
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        constexpr float TEMPERATURE = 10.0f;
+        constexpr float TEMPERATURE = 0.1f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
@@ -463,7 +461,7 @@ __global__ void batched_update_graph_kernel_fp32(
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        constexpr float TEMPERATURE = 10.0f;
+        constexpr float TEMPERATURE = 0.1f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
@@ -858,7 +856,7 @@ __global__ void build_transpose_graph_kernel_fp32(
         int32_t* row = rev_adj_list + key_pos * top_k;
         float* weight_row = rev_adj_weights + key_pos * top_k;
 
-        constexpr float TEMPERATURE = 10.0f;
+        constexpr float TEMPERATURE = 0.1f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
