@@ -36,11 +36,6 @@ class CircuitKVConfig:
     sink_size: int = 4  # CircuitKV absorbing boundary (first N tokens)
     local_window: int = 64  # Local window to always keep
 
-    # Coverage guarantee parameters (for haystack/summarization tasks)
-    # Physics: Like adding capacitors throughout the circuit to ensure signal propagation
-    coverage_window: int = 256  # Check coverage in N-token windows
-    min_coverage: int = 2  # Minimum tokens to keep per coverage window
-
     # Capacitive CircuitKV: State-Space Model Parameters
     # Physics: Tokens are capacitors that accumulate charge over time
     decay: float = 0.95  # EMA decay for charge accumulation (temporal smoothing)
@@ -271,14 +266,7 @@ class CircuitKVMonitor:
         The mask respects:
         1. Attention sinks (always kept - these are the absorbing boundary)
         2. Local window (always kept)
-        3. Coverage guarantee (ensure each region has minimum representation)
-        4. Top tokens by current-flow score (up to budget)
-
-        Physics Rationale for Coverage Guarantee:
-        - The walker flows from Query to Sink, naturally favoring tokens on that path
-        - Middle-document tokens may get low scores even if important for summarization
-        - Coverage guarantee acts like "capacitor probes" throughout the circuit,
-          ensuring signal is captured from all regions, not just the main current path
+        3. Top tokens by current-flow score (up to budget)
 
         Args:
             budget_ratio: Fraction of total tokens to keep (0.0-1.0)
@@ -300,52 +288,12 @@ class CircuitKVMonitor:
         already_kept = keep_mask.sum().item()
         remaining_budget = max(0, budget - already_kept)
 
-        # Coverage guarantee: ensure each region has minimum representation
-        # This helps coverage tasks (summarization, few-shot) without hurting needle tasks
-        coverage_window = self.config.coverage_window
-        min_coverage = self.config.min_coverage
-        middle_start = self.config.sink_size
-        middle_end = local_start
-
-        if remaining_budget > 0 and middle_end > middle_start:
-            for region_start in range(middle_start, middle_end, coverage_window):
-                region_end = min(region_start + coverage_window, middle_end)
-
-                # Count how many tokens are already kept in this region
-                region_kept = keep_mask[region_start:region_end].sum().item()
-
-                # If below minimum, add top-scoring tokens from this region
-                if region_kept < min_coverage and remaining_budget > 0:
-                    need = min(min_coverage - region_kept, remaining_budget)
-
-                    # Get scores for this region, excluding already kept
-                    region_scores = scores[region_start:region_end].clone()
-                    region_mask = keep_mask[region_start:region_end]
-                    region_scores[region_mask] = float("-inf")
-
-                    # Select top 'need' tokens from this region
-                    valid_count = (~region_mask).sum().item()
-                    if valid_count > 0:
-                        k = min(need, valid_count)
-                        _, top_in_region = region_scores.topk(k)
-                        for idx in top_in_region:
-                            keep_mask[region_start + idx] = True
-                            remaining_budget -= 1
-                            if remaining_budget <= 0:
-                                break
-
-                if remaining_budget <= 0:
-                    break
-
-        # Fill remaining budget with global top scores (preserves needle task performance)
+        # Select top tokens by score (excluding already kept)
         if remaining_budget > 0:
             scores_masked = scores.clone()
             scores_masked[keep_mask] = float("-inf")  # Exclude already kept
-            valid_remaining = (~keep_mask).sum().item()
-            if valid_remaining > 0:
-                k = min(remaining_budget, valid_remaining)
-                _, top_indices = scores_masked.topk(k)
-                keep_mask[top_indices] = True
+            _, top_indices = scores_masked.topk(remaining_budget)
+            keep_mask[top_indices] = True
 
         return keep_mask
 
