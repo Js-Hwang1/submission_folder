@@ -235,17 +235,47 @@ __global__ void update_graph_kernel(
         }
     }
 
-    // Thread 0 writes final results
+    // Thread 0 writes final results with Boltzmann conductance (softmax)
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        for (int k = 0; k < top_k; ++k) {
-            if (k < block_heap_size) {
-                row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
-            } else {
-                row[k] = -1;  // No neighbor
+        // Boltzmann conductance: G_ij = softmax(score / tau)
+        // tau = 1.0 (standard attention temperature)
+        // This ensures:
+        //   1. All weights are positive (no dead ends from negative scores)
+        //   2. Weights sum to 1 (proper probability distribution)
+        //   3. Physics-consistent current flow (Kirchhoff's law)
+        constexpr float TEMPERATURE = 1.0f;
+        float scale = 1.0f / sqrtf((float)head_dim);  // Standard attention scaling
+        float inv_temp = 1.0f / TEMPERATURE;
+
+        if (block_heap_size > 0) {
+            // Compute max for numerical stability
+            float max_score = block_heap[0].score * scale;  // Already sorted descending
+
+            // Compute sum of exp for softmax denominator
+            float sum_exp = 0.0f;
+            for (int k = 0; k < block_heap_size; ++k) {
+                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                sum_exp += expf(fminf(normalized_score, 20.0f));  // Clamp to avoid overflow
+            }
+
+            // Write softmax probabilities as conductances
+            for (int k = 0; k < top_k; ++k) {
+                if (k < block_heap_size) {
+                    row[k] = block_heap[k].index;
+                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
+                } else {
+                    row[k] = -1;  // No neighbor
+                    weight_row[k] = 0.0f;
+                }
+            }
+        } else {
+            // No neighbors found
+            for (int k = 0; k < top_k; ++k) {
+                row[k] = -1;
                 weight_row[k] = 0.0f;
             }
         }
@@ -308,15 +338,36 @@ __global__ void update_graph_kernel_fp32(
         }
     }
 
+    // Thread 0 writes final results with Boltzmann conductance (softmax)
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        for (int k = 0; k < top_k; ++k) {
-            if (k < block_heap_size) {
-                row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
-            } else {
+        constexpr float TEMPERATURE = 1.0f;
+        float scale = 1.0f / sqrtf((float)head_dim);
+        float inv_temp = 1.0f / TEMPERATURE;
+
+        if (block_heap_size > 0) {
+            float max_score = block_heap[0].score * scale;
+
+            float sum_exp = 0.0f;
+            for (int k = 0; k < block_heap_size; ++k) {
+                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                sum_exp += expf(fminf(normalized_score, 20.0f));
+            }
+
+            for (int k = 0; k < top_k; ++k) {
+                if (k < block_heap_size) {
+                    row[k] = block_heap[k].index;
+                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
+                } else {
+                    row[k] = -1;
+                    weight_row[k] = 0.0f;
+                }
+            }
+        } else {
+            for (int k = 0; k < top_k; ++k) {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
             }
@@ -405,16 +456,36 @@ __global__ void batched_update_graph_kernel_fp32(
         }
     }
 
-    // Thread 0 writes final results
+    // Thread 0 writes final results with Boltzmann conductance (softmax)
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        for (int k = 0; k < top_k; ++k) {
-            if (k < block_heap_size) {
-                row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
-            } else {
+        constexpr float TEMPERATURE = 1.0f;
+        float scale = 1.0f / sqrtf((float)head_dim);
+        float inv_temp = 1.0f / TEMPERATURE;
+
+        if (block_heap_size > 0) {
+            float max_score = block_heap[0].score * scale;
+
+            float sum_exp = 0.0f;
+            for (int k = 0; k < block_heap_size; ++k) {
+                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                sum_exp += expf(fminf(normalized_score, 20.0f));
+            }
+
+            for (int k = 0; k < top_k; ++k) {
+                if (k < block_heap_size) {
+                    row[k] = block_heap[k].index;
+                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
+                } else {
+                    row[k] = -1;
+                    weight_row[k] = 0.0f;
+                }
+            }
+        } else {
+            for (int k = 0; k < top_k; ++k) {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
             }
@@ -781,16 +852,36 @@ __global__ void build_transpose_graph_kernel_fp32(
         }
     }
 
-    // Thread 0 writes results
+    // Thread 0 writes results with Boltzmann conductance (softmax)
     if (threadIdx.x == 0) {
         int32_t* row = rev_adj_list + key_pos * top_k;
         float* weight_row = rev_adj_weights + key_pos * top_k;
 
-        for (int k = 0; k < top_k; ++k) {
-            if (k < block_heap_size) {
-                row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
-            } else {
+        constexpr float TEMPERATURE = 1.0f;
+        float scale = 1.0f / sqrtf((float)head_dim);
+        float inv_temp = 1.0f / TEMPERATURE;
+
+        if (block_heap_size > 0) {
+            float max_score = block_heap[0].score * scale;
+
+            float sum_exp = 0.0f;
+            for (int k = 0; k < block_heap_size; ++k) {
+                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                sum_exp += expf(fminf(normalized_score, 20.0f));
+            }
+
+            for (int k = 0; k < top_k; ++k) {
+                if (k < block_heap_size) {
+                    row[k] = block_heap[k].index;
+                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
+                } else {
+                    row[k] = -1;
+                    weight_row[k] = 0.0f;
+                }
+            }
+        } else {
+            for (int k = 0; k < top_k; ++k) {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
             }
