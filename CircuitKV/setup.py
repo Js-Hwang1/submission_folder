@@ -34,19 +34,16 @@ def get_extensions():
         "cxx": [
             "-O3",
             "-std=c++17",
-            "-Wall",
-            "-Wextra",
         ],
         "nvcc": [
             "-O3",
             "-std=c++17",
             "--use_fast_math",
             "-lineinfo",  # Debug info without perf hit
-            "--ptxas-options=-v",  # Show register usage
             "-gencode=arch=compute_80,code=sm_80",  # A100
             "-gencode=arch=compute_86,code=sm_86",  # RTX 3090
             "-gencode=arch=compute_89,code=sm_89",  # RTX 4090
-            "-gencode=arch=compute_90,code=sm_90",  # H100
+            "-gencode=arch=compute_90,code=sm_90",  # H100 / GH200
         ],
     }
 
