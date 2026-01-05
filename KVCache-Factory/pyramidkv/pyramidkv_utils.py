@@ -1200,10 +1200,17 @@ class CircuitKVCluster():
         """
         Get a boolean mask indicating which tokens to keep.
 
-        Implements Static Budgeting logic:
+        Implements Static Budgeting logic with Coverage Guarantee:
         1. Handle both static (int) and dynamic (float) budgets
         2. Always keep Sink tokens (first sink_size) and Local window (last window_size)
-        3. Fill remaining budget with top current-flow scored tokens
+        3. Coverage guarantee: ensure each region has minimum representation
+        4. Fill remaining budget with top current-flow scored tokens
+
+        Physics Rationale for Coverage Guarantee:
+        - The walker flows from Query to Sink, naturally favoring tokens on that path
+        - Middle-document tokens may get low scores even if important for summarization
+        - Coverage guarantee acts like "capacitor probes" throughout the circuit,
+          ensuring signal is captured from all regions, not just the main current path
 
         Args:
             scores: Current-flow scores from random walks [seq_len]
@@ -1237,6 +1244,44 @@ class CircuitKVCluster():
         current_kept = mask.sum().item()
         remaining_slots = max(0, target_count - current_kept)
 
+        # 4. Coverage Guarantee: ensure each region has minimum representation
+        # This helps coverage tasks (summarization, few-shot) without hurting needle tasks
+        coverage_window = 256  # Check coverage in 256-token windows
+        min_coverage = 2       # Minimum tokens to keep per region
+        middle_start = self.sink_size
+        middle_end = local_start
+
+        if remaining_slots > 0 and middle_end > middle_start:
+            for region_start in range(middle_start, middle_end, coverage_window):
+                region_end = min(region_start + coverage_window, middle_end)
+
+                # Count how many tokens are already kept in this region
+                region_kept = mask[region_start:region_end].sum().item()
+
+                # If below minimum, add top-scoring tokens from this region
+                if region_kept < min_coverage and remaining_slots > 0:
+                    need = min(min_coverage - region_kept, remaining_slots)
+
+                    # Get scores for this region, excluding already kept
+                    region_scores = scores[region_start:region_end].clone()
+                    region_mask = mask[region_start:region_end]
+                    region_scores[region_mask] = float('-inf')
+
+                    # Select top 'need' tokens from this region
+                    valid_count = (~region_mask).sum().item()
+                    if valid_count > 0:
+                        k = min(need, valid_count)
+                        _, top_in_region = torch.topk(region_scores, k)
+                        for idx in top_in_region:
+                            mask[region_start + idx] = True
+                            remaining_slots -= 1
+                            if remaining_slots <= 0:
+                                break
+
+                if remaining_slots <= 0:
+                    break
+
+        # 5. Fill remaining budget with global top scores (preserves needle task performance)
         if remaining_slots > 0:
             # Zero out scores for tokens we already force-kept
             scores_masked = scores[:seq_len].clone()
