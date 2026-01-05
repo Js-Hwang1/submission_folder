@@ -1092,26 +1092,30 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    Capacitive CircuitKV with Observation Window (P0+P1).
+    Capacitive CircuitKV with Distributed Observation Sampling.
 
-    Physics Model (RC Circuit):
+    Physics Model (RC Circuit with Multi-Probe Measurement):
     - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill): Observation Window Strategy
-      * P1: Real H2O from softmax(Q[-W:]@K^T).sum() - true attention importance
-      * P0: Multi-source walks from ALL W tokens - distributed bridge detection
-      * Combined: max(H2O, Circuit) - keeps tokens high on EITHER signal
+    - INITIALIZATION (End of Prefill): Distributed Observation Strategy
+      * For long documents: Sample observations at 25%, 50%, 75%, 100% of sequence
+      * Each observation computes H2O + Circuit from its OWN query position
+      * MAX aggregation: "If ANY probe thinks you're important, keep it"
     - UPDATE (During Generation): Current from CircuitKV walker updates via EMA
       Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
 
-    Key Innovations:
-    - P1 (Real H2O): Uses actual attention scores, not key norms
-      * Catches true Heavy Hitters that receive high attention
-    - P0 (Multi-source): Runs walks from observation window, not single token
-      * Catches distributed importance patterns (summarization, few-shot)
-      * Single-source only captures last-token dependencies
+    Key Innovation - Distributed Observation:
+    - Problem: Single-source walk (from last token) misses content important
+      to earlier parts of the document. Coverage tasks (summarization) fail.
+    - Solution: Sample multiple observation points throughout the document.
+      Each observation gets its OWN query-specific graph and walk.
+    - MAX Aggregation (not SUM): Preserves needle signal (from last position)
+      while adding coverage signal (from earlier positions).
 
-    Unlike H2O alone (degree centrality) or raw CircuitKV (instant current),
-    this combines real attention importance with multi-source bridge detection.
+    Physics Interpretation:
+    - Each observation = voltage probe at different document location
+    - MAX = peak importance potential across all probes
+    - Needle preserved: 100% position finds the needle path
+    - Coverage added: Earlier positions capture distributed importance
     """
 
     def __init__(
@@ -1200,17 +1204,10 @@ class CircuitKVCluster():
         """
         Get a boolean mask indicating which tokens to keep.
 
-        Implements Static Budgeting logic with Coverage Guarantee:
+        Implements Static Budgeting logic:
         1. Handle both static (int) and dynamic (float) budgets
         2. Always keep Sink tokens (first sink_size) and Local window (last window_size)
-        3. Coverage guarantee: ensure each region has minimum representation
-        4. Fill remaining budget with top current-flow scored tokens
-
-        Physics Rationale for Coverage Guarantee:
-        - The walker flows from Query to Sink, naturally favoring tokens on that path
-        - Middle-document tokens may get low scores even if important for summarization
-        - Coverage guarantee acts like "capacitor probes" throughout the circuit,
-          ensuring signal is captured from all regions, not just the main current path
+        3. Fill remaining budget with top current-flow scored tokens
 
         Args:
             scores: Current-flow scores from random walks [seq_len]
@@ -1244,44 +1241,7 @@ class CircuitKVCluster():
         current_kept = mask.sum().item()
         remaining_slots = max(0, target_count - current_kept)
 
-        # 4. Coverage Guarantee: ensure each region has minimum representation
-        # This helps coverage tasks (summarization, few-shot) without hurting needle tasks
-        coverage_window = 256  # Check coverage in 256-token windows
-        min_coverage = 2       # Minimum tokens to keep per region
-        middle_start = self.sink_size
-        middle_end = local_start
-
-        if remaining_slots > 0 and middle_end > middle_start:
-            for region_start in range(middle_start, middle_end, coverage_window):
-                region_end = min(region_start + coverage_window, middle_end)
-
-                # Count how many tokens are already kept in this region
-                region_kept = mask[region_start:region_end].sum().item()
-
-                # If below minimum, add top-scoring tokens from this region
-                if region_kept < min_coverage and remaining_slots > 0:
-                    need = min(min_coverage - region_kept, remaining_slots)
-
-                    # Get scores for this region, excluding already kept
-                    region_scores = scores[region_start:region_end].clone()
-                    region_mask = mask[region_start:region_end]
-                    region_scores[region_mask] = float('-inf')
-
-                    # Select top 'need' tokens from this region
-                    valid_count = (~region_mask).sum().item()
-                    if valid_count > 0:
-                        k = min(need, valid_count)
-                        _, top_in_region = torch.topk(region_scores, k)
-                        for idx in top_in_region:
-                            mask[region_start + idx] = True
-                            remaining_slots -= 1
-                            if remaining_slots <= 0:
-                                break
-
-                if remaining_slots <= 0:
-                    break
-
-        # 5. Fill remaining budget with global top scores (preserves needle task performance)
+        # Fill remaining budget with global top scores
         if remaining_slots > 0:
             # Zero out scores for tokens we already force-kept
             scores_masked = scores[:seq_len].clone()
@@ -1303,16 +1263,24 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using Observation Window + Union (Max).
+        Initialize capacitor charge using Distributed Observation Sampling.
 
-        **P0+P1 Implementation:**
-        - P1 (Real H2O): Compute softmax(Q[-W:]@K^T).sum() instead of key norms
-          * Uses actual attention importance from observation window queries
-          * Captures true "Heavy Hitters" that receive high attention
-        - P0 (Multi-source walks): Run walks from ALL tokens in observation window
-          * Aggregates visit counts from W parallel walks
-          * Captures distributed importance, not just last-token dependencies
-        - Combination: max(H2O, Circuit) - keeps tokens high on EITHER signal
+        **Distributed Observation Strategy:**
+        For long documents, importance varies throughout. A single observation
+        point (last token) misses content important to earlier positions.
+
+        This implementation samples multiple observation points throughout
+        the document (e.g., 25%, 50%, 75%, 100%) and aggregates via MAX:
+        - Each observation point computes H2O + Circuit with its OWN query
+        - MAX aggregation: "If ANY observation thinks you're important, keep it"
+
+        Physics Interpretation:
+        - Each observation = voltage probe at different document locations
+        - MAX = peak importance potential across all probes
+
+        Key Properties:
+        - Needle Preserved: Last position (100%) finds needle path
+        - Coverage Added: Earlier positions capture distributed importance
 
         Args:
             query_states: [bsz, num_heads, seq_len, head_dim]
@@ -1325,70 +1293,84 @@ class CircuitKVCluster():
 
         device = key_states.device
 
-        # Observation window size (capped by sequence length)
-        W = min(self.observation_window, q_len - self.sink_size)
-        W = max(W, 1)  # At least 1 token
-
         # =====================================================================
-        # P1: REAL ATTENTION-BASED H2O (Not key norms!)
-        # Compute softmax(Q[-W:] @ K^T / sqrt(d)).sum(dim=0) for true importance
+        # DISTRIBUTED OBSERVATION: Sample multiple positions throughout document
+        # - Short docs (<1000): Just use last position (original behavior)
+        # - Long docs: Sample at 25%, 50%, 75%, 100% of sequence
         # =====================================================================
-        # Get queries from observation window: [W, head_dim] (first head)
-        queries_window = query_states[0, 0, -W:, :].contiguous()  # [W, head_dim]
-        keys_flat = key_states[0, 0, :q_len, :].contiguous()  # [q_len, head_dim]
-
-        # Compute attention scores: [W, q_len] = [W, head_dim] @ [head_dim, q_len]
-        attn_logits = queries_window @ keys_flat.T / math.sqrt(head_dim)
-
-        # Apply causal mask: query at position (q_len - W + i) can only attend to [0, q_len - W + i]
-        causal_mask = torch.ones(W, q_len, device=device, dtype=torch.bool)
-        for i in range(W):
-            query_pos = q_len - W + i
-            causal_mask[i, query_pos + 1:] = False  # Mask future tokens
-
-        attn_logits = attn_logits.masked_fill(~causal_mask, float('-inf'))
-
-        # Softmax and sum across window queries -> H2O importance
-        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [W, q_len]
-        h2o = attn_weights.sum(dim=0)  # [q_len] - total attention received from window
-
-        # Normalize to [0, 1]
-        h2o_max = h2o.max()
-        if h2o_max > 0:
-            h2o = h2o / h2o_max
-
-        # =====================================================================
-        # P0: CIRCUIT WALKS (Single-source from last query position)
-        # Run walks from the last token in observation window
-        # =====================================================================
-        if self._graph is not None:
-            # Convert to FP32 for CUDA kernel
-            # Use last query in window as the source
-            last_query = queries_window[-1:].float().contiguous()  # [1, head_dim]
-            keys_fp32 = keys_flat[:q_len].float().contiguous()
-
-            # Run circuit walk from last position
-            self._graph.update_and_step_circuit(last_query, keys_fp32, q_len - 1)
-
-            # Get visit counts
-            circuit_total = self._graph.get_scores()[:q_len].float()
-
-            # =====================================================================
-            # FIXED SCALING (NOT dynamic normalization)
-            # Scale by num_walkers so 10% visits -> ~1.0
-            # =====================================================================
-            scale_factor = 10.0 / self.num_walkers
-            circuit = circuit_total * scale_factor
+        if q_len < 1000:
+            # Short document: single observation at end (original behavior)
+            sample_fractions = [1.0]
         else:
-            # Fallback if graph not initialized
-            circuit = torch.ones(q_len, device=device, dtype=torch.float32)
+            # Long document: distributed sampling for coverage
+            sample_fractions = [0.25, 0.50, 0.75, 1.0]
+
+        # Convert fractions to positions, ensuring valid indices
+        sample_positions = []
+        for f in sample_fractions:
+            pos = max(self.sink_size + 1, int(f * q_len) - 1)
+            pos = min(pos, q_len - 1)  # Clamp to valid range
+            sample_positions.append(pos)
+
+        # Ensure last position is exactly q_len - 1 (for needle preservation)
+        sample_positions[-1] = q_len - 1
+        # Remove duplicates and sort
+        sample_positions = sorted(set(sample_positions))
+
+        # Initialize combined scores buffer
+        combined = torch.zeros(q_len, device=device, dtype=torch.float32)
+
+        # Scale factor for circuit scores
+        scale_factor = 10.0 / self.num_walkers
 
         # =====================================================================
-        # UNION (MAX) STRATEGY: Keep tokens high on EITHER signal
-        # - Heavy Hitters (H2O from real attention) are preserved
-        # - Circuit Bridges (from multi-source walks) are added
+        # OBSERVATION LOOP: For each sample position, compute H2O + Circuit
         # =====================================================================
-        combined = torch.maximum(h2o, circuit)
+        for p in sample_positions:
+            # Skip invalid positions
+            if p < self.sink_size + 1:
+                continue
+
+            # -----------------------------------------------------------------
+            # H2O: Attention-based importance from position p
+            # Query at p can only see keys [0, p] (causal)
+            # -----------------------------------------------------------------
+            Q_p = query_states[0, 0, p, :].contiguous()  # [head_dim]
+            K_p = key_states[0, 0, :p+1, :].contiguous()  # [p+1, head_dim]
+
+            attn_logits = Q_p @ K_p.T / math.sqrt(head_dim)
+            h2o_p = F.softmax(attn_logits.float(), dim=-1)  # [p+1]
+
+            # Normalize to [0, 1]
+            h2o_max = h2o_p.max()
+            if h2o_max > 0:
+                h2o_p = h2o_p / h2o_max
+
+            # -----------------------------------------------------------------
+            # Circuit: Walk-based importance from position p
+            # Graph built from Q_p's attention pattern, walk starts at p
+            # -----------------------------------------------------------------
+            if self._graph is not None:
+                Q_fp32 = Q_p.float().unsqueeze(0).contiguous()  # [1, head_dim]
+                K_fp32 = K_p.float().contiguous()
+
+                # Build graph from Q_p and run walk from position p
+                self._graph.update_and_step_circuit(Q_fp32, K_fp32, p)
+                circuit_p = self._graph.get_scores()[:p+1].float()
+                circuit_p = circuit_p * scale_factor
+            else:
+                circuit_p = torch.zeros(p+1, device=device, dtype=torch.float32)
+
+            # -----------------------------------------------------------------
+            # Local MAX: Combine H2O and Circuit for this observation
+            # -----------------------------------------------------------------
+            local = torch.maximum(h2o_p, circuit_p)
+
+            # -----------------------------------------------------------------
+            # Global MAX: Update combined scores
+            # "If ANY observation thinks you're important, you're important"
+            # -----------------------------------------------------------------
+            combined[:p+1] = torch.maximum(combined[:p+1], local)
 
         # Initialize accumulated charge buffer
         self._accumulated_charge = torch.zeros(
