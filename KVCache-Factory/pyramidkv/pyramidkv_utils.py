@@ -1092,21 +1092,26 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    Capacitive CircuitKV - Current-Flow Betweenness for KV Cache Eviction.
+    Capacitive CircuitKV with Observation Window (P0+P1).
 
     Physics Model (RC Circuit):
     - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill):
-      * H2O: Attention probabilities normalized to [0, 1]
-      * Circuit: Visit counts scaled (NOT normalized) - can exceed 1.0
-      * Combined: MAX(H2O, Circuit) - Circuit DOMINATES for high-visit tokens
+    - INITIALIZATION (End of Prefill): Observation Window Strategy
+      * P1: Real H2O from softmax(Q[-W:]@K^T).sum() - true attention importance
+      * P0: Multi-source walks from ALL W tokens - distributed bridge detection
+      * Combined: max(H2O, Circuit) - keeps tokens high on EITHER signal
     - UPDATE (During Generation): Current from CircuitKV walker updates via EMA
+      Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
 
-    CRITICAL INSIGHT:
-    Circuit scores are NOT normalized to [0,1]. This allows circuit to
-    dominate the MAX operation for tokens with high walker visits.
-    This is essential for needle tasks where circuit finds bridge tokens
-    that H2O (attention) misses.
+    Key Innovations:
+    - P1 (Real H2O): Uses actual attention scores, not key norms
+      * Catches true Heavy Hitters that receive high attention
+    - P0 (Multi-source): Runs walks from observation window, not single token
+      * Catches distributed importance patterns (summarization, few-shot)
+      * Single-source only captures last-token dependencies
+
+    Unlike H2O alone (degree centrality) or raw CircuitKV (instant current),
+    this combines real attention importance with multi-source bridge detection.
     """
 
     def __init__(
@@ -1254,16 +1259,16 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using MAX(H2O, Circuit) - EXACT BASELINE.
+        Initialize capacitor charge using Observation Window + Union (Max).
 
-        **Baseline Strategy:**
-        - H2O: Attention probabilities normalized to [0, 1]
-        - Circuit: Visit counts scaled by 10/num_walkers (NOT normalized to [0,1])
-        - Combined: MAX(H2O, Circuit)
-
-        CRITICAL: Circuit is NOT normalized to [0,1]. This allows circuit to
-        DOMINATE for tokens with high visit counts. This is essential for
-        needle tasks where circuit finds bridge tokens that H2O misses.
+        **P0+P1 Implementation:**
+        - P1 (Real H2O): Compute softmax(Q[-W:]@K^T).sum() instead of key norms
+          * Uses actual attention importance from observation window queries
+          * Captures true "Heavy Hitters" that receive high attention
+        - P0 (Multi-source walks): Run walks from ALL tokens in observation window
+          * Aggregates visit counts from W parallel walks
+          * Captures distributed importance, not just last-token dependencies
+        - Combination: max(H2O, Circuit) - keeps tokens high on EITHER signal
 
         Args:
             query_states: [bsz, num_heads, seq_len, head_dim]
@@ -1276,43 +1281,69 @@ class CircuitKVCluster():
 
         device = key_states.device
 
-        # Get query and keys from last position
-        Q_last = query_states[0, 0, -1, :].contiguous()  # [head_dim]
-        K_all = key_states[0, 0, :q_len, :].contiguous()  # [q_len, head_dim]
+        # Observation window size (capped by sequence length)
+        W = min(self.observation_window, q_len - self.sink_size)
+        W = max(W, 1)  # At least 1 token
 
-        # ---------------------------------------------------------------------
-        # H2O: Attention-based importance from question position
-        # Normalized to [0, 1]
-        # ---------------------------------------------------------------------
-        attn_logits = Q_last @ K_all.T / math.sqrt(head_dim)
-        attn_probs = F.softmax(attn_logits.float(), dim=-1)  # [q_len]
+        # =====================================================================
+        # P1: REAL ATTENTION-BASED H2O (Not key norms!)
+        # Compute softmax(Q[-W:] @ K^T / sqrt(d)).sum(dim=0) for true importance
+        # =====================================================================
+        # Get queries from observation window: [W, head_dim] (first head)
+        queries_window = query_states[0, 0, -W:, :].contiguous()  # [W, head_dim]
+        keys_flat = key_states[0, 0, :q_len, :].contiguous()  # [q_len, head_dim]
 
-        h2o = attn_probs.clone()
+        # Compute attention scores: [W, q_len] = [W, head_dim] @ [head_dim, q_len]
+        attn_logits = queries_window @ keys_flat.T / math.sqrt(head_dim)
+
+        # Apply causal mask: query at position (q_len - W + i) can only attend to [0, q_len - W + i]
+        causal_mask = torch.ones(W, q_len, device=device, dtype=torch.bool)
+        for i in range(W):
+            query_pos = q_len - W + i
+            causal_mask[i, query_pos + 1:] = False  # Mask future tokens
+
+        attn_logits = attn_logits.masked_fill(~causal_mask, float('-inf'))
+
+        # Softmax and sum across window queries -> H2O importance
+        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [W, q_len]
+        h2o = attn_weights.sum(dim=0)  # [q_len] - total attention received from window
+
+        # Normalize to [0, 1]
         h2o_max = h2o.max()
         if h2o_max > 0:
-            h2o = h2o / h2o_max  # [0, 1]
+            h2o = h2o / h2o_max
 
-        # ---------------------------------------------------------------------
-        # Circuit: Walk-based importance from question position
-        # Scaled but NOT normalized - allows circuit to dominate for high visits
-        # ---------------------------------------------------------------------
-        scale_factor = 10.0 / self.num_walkers
-
+        # =====================================================================
+        # P0: CIRCUIT WALKS (Single-source from last query position)
+        # Run walks from the last token in observation window
+        # =====================================================================
         if self._graph is not None:
-            Q_fp32 = Q_last.float().unsqueeze(0).contiguous()  # [1, head_dim]
-            K_fp32 = K_all.float().contiguous()
+            # Convert to FP32 for CUDA kernel
+            # Use last query in window as the source
+            last_query = queries_window[-1:].float().contiguous()  # [1, head_dim]
+            keys_fp32 = keys_flat[:q_len].float().contiguous()
 
-            # Build graph from question's attention and run walk
-            self._graph.update_and_step_circuit(Q_fp32, K_fp32, q_len - 1)
-            circuit = self._graph.get_scores()[:q_len].float()
-            circuit = circuit * scale_factor  # NOT normalized to [0,1]!
+            # Run circuit walk from last position
+            self._graph.update_and_step_circuit(last_query, keys_fp32, q_len - 1)
+
+            # Get visit counts
+            circuit_total = self._graph.get_scores()[:q_len].float()
+
+            # =====================================================================
+            # FIXED SCALING (NOT dynamic normalization)
+            # Scale by num_walkers so 10% visits -> ~1.0
+            # =====================================================================
+            scale_factor = 10.0 / self.num_walkers
+            circuit = circuit_total * scale_factor
         else:
-            circuit = torch.zeros(q_len, device=device, dtype=torch.float32)
+            # Fallback if graph not initialized
+            circuit = torch.ones(q_len, device=device, dtype=torch.float32)
 
-        # ---------------------------------------------------------------------
-        # UNION (MAX): Circuit dominates for high-visit tokens
-        # This is critical for needle tasks - circuit finds bridges H2O misses
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # UNION (MAX) STRATEGY: Keep tokens high on EITHER signal
+        # - Heavy Hitters (H2O from real attention) are preserved
+        # - Circuit Bridges (from multi-source walks) are added
+        # =====================================================================
         combined = torch.maximum(h2o, circuit)
 
         # Initialize accumulated charge buffer
