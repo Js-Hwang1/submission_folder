@@ -236,6 +236,9 @@ __global__ void update_graph_kernel(
     }
 
     // Thread 0 writes final results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
+    // Raw scores give nearly uniform sampling among top-k neighbors,
+    // which preserves exploration for needle tasks.
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
@@ -243,7 +246,8 @@ __global__ void update_graph_kernel(
         for (int k = 0; k < top_k; ++k) {
             if (k < block_heap_size) {
                 row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
+                // Use raw score as weight (will be normalized by walker)
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
             } else {
                 row[k] = -1;  // No neighbor
                 weight_row[k] = 0.0f;
@@ -308,6 +312,8 @@ __global__ void update_graph_kernel_fp32(
         }
     }
 
+    // Thread 0 writes final results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
@@ -315,7 +321,7 @@ __global__ void update_graph_kernel_fp32(
         for (int k = 0; k < top_k; ++k) {
             if (k < block_heap_size) {
                 row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
             } else {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
@@ -406,6 +412,7 @@ __global__ void batched_update_graph_kernel_fp32(
     }
 
     // Thread 0 writes final results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
@@ -413,7 +420,7 @@ __global__ void batched_update_graph_kernel_fp32(
         for (int k = 0; k < top_k; ++k) {
             if (k < block_heap_size) {
                 row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
             } else {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
@@ -782,6 +789,7 @@ __global__ void build_transpose_graph_kernel_fp32(
     }
 
     // Thread 0 writes results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
     if (threadIdx.x == 0) {
         int32_t* row = rev_adj_list + key_pos * top_k;
         float* weight_row = rev_adj_weights + key_pos * top_k;
@@ -789,7 +797,7 @@ __global__ void build_transpose_graph_kernel_fp32(
         for (int k = 0; k < top_k; ++k) {
             if (k < block_heap_size) {
                 row[k] = block_heap[k].index;
-                weight_row[k] = block_heap[k].score;
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
             } else {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
