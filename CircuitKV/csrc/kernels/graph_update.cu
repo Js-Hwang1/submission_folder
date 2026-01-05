@@ -241,23 +241,25 @@ __global__ void update_graph_kernel(
         float* weight_row = adj_weights + current_idx * top_k;
 
         // Boltzmann conductance: G_ij = softmax(score / tau)
-        // tau = 1.0 (standard attention temperature)
-        // This ensures:
-        //   1. All weights are positive (no dead ends from negative scores)
-        //   2. Weights sum to 1 (proper probability distribution)
-        //   3. Physics-consistent current flow (Kirchhoff's law)
+        //
+        // IMPORTANT: We do NOT apply 1/sqrt(d) scaling here because:
+        // 1. Top-K selection already used raw scores (implicitly scaled)
+        // 2. We want softmax over the RAW score differences among top-k
+        // 3. 1/sqrt(d) would make tau_effective = tau * sqrt(d) ≈ 11, way too diffuse
+        //
+        // tau = 1.0 means: probability ratios match score ratios
+        // e.g., scores [10, 8, 6] → softmax ≈ [0.67, 0.24, 0.09] (sharp)
         constexpr float TEMPERATURE = 1.0f;
-        float scale = 1.0f / sqrtf((float)head_dim);  // Standard attention scaling
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
-            // Compute max for numerical stability
-            float max_score = block_heap[0].score * scale;  // Already sorted descending
+            // Compute max for numerical stability (no 1/sqrt(d) scaling!)
+            float max_score = block_heap[0].score;  // Already sorted descending
 
             // Compute sum of exp for softmax denominator
             float sum_exp = 0.0f;
             for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                 sum_exp += expf(fminf(normalized_score, 20.0f));  // Clamp to avoid overflow
             }
 
@@ -265,7 +267,7 @@ __global__ void update_graph_kernel(
             for (int k = 0; k < top_k; ++k) {
                 if (k < block_heap_size) {
                     row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                     weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
                 } else {
                     row[k] = -1;  // No neighbor
@@ -344,22 +346,21 @@ __global__ void update_graph_kernel_fp32(
         float* weight_row = adj_weights + current_idx * top_k;
 
         constexpr float TEMPERATURE = 1.0f;
-        float scale = 1.0f / sqrtf((float)head_dim);
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
-            float max_score = block_heap[0].score * scale;
+            float max_score = block_heap[0].score;
 
             float sum_exp = 0.0f;
             for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                 sum_exp += expf(fminf(normalized_score, 20.0f));
             }
 
             for (int k = 0; k < top_k; ++k) {
                 if (k < block_heap_size) {
                     row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                     weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
                 } else {
                     row[k] = -1;
@@ -462,22 +463,21 @@ __global__ void batched_update_graph_kernel_fp32(
         float* weight_row = adj_weights + current_idx * top_k;
 
         constexpr float TEMPERATURE = 1.0f;
-        float scale = 1.0f / sqrtf((float)head_dim);
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
-            float max_score = block_heap[0].score * scale;
+            float max_score = block_heap[0].score;
 
             float sum_exp = 0.0f;
             for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                 sum_exp += expf(fminf(normalized_score, 20.0f));
             }
 
             for (int k = 0; k < top_k; ++k) {
                 if (k < block_heap_size) {
                     row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                     weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
                 } else {
                     row[k] = -1;
@@ -858,22 +858,21 @@ __global__ void build_transpose_graph_kernel_fp32(
         float* weight_row = rev_adj_weights + key_pos * top_k;
 
         constexpr float TEMPERATURE = 1.0f;
-        float scale = 1.0f / sqrtf((float)head_dim);
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
-            float max_score = block_heap[0].score * scale;
+            float max_score = block_heap[0].score;
 
             float sum_exp = 0.0f;
             for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                 sum_exp += expf(fminf(normalized_score, 20.0f));
             }
 
             for (int k = 0; k < top_k; ++k) {
                 if (k < block_heap_size) {
                     row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score * scale - max_score) * inv_temp;
+                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
                     weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
                 } else {
                     row[k] = -1;
