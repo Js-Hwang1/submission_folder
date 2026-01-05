@@ -1092,26 +1092,21 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    Capacitive CircuitKV with Entropy-Adaptive Gating.
+    Capacitive CircuitKV - Current-Flow Betweenness for KV Cache Eviction.
 
-    Physics Model (RC Circuit with Adaptive Impedance):
+    Physics Model (RC Circuit):
     - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill): Entropy-Adaptive gating
-      * H2O: Attention-based importance (what the question attends to)
-      * Circuit: Walk-based importance (path from question to sink)
-      * Entropy: Measures attention spread (sharp vs broad)
-      * Combined: MAX(H2O, Circuit) gated by entropy
+    - INITIALIZATION (End of Prefill):
+      * H2O: Attention probabilities normalized to [0, 1]
+      * Circuit: Visit counts scaled (NOT normalized) - can exceed 1.0
+      * Combined: MAX(H2O, Circuit) - Circuit DOMINATES for high-visit tokens
     - UPDATE (During Generation): Current from CircuitKV walker updates via EMA
 
-    Key Innovation - Entropy-Adaptive Gating:
-    - Low entropy (<0.6): Use MAX(H2O, Circuit) - Circuit finds useful bridges
-    - High entropy (>0.85): Use H2O only - Circuit adds noise, remove it
-    - In between: Smooth transition preserving both behaviors
-
-    Physics Interpretation:
-    - MAX preserves peak signals (critical for needle tasks)
-    - Entropy gates whether Circuit contributes or just adds noise
-    - Automatically adapts without explicit task labels
+    CRITICAL INSIGHT:
+    Circuit scores are NOT normalized to [0,1]. This allows circuit to
+    dominate the MAX operation for tokens with high walker visits.
+    This is essential for needle tasks where circuit finds bridge tokens
+    that H2O (attention) misses.
     """
 
     def __init__(
@@ -1259,23 +1254,16 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using Entropy-Adaptive Gating.
+        Initialize capacitor charge using MAX(H2O, Circuit) - EXACT BASELINE.
 
-        **Entropy-Adaptive Gating Strategy:**
-        The attention entropy tells us whether the question is focused (needle)
-        or broad (coverage):
-        - Low entropy = sharp attention = needle task → Circuit finds bridges
-        - High entropy = broad attention = coverage task → Circuit adds noise
+        **Baseline Strategy:**
+        - H2O: Attention probabilities normalized to [0, 1]
+        - Circuit: Visit counts scaled by 10/num_walkers (NOT normalized to [0,1])
+        - Combined: MAX(H2O, Circuit)
 
-        Key insight: MAX preserves peak signals, weighted average dilutes them.
-        We use MAX as baseline, and only gate out Circuit for high entropy:
-        - entropy < 0.6: pure MAX(H2O, Circuit) - preserves needle behavior
-        - entropy > 0.85: pure H2O - removes circuit noise for coverage
-        - in between: smooth transition
-
-        Physics Interpretation:
-        - Low entropy = concentrated potential → current has clear path (Circuit useful)
-        - High entropy = diffuse potential → current spreads everywhere (Circuit noisy)
+        CRITICAL: Circuit is NOT normalized to [0,1]. This allows circuit to
+        DOMINATE for tokens with high visit counts. This is essential for
+        needle tasks where circuit finds bridge tokens that H2O misses.
 
         Args:
             query_states: [bsz, num_heads, seq_len, head_dim]
@@ -1294,28 +1282,19 @@ class CircuitKVCluster():
 
         # ---------------------------------------------------------------------
         # H2O: Attention-based importance from question position
+        # Normalized to [0, 1]
         # ---------------------------------------------------------------------
         attn_logits = Q_last @ K_all.T / math.sqrt(head_dim)
-        attn_probs = F.softmax(attn_logits.float(), dim=-1)  # [q_len] - actual probabilities
+        attn_probs = F.softmax(attn_logits.float(), dim=-1)  # [q_len]
 
-        # ---------------------------------------------------------------------
-        # Compute Attention Entropy (measures spread)
-        # High entropy = broad attention (coverage task)
-        # Low entropy = focused attention (needle task)
-        # ---------------------------------------------------------------------
-        # Entropy: H = -sum(p * log(p))
-        entropy = -torch.sum(attn_probs * torch.log(attn_probs + 1e-10))
-        max_entropy = math.log(q_len)  # Maximum possible entropy (uniform distribution)
-        normalized_entropy = (entropy / max_entropy).clamp(0, 1)  # [0, 1]
-
-        # H2O normalized to [0, 1]
         h2o = attn_probs.clone()
         h2o_max = h2o.max()
         if h2o_max > 0:
-            h2o = h2o / h2o_max
+            h2o = h2o / h2o_max  # [0, 1]
 
         # ---------------------------------------------------------------------
         # Circuit: Walk-based importance from question position
+        # Scaled but NOT normalized - allows circuit to dominate for high visits
         # ---------------------------------------------------------------------
         scale_factor = 10.0 / self.num_walkers
 
@@ -1326,36 +1305,15 @@ class CircuitKVCluster():
             # Build graph from question's attention and run walk
             self._graph.update_and_step_circuit(Q_fp32, K_fp32, q_len - 1)
             circuit = self._graph.get_scores()[:q_len].float()
-            circuit = circuit * scale_factor
-
-            # Normalize circuit to [0, 1] for fair combination
-            circuit_max = circuit.max()
-            if circuit_max > 0:
-                circuit = circuit / circuit_max
+            circuit = circuit * scale_factor  # NOT normalized to [0,1]!
         else:
             circuit = torch.zeros(q_len, device=device, dtype=torch.float32)
 
         # ---------------------------------------------------------------------
-        # ENTROPY-ADAPTIVE GATING (Preserve MAX, gate Circuit for high entropy)
-        #
-        # Key insight: MAX preserves peak signals, weighted average dilutes them.
-        # - Low entropy (needle): Use MAX - Circuit finds useful bridges
-        # - High entropy (coverage): Use H2O only - Circuit adds noise
-        #
-        # Smooth transition between MAX and H2O-only based on entropy.
+        # UNION (MAX): Circuit dominates for high-visit tokens
+        # This is critical for needle tasks - circuit finds bridges H2O misses
         # ---------------------------------------------------------------------
-        entropy_val = normalized_entropy.item()
-
-        # Smooth transition: 0 at entropy=0.6, 1 at entropy=0.85
-        # Below 0.6: pure MAX (needle tasks)
-        # Above 0.85: pure H2O (coverage tasks)
-        gate = max(0.0, min(1.0, (entropy_val - 0.6) / 0.25))
-
-        # MAX preserves peaks (baseline behavior)
-        max_combined = torch.maximum(h2o, circuit)
-
-        # Interpolate: low entropy → MAX, high entropy → H2O only
-        combined = gate * h2o + (1 - gate) * max_combined
+        combined = torch.maximum(h2o, circuit)
 
         # Initialize accumulated charge buffer
         self._accumulated_charge = torch.zeros(
