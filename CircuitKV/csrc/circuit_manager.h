@@ -95,59 +95,6 @@ public:
     );
 
     /**
-     * Multi-source CircuitKV: Run walks from W sources in parallel (P3 Optimization).
-     *
-     * This method builds graphs for ALL sources in the observation window and
-     * runs W × walkers_per_source walks in a single kernel launch.
-     *
-     * @param queries        Query vectors [num_sources, head_dim], FP32
-     * @param keys           Key cache [seq_len, head_dim], FP32
-     * @param source_indices Source token indices [num_sources], INT64
-     */
-    void update_and_step_circuit_multi_source(
-        torch::Tensor queries,
-        torch::Tensor keys,
-        torch::Tensor source_indices
-    );
-
-    /**
-     * Bidirectional CircuitKV (RC+B): Run walks in BOTH directions.
-     *
-     * This method runs absorbing walks in two directions:
-     * - Backward: Query -> Sink (following attention edges)
-     * - Forward: Sink -> Query (following transpose attention edges)
-     *
-     * Tokens visited by BOTH directions are "true bridges" and receive bonus scoring:
-     *   bridge_score = min(backward_visits, forward_visits)
-     *   final_score = max(backward, forward) + 0.5 * bridge_score
-     *
-     * This captures true reasoning bridges that connect Question to Context
-     * from BOTH directions, significantly improving recall on LongBench.
-     *
-     * @param queries        Query vectors for observation window [W, head_dim], FP32
-     * @param keys           Key cache [seq_len, head_dim], FP32
-     * @param source_indices Query token indices [W], INT32
-     */
-    void update_and_step_circuit_bidirectional(
-        torch::Tensor queries,
-        torch::Tensor keys,
-        torch::Tensor source_indices
-    );
-
-    /**
-     * Get bidirectional scores (combined backward + forward + bridge).
-     *
-     * Returns scores computed as:
-     *   bridge = min(backward, forward)
-     *   score = max(backward, forward) + 0.5 * bridge
-     *
-     * Synchronizes sidecar stream before returning.
-     *
-     * @return Tensor of shape [max_seq_len] with combined scores
-     */
-    torch::Tensor get_bidirectional_scores();
-
-    /**
      * Get the current-flow scores.
      *
      * Synchronizes the sidecar stream before returning.
@@ -179,20 +126,12 @@ private:
     int query_window_;  // Kept for API compatibility (unused)
     int current_seq_len_;
 
-    // GPU memory: Forward adjacency list (token i attends to token j)
+    // GPU memory: Adjacency list (token i attends to token j)
     int32_t* adj_list_;        // [max_seq_len, top_k]
     float* adj_weights_;       // [max_seq_len, top_k]
 
-    // GPU memory: Transpose adjacency list (who attends TO token k) - for RC+B
-    int32_t* rev_adj_list_;    // [max_seq_len, top_k]
-    float* rev_adj_weights_;   // [max_seq_len, top_k]
-
     // GPU memory: Visit counts (current-flow scores)
-    int32_t* visit_counts_;    // [max_seq_len] - standard (backward) visits
-
-    // GPU memory: Bidirectional visit counts - for RC+B
-    int32_t* backward_visits_; // [max_seq_len] - Query->Sink direction
-    int32_t* forward_visits_;  // [max_seq_len] - Sink->Query direction
+    int32_t* visit_counts_;    // [max_seq_len]
 
     // GPU memory: PRNG states
     uint64_t* rng_states_;     // [num_walkers * 2]

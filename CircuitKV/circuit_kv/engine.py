@@ -34,22 +34,11 @@ class CircuitKVConfig:
 
     # Eviction parameters
     sink_size: int = 4  # CircuitKV absorbing boundary (first N tokens)
-    local_window: int = 32  # Local window to always keep
-
-    # Observation window for importance scoring (like SnapKV)
-    observation_window: int = 1  # Last W tokens for H2O attention + multi-source walks
+    local_window: int = 64  # Local window to always keep
 
     # Capacitive CircuitKV: State-Space Model Parameters
     # Physics: Tokens are capacitors that accumulate charge over time
     decay: float = 0.95  # EMA decay for charge accumulation (temporal smoothing)
-
-    # RC+B: Bidirectional Circuit Walks
-    # When enabled, runs walks in BOTH directions:
-    # - Backward: Query -> Sink (standard direction)
-    # - Forward: Sink -> Query (via transpose graph)
-    # Tokens visited by BOTH directions get bridge bonus: score = max(b,f) + 0.5*min(b,f)
-    # NOTE: Disabled by default - R@65 improved but narrativeqa score dropped (25.10 -> 23.78)
-    bidirectional: bool = False
 
     # Hardware
     device: str = "cuda"
@@ -58,33 +47,29 @@ class CircuitKVConfig:
 
 class CircuitKVMonitor:
     """
-    The Capacitive CircuitKV Monitor with Observation Window (P0+P1).
+    The Capacitive CircuitKV Monitor.
 
     This class wraps the CUDA extension and provides a high-level interface
     for updating the attention graph and computing current-flow scores.
 
     Physics Model (RC Circuit / State-Space):
     - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill): Observation Window Strategy
-      * P1: Real H2O from softmax(Q[-W:]@K^T).sum() - true attention importance
-      * P0: Multi-source walks from ALL W tokens - distributed bridge detection
-      * Combined: max(H2O, Circuit) - keeps tokens high on EITHER signal
+    - INITIALIZATION (End of Prefill): Charge is set from H2O accumulated attention
+      This represents the "steady state" charge deposited by prefill tokens.
     - UPDATE (During Generation): Current from CircuitKV walker updates charge via EMA
       Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
 
-    Key Innovations:
-    - P1 (Real H2O): Uses actual attention scores, not key norms
-      * Catches true Heavy Hitters that receive high attention
-    - P0 (Multi-source): Runs walks from observation window, not single token
-      * Catches distributed importance patterns (summarization, few-shot)
-      * Single-source only captures last-token dependencies
+    Key Innovation:
+    - Heavy Hitters (NarrativeQA): Start with high charge from prefill attention
+    - Reasoning Bridges (HotpotQA): Gain charge immediately when referenced by walker,
+      overriding their low historical attention
 
     Usage:
         config = CircuitKVConfig()
         monitor = CircuitKVMonitor(config)
 
-        # At end of prefill phase (Single-Token Multiplicative Gating):
-        monitor.initialize_from_prefill(keys, final_query_state)
+        # At end of prefill phase:
+        monitor.initialize_from_prefill(attention_matrix)
 
         # During generation, after each new token:
         monitor.update(query, keys, current_idx)
@@ -124,155 +109,54 @@ class CircuitKVMonitor:
 
     def initialize_from_prefill(
         self,
-        keys: torch.Tensor,
-        final_query_state: Optional[torch.Tensor] = None,
+        attention_matrix: torch.Tensor,
         seq_len: Optional[int] = None,
     ) -> None:
         """
-        Initialize capacitor charge using Observation Window + Union (Max).
+        Initialize capacitor charge from prefill-phase attention (H2O Initialization).
 
-        **P0+P1 Implementation:**
-        - P1 (Real H2O): Compute softmax(Q[-W:]@K^T).sum() instead of key norms
-          * Uses actual attention importance from observation window queries
-          * Captures true "Heavy Hitters" that receive high attention
-        - P0 (Multi-source walks): Run walks from ALL tokens in observation window
-          * Aggregates visit counts from W parallel walks
-          * Captures distributed importance, not just last-token dependencies
-        - Combination: max(H2O, Circuit) - keeps tokens high on EITHER signal
+        This sets the "steady state" charge based on accumulated attention during prefill.
+        Heavy Hitters (tokens that received lots of attention) start with high charge.
+
+        Physics Rationale:
+        - During prefill, ~30k tokens have already "deposited" attention onto keys
+        - This accumulated attention represents the equilibrium charge distribution
+        - We use column sums of attention matrix (H2O scores) as initial charge
 
         Args:
-            keys: Key vectors from prefill. Shape: [N, D] or [B, H, N, D]
-            final_query_state: Query vectors. Shape: [W, D] or [B, H, N, D] (uses last W)
-                If None, uses last W keys as proxy.
-            seq_len: Sequence length (optional, inferred from keys).
+            attention_matrix: Attention weights from prefill. Shape: [N, N] or [B, H, N, N]
+                              Can also be pre-computed column sums [N] or [B, H, N]
+            seq_len: Sequence length (optional, inferred from attention_matrix)
         """
-        import math
-        import torch.nn.functional as F
-
         self._lazy_init()
 
-        # Handle different input shapes - flatten to [N, D]
-        if keys.dim() == 4:
-            # [B, H, N, D] -> [N, D] (use first batch, first head)
-            keys_flat = keys[0, 0, :, :].contiguous()
-        elif keys.dim() == 3:
-            # [B, N, D] -> [N, D]
-            keys_flat = keys[0, :, :].contiguous()
+        # Handle different input shapes
+        if attention_matrix.dim() == 1:
+            # Already column sums [N]
+            h2o_scores = attention_matrix
+        elif attention_matrix.dim() == 2:
+            # Full attention matrix [N, N] -> column sums
+            h2o_scores = attention_matrix.sum(dim=0)
+        elif attention_matrix.dim() == 4:
+            # Batched [B, H, N, N] -> average over batch and heads, then column sum
+            h2o_scores = attention_matrix.mean(dim=(0, 1)).sum(dim=0)
         else:
-            # Already [N, D]
-            keys_flat = keys.contiguous()
+            # [B, H, N] -> average over batch and heads
+            h2o_scores = attention_matrix.mean(dim=(0, 1))
 
-        actual_seq_len = seq_len if seq_len is not None else keys_flat.shape[0]
-        device = keys_flat.device
-        head_dim = keys_flat.shape[-1]
+        # Normalize to [0, 1] range
+        max_score = h2o_scores.max()
+        if max_score > 0:
+            h2o_scores = h2o_scores / max_score
 
-        # Observation window size (capped by sequence length)
-        W = min(self.config.observation_window, actual_seq_len - self.config.sink_size)
-        W = max(W, 1)  # At least 1 token
-
-        # =====================================================================
-        # P1: REAL ATTENTION-BASED H2O (Not key norms!)
-        # Compute softmax(Q[-W:] @ K^T / sqrt(d)).sum(dim=0) for true importance
-        # =====================================================================
-        # Get queries from observation window
-        if final_query_state is not None:
-            # Handle different shapes - extract last W queries
-            if final_query_state.dim() == 4:
-                # [B, H, N, D] -> [W, D]
-                queries_window = final_query_state[0, 0, -W:, :].contiguous()
-            elif final_query_state.dim() == 3:
-                # [B, N, D] -> [W, D]
-                queries_window = final_query_state[0, -W:, :].contiguous()
-            elif final_query_state.dim() == 2:
-                # [N, D] -> [W, D]
-                queries_window = final_query_state[-W:, :].contiguous()
-            else:
-                # [D] -> [1, D] (single query fallback)
-                queries_window = final_query_state.unsqueeze(0).contiguous()
-                W = 1
-        else:
-            # Fallback: use last W keys as proxy for queries
-            queries_window = keys_flat[-W:, :].contiguous()
-
-        # Compute attention scores: [W, N] = [W, D] @ [D, N]
-        # Only attend to tokens BEFORE each query (causal mask)
-        attn_logits = queries_window @ keys_flat[:actual_seq_len].T / math.sqrt(head_dim)
-
-        # Apply causal mask: query at position (seq_len - W + i) can only attend to [0, seq_len - W + i]
-        causal_mask = torch.ones(W, actual_seq_len, device=device, dtype=torch.bool)
-        for i in range(W):
-            query_pos = actual_seq_len - W + i
-            causal_mask[i, query_pos + 1:] = False  # Mask future tokens
-
-        attn_logits = attn_logits.masked_fill(~causal_mask, float('-inf'))
-
-        # Softmax and sum across window queries -> H2O importance
-        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [W, N]
-        h2o = attn_weights.sum(dim=0)  # [N] - total attention received from window
-
-        # Normalize to [0, 1]
-        h2o_max = h2o.max()
-        if h2o_max > 0:
-            h2o = h2o / h2o_max
-
-        # =====================================================================
-        # P0+P3: CIRCUIT WALKS (CUDA-parallelized)
-        # Run walks from observation window - either unidirectional or bidirectional
-        # =====================================================================
-        # Build source indices array
-        source_indices = torch.arange(
-            actual_seq_len - W, actual_seq_len,
-            device=device, dtype=torch.int32
-        )
-
-        # Convert queries to FP32 for CUDA kernel
-        queries_fp32 = queries_window.float().contiguous()
-        keys_fp32 = keys_flat[:actual_seq_len].float().contiguous()
-
-        if self.config.bidirectional:
-            # =====================================================================
-            # RC+B: BIDIRECTIONAL CIRCUIT WALKS
-            # Run walks in BOTH directions:
-            # - Backward: Query -> Sink (who does query attend to)
-            # - Forward: Sink -> Query (who attends to sink, via transpose graph)
-            # Bridge bonus for tokens visited by BOTH directions
-            # =====================================================================
-            self._graph.update_and_step_circuit_bidirectional(
-                queries_fp32, keys_fp32, source_indices
-            )
-
-            # Get combined bidirectional scores (includes bridge bonus)
-            circuit_total = self._graph.get_bidirectional_scores()[:actual_seq_len].float()
-        else:
-            # Standard unidirectional multi-source walks
-            self._graph.update_and_step_circuit_multi_source(
-                queries_fp32, keys_fp32, source_indices
-            )
-
-            # Get aggregated visit counts from all W sources
-            circuit_total = self._graph.get_scores()[:actual_seq_len].float()
-
-        # =====================================================================
-        # FIXED SCALING (NOT dynamic normalization)
-        # Scale by (num_walkers * W) so 10% visits across all walks -> ~1.0
-        # =====================================================================
-        scale_factor = 10.0 / (self.config.num_walkers * W)
-        circuit = circuit_total * scale_factor
-
-        # =====================================================================
-        # UNION (MAX) STRATEGY: Keep tokens high on EITHER signal
-        # - Heavy Hitters (H2O from real attention) are preserved
-        # - Circuit Bridges (from multi-source walks) are added
-        # =====================================================================
-        combined = torch.maximum(h2o, circuit)
-
-        # Initialize accumulated charge buffer
+        # Initialize accumulated charge
+        actual_seq_len = seq_len if seq_len is not None else h2o_scores.shape[0]
         self._accumulated_charge = torch.zeros(
             self.config.max_seq_len,
-            device=device,
+            device=h2o_scores.device,
             dtype=torch.float32,
         )
-        self._accumulated_charge[:actual_seq_len] = combined
+        self._accumulated_charge[:actual_seq_len] = h2o_scores[:actual_seq_len].float()
         self._prefill_initialized = True
 
     def update(
