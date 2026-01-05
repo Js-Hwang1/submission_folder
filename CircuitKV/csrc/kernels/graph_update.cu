@@ -242,14 +242,15 @@ __global__ void update_graph_kernel(
 
         // Boltzmann conductance: G_ij = softmax(score / tau)
         //
-        // IMPORTANT: We do NOT apply 1/sqrt(d) scaling here because:
-        // 1. Top-K selection already used raw scores (implicitly scaled)
-        // 2. We want softmax over the RAW score differences among top-k
-        // 3. 1/sqrt(d) would make tau_effective = tau * sqrt(d) ≈ 11, way too diffuse
+        // Raw Q·K scores have magnitude ~100 (since ||Q||, ||K|| ≈ √d ≈ 11)
+        // So score differences among top-k are typically 5-20.
         //
-        // tau = 1.0 means: probability ratios match score ratios
-        // e.g., scores [10, 8, 6] → softmax ≈ [0.67, 0.24, 0.09] (sharp)
-        constexpr float TEMPERATURE = 1.0f;
+        // tau = 10.0 gives moderate sharpness:
+        //   scores [120, 115, 110, 105] → softmax ≈ [0.48, 0.29, 0.18, 0.11]
+        // This balances:
+        //   - Sharp enough to prefer high-attention neighbors
+        //   - Random enough to explore alternative paths (find bridges)
+        constexpr float TEMPERATURE = 10.0f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
@@ -345,7 +346,7 @@ __global__ void update_graph_kernel_fp32(
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        constexpr float TEMPERATURE = 1.0f;
+        constexpr float TEMPERATURE = 10.0f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
@@ -462,7 +463,7 @@ __global__ void batched_update_graph_kernel_fp32(
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        constexpr float TEMPERATURE = 1.0f;
+        constexpr float TEMPERATURE = 10.0f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
@@ -857,7 +858,7 @@ __global__ void build_transpose_graph_kernel_fp32(
         int32_t* row = rev_adj_list + key_pos * top_k;
         float* weight_row = rev_adj_weights + key_pos * top_k;
 
-        constexpr float TEMPERATURE = 1.0f;
+        constexpr float TEMPERATURE = 10.0f;
         float inv_temp = 1.0f / TEMPERATURE;
 
         if (block_heap_size > 0) {
