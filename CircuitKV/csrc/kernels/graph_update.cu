@@ -235,48 +235,21 @@ __global__ void update_graph_kernel(
         }
     }
 
-    // Thread 0 writes final results with Boltzmann conductance (softmax)
+    // Thread 0 writes final results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
+    // Raw scores give nearly uniform sampling among top-k neighbors,
+    // which preserves exploration for needle tasks.
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        // Boltzmann conductance: G_ij = softmax(score / tau)
-        //
-        // Raw Q·K scores have magnitude ~100 (since ||Q||, ||K|| ≈ √d ≈ 11)
-        // So score differences among top-k are typically 5-20.
-        //
-        // tau = 0.1 gives extremely sharp walks (nearly deterministic):
-        //   scores [120, 115, 110, 105] → softmax ≈ [1.0, 0.0, 0.0, 0.0]
-        // This is almost greedy selection of the highest-attention neighbor.
-        constexpr float TEMPERATURE = 0.1f;
-        float inv_temp = 1.0f / TEMPERATURE;
-
-        if (block_heap_size > 0) {
-            // Compute max for numerical stability (no 1/sqrt(d) scaling!)
-            float max_score = block_heap[0].score;  // Already sorted descending
-
-            // Compute sum of exp for softmax denominator
-            float sum_exp = 0.0f;
-            for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                sum_exp += expf(fminf(normalized_score, 20.0f));  // Clamp to avoid overflow
-            }
-
-            // Write softmax probabilities as conductances
-            for (int k = 0; k < top_k; ++k) {
-                if (k < block_heap_size) {
-                    row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
-                } else {
-                    row[k] = -1;  // No neighbor
-                    weight_row[k] = 0.0f;
-                }
-            }
-        } else {
-            // No neighbors found
-            for (int k = 0; k < top_k; ++k) {
-                row[k] = -1;
+        for (int k = 0; k < top_k; ++k) {
+            if (k < block_heap_size) {
+                row[k] = block_heap[k].index;
+                // Use raw score as weight (will be normalized by walker)
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
+            } else {
+                row[k] = -1;  // No neighbor
                 weight_row[k] = 0.0f;
             }
         }
@@ -339,35 +312,17 @@ __global__ void update_graph_kernel_fp32(
         }
     }
 
-    // Thread 0 writes final results with Boltzmann conductance (softmax)
+    // Thread 0 writes final results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        constexpr float TEMPERATURE = 0.1f;
-        float inv_temp = 1.0f / TEMPERATURE;
-
-        if (block_heap_size > 0) {
-            float max_score = block_heap[0].score;
-
-            float sum_exp = 0.0f;
-            for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                sum_exp += expf(fminf(normalized_score, 20.0f));
-            }
-
-            for (int k = 0; k < top_k; ++k) {
-                if (k < block_heap_size) {
-                    row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
-                } else {
-                    row[k] = -1;
-                    weight_row[k] = 0.0f;
-                }
-            }
-        } else {
-            for (int k = 0; k < top_k; ++k) {
+        for (int k = 0; k < top_k; ++k) {
+            if (k < block_heap_size) {
+                row[k] = block_heap[k].index;
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
+            } else {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
             }
@@ -456,35 +411,17 @@ __global__ void batched_update_graph_kernel_fp32(
         }
     }
 
-    // Thread 0 writes final results with Boltzmann conductance (softmax)
+    // Thread 0 writes final results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
     if (threadIdx.x == 0) {
         int32_t* row = adj_list + current_idx * top_k;
         float* weight_row = adj_weights + current_idx * top_k;
 
-        constexpr float TEMPERATURE = 0.1f;
-        float inv_temp = 1.0f / TEMPERATURE;
-
-        if (block_heap_size > 0) {
-            float max_score = block_heap[0].score;
-
-            float sum_exp = 0.0f;
-            for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                sum_exp += expf(fminf(normalized_score, 20.0f));
-            }
-
-            for (int k = 0; k < top_k; ++k) {
-                if (k < block_heap_size) {
-                    row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
-                } else {
-                    row[k] = -1;
-                    weight_row[k] = 0.0f;
-                }
-            }
-        } else {
-            for (int k = 0; k < top_k; ++k) {
+        for (int k = 0; k < top_k; ++k) {
+            if (k < block_heap_size) {
+                row[k] = block_heap[k].index;
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
+            } else {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
             }
@@ -851,35 +788,17 @@ __global__ void build_transpose_graph_kernel_fp32(
         }
     }
 
-    // Thread 0 writes results with Boltzmann conductance (softmax)
+    // Thread 0 writes results
+    // BASELINE: Use raw Q·K scores as weights (no softmax)
     if (threadIdx.x == 0) {
         int32_t* row = rev_adj_list + key_pos * top_k;
         float* weight_row = rev_adj_weights + key_pos * top_k;
 
-        constexpr float TEMPERATURE = 0.1f;
-        float inv_temp = 1.0f / TEMPERATURE;
-
-        if (block_heap_size > 0) {
-            float max_score = block_heap[0].score;
-
-            float sum_exp = 0.0f;
-            for (int k = 0; k < block_heap_size; ++k) {
-                float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                sum_exp += expf(fminf(normalized_score, 20.0f));
-            }
-
-            for (int k = 0; k < top_k; ++k) {
-                if (k < block_heap_size) {
-                    row[k] = block_heap[k].index;
-                    float normalized_score = (block_heap[k].score - max_score) * inv_temp;
-                    weight_row[k] = expf(fminf(normalized_score, 20.0f)) / sum_exp;
-                } else {
-                    row[k] = -1;
-                    weight_row[k] = 0.0f;
-                }
-            }
-        } else {
-            for (int k = 0; k < top_k; ++k) {
+        for (int k = 0; k < top_k; ++k) {
+            if (k < block_heap_size) {
+                row[k] = block_heap[k].index;
+                weight_row[k] = fmaxf(block_heap[k].score, 0.0f);
+            } else {
                 row[k] = -1;
                 weight_row[k] = 0.0f;
             }
