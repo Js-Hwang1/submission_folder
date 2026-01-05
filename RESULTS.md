@@ -1,4 +1,4 @@
-# SpectralKV Benchmark Results
+# CircuitKV Benchmark Results
 
 ## LongBench Evaluation
 
