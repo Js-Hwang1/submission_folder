@@ -1,0 +1,1541 @@
+import torch
+import time
+import torch.nn.functional as F
+import torch.nn as nn
+import math
+
+from typing import List
+
+
+from typing import List, Optional, Tuple
+from transformers.cache_utils import Cache
+
+def key_pruner_query_driven(kv_states, q_states, recent_size=128, ratio=0.3):
+    _, _, seqlen, head_dim = kv_states.shape
+    k = int(head_dim * ratio)
+    # new efficient implementation
+    queries_norm = torch.pow(q_states[..., -32:, :], 2).mean(dim=2)
+    keys_norm = torch.pow(kv_states, 2).mean(dim=2)
+    key = queries_norm * keys_norm
+    _, indices = torch.topk(key, k, dim=-1, largest=False)
+    keep_idx = indices.sort().values
+    mask = torch.zeros(key.shape, dtype=torch.bool).to(kv_states.device)
+    mask = mask.scatter_(-1, keep_idx, 1)                   
+    mask_k = mask.unsqueeze(2).expand(-1, -1, seqlen - recent_size, -1)
+
+    return kv_states[:, :, :seqlen - recent_size, :][~mask_k].reshape(1,-1,seqlen - recent_size,head_dim-k), kv_states[:, :, seqlen - recent_size:, :], ~mask
+
+class DynamicCacheSplitHeadFlatten(Cache):
+    '''
+    adapt from https://github.com/FFY0/AdaKV.
+    '''
+    def __init__(self) ->None:
+        # Token wise List[]  Head wise KV List[torch.Tensor]
+        super().__init__()
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+        self._seen_tokens = 0
+
+    def __len__(self):
+        return len(self.key_cache)
+
+    def __iter__(self):
+        for layer_idx in range(len(self)):
+            yield (tuple(self.key_cache[layer_idx]),tuple(self.value_cache[layer_idx]))
+
+    def __getitem__(self, layer_idx: int) -> Tuple[Tuple[torch.Tensor],Tuple[torch.Tensor]]:
+        if layer_idx < len(self):
+            return (tuple(self.key_cache[layer_idx]),tuple(self.value_cache[layer_idx]))
+        else:
+            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        else:
+            assert self.key_cache[layer_idx].dim() == 2
+            bs, head, seqlen, dim = key_states.shape
+            assert bs == 1 and seqlen == 1
+            head_lens = cache_kwargs["head_lens"]
+            cu_klen = cache_kwargs["cu_klen"]
+
+            import nvtx
+            copy_old_rng = nvtx.start_range("copy old")
+            from tiny_api_cuda import update_flatten_view
+            new_key_cache = update_flatten_view(self.key_cache[layer_idx].view(-1,dim), key_states.view(-1, dim), head_lens, cu_klen)
+            new_value_cache = update_flatten_view(self.value_cache[layer_idx].view(-1,dim), value_states.view(-1, dim), head_lens, cu_klen)
+
+            nvtx.end_range(copy_old_rng)
+
+            self.key_cache[layer_idx] = new_key_cache
+            self.value_cache[layer_idx] = new_value_cache
+
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        if len(self.key_cache) <= layer_idx:
+            return 0
+        # TODO: return 1 to means has content for now
+        return 1
+        # return max(map(lambda states: states.shape[-2], self.key_cache[layer_idx]))
+
+    def get_max_length(self) -> Optional[int]:
+        return None
+
+    def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
+        """Converts the `DynamicCache` instance into the its equivalent in the legacy cache format."""
+        legacy_cache = ()
+        for layer_idx in range(len(self)):
+            legacy_cache += ((self.key_cache[layer_idx], self.value_cache[layer_idx]),)
+        return legacy_cache
+
+    @classmethod
+    def from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCacheEachHead":
+        """Converts a cache in the legacy cache format into an equivalent `DynamicCache`."""
+        cache = cls()
+        if past_key_values is not None:
+            for layer_idx in range(len(past_key_values)):
+                key_states, value_states = past_key_values[layer_idx]
+                cache.update(key_states, value_states, layer_idx)
+        return cache
+
+# perform qk calculation and get indices
+# this version will not update in inference mode
+
+# Copied from transformers.models.llama.modeling_llama.repeat_kv
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+def merge_kv(key_states, value_states, indices, window_size, merge):
+    # merge methods in LOOK-M 
+
+    bsz, num_heads, k_len, head_dim = key_states.shape
+
+    # kv-selected
+    selected_keys = key_states.gather(dim=2, index=indices)  # [bsz, num_heads, topk_len, head_dim]
+    selected_values = value_states.gather(dim=2, index=indices)  # [bsz, num_heads, topk_len, head_dim]
+
+    # kv-drop
+    all_indices = torch.arange(k_len, device=key_states.device).unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, k_len)
+    all_indices_flattened = all_indices.flatten()  # [bsz * num_heads * (k_len-window_size)]
+    selected_indices_flattened = indices.flatten()  # [bsz * num_heads * topk_len]
+    is_selected = torch.isin(all_indices_flattened, selected_indices_flattened)
+    drop_indices_flattened = all_indices_flattened[~is_selected] 
+    drop_len = drop_indices_flattened.shape[0] // (all_indices.shape[0] * all_indices.shape[1])
+    drop_indices = drop_indices_flattened.reshape(all_indices.shape[0], all_indices.shape[1], drop_len) # [bsz * num_heads * (k_len-window_size-topk_len)]
+    drop_indices = drop_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)  # [bsz, num_heads, (k_len-window_size-topk_len), head_dim]
+    drop_keys = key_states.gather(dim=2, index=drop_indices)
+    drop_values = value_states.gather(dim=2, index=drop_indices)
+
+    # kv-recent
+    recent_keys = key_states[:, :, -window_size:, :]
+
+    ##### apply merge #####
+    # prepare for merge
+    k_hh_pruned = drop_keys  # [bsz, num_heads, k_len-topk_len-window_size, head_dim]
+    k_hh_recent = torch.cat([recent_keys, selected_keys], dim=2)  # [bsz, num_heads, topk_len+window_size, head_dim]
+    v_hh_pruned = drop_values  # [bsz, num_heads, k_len-topk_len-window_size, head_dim]
+    v_hh_recent = torch.cat([selected_values, value_states[:, :, -window_size:, :]], dim=2)  # [bsz, num_heads, topk_len+window_size, head_dim]
+    # similarity matrix
+    similarity = (k_hh_pruned / torch.norm(k_hh_pruned, dim=-1).unsqueeze(-1).repeat(1, 1, 1, 128)) @ ((k_hh_recent / (torch.norm(k_hh_recent, dim=-1).unsqueeze(-1).repeat(1, 1, 1, 128))).transpose(-1, -2)) # cosin
+    max_values, max_indices = similarity.max(dim=-1)
+
+    # pivot merge
+    if merge=="pivot":
+        print("Pivot merge")
+        merged_indices = max_indices.unsqueeze(-1).repeat(1, 1, 1, 128)
+        k_hh_selected = torch.gather(input=k_hh_recent, dim=2, index=merged_indices)
+        k_hh_merged = (k_hh_pruned + k_hh_selected)/2
+        k_hh_recent = torch.scatter_reduce(input=k_hh_recent, dim=2, index=merged_indices, src=k_hh_merged, reduce='mean', include_self=True) # include_self=True seems decrease the performance
+        v_hh_selected = torch.gather(input=v_hh_recent, dim=2, index=merged_indices)
+        v_hh_merged = (v_hh_pruned + v_hh_selected)/2
+        v_hh_recent = torch.scatter_reduce(input=v_hh_recent, dim=2, index=merged_indices, src=v_hh_merged, reduce='mean', include_self=True)
+    else:
+        raise ValueError('Merge method not supported')
+        
+    # TODO: other merge strategies
+    # average merge
+    # weight merge
+
+    return k_hh_recent, v_hh_recent
+
+
+class PyramidKVCluster():
+    def __init__(self, num_hidden_layers = 32, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', beta = 20, num_layers = 80, layer_idx=None, merge = None):
+        
+        self.layer_idx = layer_idx
+        self.num_hidden_layers = num_hidden_layers
+        
+        self.steps = -1
+        self.beta = beta
+        
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+
+    def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        
+        # check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        
+        # TODO
+        # window_sizes = 32
+        min_num = (self.max_capacity_prompt - self.window_size) // self.beta
+        max_num = (self.max_capacity_prompt - self.window_size) * 2 - min_num
+        
+            
+        if max_num >= q_len - self.window_size:
+            max_num = q_len - self.window_size
+            min_num = (self.max_capacity_prompt - self.window_size) * 2 - max_num
+    
+       
+        steps = (max_num - min_num) // (self.num_hidden_layers - 1)
+        max_capacity_prompt = max_num - self.layer_idx * steps
+        
+        print(f"PyramidKV max_capacity_prompt {max_capacity_prompt}")
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+        elif q_len < (self.max_capacity_prompt - self.window_size) * 2:
+            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+            mask = mask.to(attn_weights.device)
+            attention_mask = mask[None, None, :, :]
+
+            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+            if self.pooling == 'avgpool':
+                attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            elif self.pooling == 'maxpool':
+                attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            else:
+                raise ValueError('Pooling method not supported')
+            indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            
+            if self.merge is not None:
+                key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
+                return key_states, value_states
+
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            return key_states, value_states
+        else:
+            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+            mask = mask.to(attn_weights.device)
+            attention_mask = mask[None, None, :, :]
+
+            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+            if self.pooling == 'avgpool':
+                attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            elif self.pooling == 'maxpool':
+                attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            else:
+                raise ValueError('Pooling method not supported')
+            indices = attn_cache.topk(max_capacity_prompt, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+            if self.merge is not None:
+                key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
+                return key_states, value_states
+
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            return key_states, value_states
+
+class SnapKVCluster():
+    def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None, recent_size = 32, ratio =  0.4):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+        self.recent_size = recent_size
+        self.ratio = ratio
+
+    def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+        self.ratio = ratio
+        self.recent_size = recent_size
+
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        
+        # check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        
+        print(f"SnapKV max_capacity_prompt {self.max_capacity_prompt}")
+        
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+        else:
+            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+            mask = mask.to(attn_weights.device)
+            attention_mask = mask[None, None, :, :]
+
+            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+            if self.pooling == 'avgpool':
+                attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            elif self.pooling == 'maxpool':
+                attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            else:
+                raise ValueError('Pooling method not supported')
+            indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+            if self.merge is not None:
+                key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
+                return key_states, value_states
+
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            return key_states, value_states
+
+    def update_think(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        
+        # check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        
+        print(f"SnapKV max_capacity_prompt {self.max_capacity_prompt}")
+        
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+        else:
+            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+            mask = mask.to(attn_weights.device)
+            attention_mask = mask[None, None, :, :]
+
+            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+            if self.pooling == 'avgpool':
+                attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            elif self.pooling == 'maxpool':
+                attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            else:
+                raise ValueError('Pooling method not supported')
+            indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+            if self.merge is not None:
+                key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
+                return key_states, value_states
+
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            kv_pruned, kv_recent, mask = key_pruner_query_driven(key_states, query_states, self.recent_size, self.ratio)
+            return kv_pruned, kv_recent, mask, value_states
+
+
+class L2NormCluster():
+    def __init__(self, max_capacity_prompt:int=256+64, layer_idx:int=0, skip_layers: List[int] = []):
+        self.max_capacity_prompt = max_capacity_prompt
+        self.layer_idx = layer_idx
+        self.skip_layers = skip_layers
+
+    def reset(self, max_capacity_prompt:int=256+64, layer_idx:int=0, skip_layers: List[int] = []):
+        self.max_capacity_prompt = max_capacity_prompt
+        self.layer_idx = layer_idx
+        self.skip_layers = skip_layers
+        
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        
+        # check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        
+        print(f"L2Norm max_capacity_prompt {self.max_capacity_prompt}")
+        
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+        elif self.layer_idx in self.skip_layers:
+            return key_states, value_states
+        else:
+            head_dim = key_states.size(-1)
+            token_norms = torch.norm(key_states, p=2, dim=-1)
+            sorted_indices = token_norms.squeeze(-1).argsort(dim=-1)
+            sorted_indices_expanded = sorted_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+            sorted_key_states = key_states.gather(dim=2, index=sorted_indices_expanded)
+            sorted_value_states = value_states.gather(dim=2, index=sorted_indices_expanded)
+            
+            key_states = sorted_key_states[:, :, :self.max_capacity_prompt, :]
+            value_states = sorted_value_states[:, :, :self.max_capacity_prompt, :]
+
+            return key_states, value_states
+
+class CAMKVCluster:
+    def __init__(self, start_budget_ratio = 0.1, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.start_budget_ratio = start_budget_ratio
+        self.merge = merge
+
+    def reset(self, start_budget_ratio = 0.1, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.start_budget_ratio = start_budget_ratio
+        self.merge = merge
+
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        
+        # check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        
+        print(f"CAM max_capacity_prompt {self.max_capacity_prompt}")
+        
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+        else:
+            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+            mask = mask.to(attn_weights.device)
+            attention_mask = mask[None, None, :, :]
+
+            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights_sum = attn_weights[:, :, :, : -self.window_size].sum(dim = -2)
+            # if self.pooling == 'avgpool':
+            #     attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            # elif self.pooling == 'maxpool':
+            #     attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            # else:
+            #     raise ValueError('Pooling method not supported')
+            attn_cache = attn_weights_sum
+
+            # merge recent tokens
+            start_budget = math.ceil(self.start_budget_ratio * q_len)
+            recent_budget = self.window_size
+            # start_budget = math.ceil(self.start_budget_ratio * attn_weights.shape[-1])
+            # recent_budget = math.ceil(self.recent_budget_ratio * attn_weights.shape[-1])
+            # print(f"start_budget {start_budget}")
+            # print(f"recent_budget {recent_budget}")
+
+            # CAM merge
+            seq_length = attn_weights.shape[-1]
+            padding_length = 0
+            merge_budget = recent_budget
+            for token_index in range(start_budget + padding_length + recent_budget, seq_length):
+                if token_index - recent_budget < 0 or token_index - recent_budget >= value_states.shape[2]:
+                    continue
+                attn_score = torch.mean(attn_weights[:, :, :token_index, :token_index], dim=-2)
+                mean_attn = torch.max(torch.cat((attn_score[0, :, :start_budget], attn_score[0, :, token_index - recent_budget:token_index]), dim=-1), dim=-1)[0]
+                merge_prob = attn_score[0, :, token_index - recent_budget] / mean_attn
+                if torch.isnan(merge_prob).any(): merge_prob[torch.isnan(merge_prob)] = 0
+                if torch.isinf(merge_prob).any(): merge_prob[torch.isinf(merge_prob)] = 1
+                merge_mask = torch.bernoulli(merge_prob.clamp(min=0, max=1))
+                score1 = value_states[:, :, token_index - recent_budget, ...].clone() * merge_mask.unsqueeze(-1) / merge_budget
+                value_states[:, :, token_index - recent_budget + 1:token_index - recent_budget + merge_budget + 1, :] += score1.unsqueeze(2)
+
+            indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+
+            return key_states, value_states
+
+
+class H2OKVCluster():
+    def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+
+    def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        
+        # check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        
+        print(f"H2O max_capacity_prompt {self.max_capacity_prompt}")
+        
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+        else:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+            mask = mask.to(attn_weights.device)
+            attention_mask = mask[None, None, :, :]
+
+            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights_sum = attn_weights[:, :, :, : -self.window_size].sum(dim = -2)
+            # if self.pooling == 'avgpool':
+            #     attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            # elif self.pooling == 'maxpool':
+            #     attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+            # else:
+            #     raise ValueError('Pooling method not supported')
+            attn_cache = attn_weights_sum
+            indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+            if self.merge is not None:
+                key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
+                return key_states, value_states
+
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            return key_states, value_states
+
+
+class StreamingLLMKVCluster():
+    def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+
+    def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', merge = None):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        
+        # check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        
+        print(f"StreamingLLM max_capacity_prompt {self.max_capacity_prompt}")
+        
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+        else:
+            
+            indices = torch.tensor(range(self.max_capacity_prompt - self.window_size), dtype=torch.int64).to(key_states.device)
+            indices = indices.unsqueeze(0).unsqueeze(0).unsqueeze(-1).repeat(bsz, num_heads, 1, head_dim)
+
+            if self.merge is not None:
+                key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
+                return key_states, value_states
+
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            return key_states, value_states
+
+class AdaKVCluster():
+    '''
+    adapt from https://github.com/FFY0/AdaKV.
+    '''
+    def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool',max_capacity_prompt=None,floor = None,normalize=None, layer_idx = None, num_hidden_layers=None):
+        self.window_size = window_size
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.base_capacity = max_capacity_prompt - window_size
+        self.floor_ratio = floor
+        self.floor_capacity = int(self.base_capacity * self.floor_ratio)
+        self.adaptive_capacity = self.base_capacity - self.floor_capacity
+        self.num_hidden_layers = num_hidden_layers
+
+        self.normalize = normalize
+        self.layer_idx = layer_idx
+
+        self.head_lens = None
+        self.max_seqlen_k = 0
+        self.klen_sum = 0
+        self.cu_klen = 0
+        self.cu_offset = None
+        self.cu_headlens = None
+
+
+    def calcul_attn_sore(self, key_states, query_states):
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(
+            head_dim)
+        mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min,
+                          device=attn_weights.device)
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(attn_weights.device)
+        attention_mask = mask[None, None, :, :]
+
+        attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
+        if self.pooling == 'avgpool':
+            attn_weights_mean_pooling = F.avg_pool1d(attn_weights_mean, kernel_size=self.kernel_size,
+                                                     padding=self.kernel_size // 2,
+                                                     stride=1)
+        elif self.pooling == 'maxpool':
+            attn_weights_mean_pooling = F.max_pool1d(attn_weights_mean, kernel_size=self.kernel_size,
+                                                     padding=self.kernel_size // 2,
+                                                     stride=1)
+        else:
+            raise ValueError('Pooling method not supported')
+        return attn_weights_mean_pooling
+
+    def update_kv(self,  key_states, query_states, value_states):
+        # check if prefix phase        assert key_states.shape[-2] == query_states.shape[-2]
+        _device = key_states.device
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        attn_score= self.calcul_attn_sore(key_states,query_states)
+        origin_heads_key_states = torch.split(key_states, 1, dim=1)
+        origin_heads_value_states = torch.split(value_states, 1, dim=1)
+
+        def init_metadata(num_heads, k_lens, klen_sum, max_seqlen_k):
+            # init metadata
+            self.head_lens = torch.tensor(k_lens, dtype=torch.int32, device=_device)
+            self.klen_sum = klen_sum
+            self.max_seqlen_k = max_seqlen_k
+            self.cu_headlens = torch.cumsum(self.head_lens, dim=0, dtype=torch.int32)
+            # init varlen flash attention metadata
+            self.cu_klen = self.cu_headlens - self.head_lens
+            self.cu_klen = torch.cat(
+                [self.cu_klen, torch.tensor([self.klen_sum], dtype=torch.int32, device=_device)], dim=0)
+            self.layer_qlens = torch.ones(num_heads, dtype=torch.int32,device=_device)
+            self.qlen_sum = num_heads
+            self.cu_qlen = torch.cumsum(self.layer_qlens, dim=0, dtype=torch.int32) - self.layer_qlens
+            self.cu_qlen = torch.cat(
+                [self.cu_qlen, torch.tensor([self.qlen_sum], dtype=torch.int32, device=_device)], dim=0)
+            self.cu_offset = torch.arange(0, num_heads + 1, dtype=torch.int32, device=_device)
+            self.cu_head_offset = torch.arange(1, num_heads+1, dtype=torch.int32, device=_device)
+
+        if self.base_capacity > attn_score.size(-1):
+            init_metadata(num_heads, [q_len] * num_heads, q_len * num_heads, q_len)
+            # not compress
+            return key_states.reshape(-1, head_dim), value_states.reshape(-1, head_dim)
+
+        # if you need to weight the attn_score
+        sorted_attn_score,sorted_attn_score_indices = attn_score.sort(dim=-1,descending=True)
+        adaptive_attn_score = sorted_attn_score
+        length = adaptive_attn_score.size(dim=-1)
+        if self.normalize:
+            ratio_weight = sorted_attn_score[...,:self.base_capacity].sum(dim=-1,keepdim=True)/sorted_attn_score.sum(dim=-1,keepdim=True)
+            adaptive_attn_score = adaptive_attn_score*ratio_weight
+        adaptive_attn_score = adaptive_attn_score.reshape(bsz,length*num_heads)
+        sorted_indices = torch.topk(adaptive_attn_score,k=num_heads*self.base_capacity,dim=-1).indices
+        sorted_indices = sorted_indices//length
+        # floor capacity set
+        head_adaptive_capacity = torch.zeros((bsz,num_heads),device=_device,dtype = sorted_indices.dtype)
+        head_adaptive_capacity.scatter_add_(-1,sorted_indices,torch.ones_like(sorted_indices,dtype=head_adaptive_capacity.dtype),)
+        assert head_adaptive_capacity.sum().item() == num_heads*self.base_capacity
+        head_adaptive_capacity = torch.round(head_adaptive_capacity * (1-self.floor_ratio) + self.floor_capacity).int()
+        sorted_attn_score_indices = sorted_attn_score_indices.split(1,dim=1)
+
+        heads_key_states = []
+        heads_value_states = []
+        assert bsz == 1
+
+        # per head
+        # reinit varlen metadata
+        k_lens = []
+        klen_sum = 0
+        max_seqlen_k = 0
+        self.cu_klen = 0
+
+        for head_idx in range(num_heads):
+            cache_index = sorted_attn_score_indices[head_idx][...,:head_adaptive_capacity[0][head_idx]]
+
+            l = cache_index.shape[-1] + self.window_size
+            k_lens.append(l)
+            max_seqlen_k = max(max_seqlen_k, l)
+            klen_sum += l
+
+            cache_index = cache_index.view(1, 1, -1, 1).expand(-1, -1, -1, head_dim)
+            top_Kcache = origin_heads_key_states[head_idx].gather(dim=2,index=cache_index)
+            top_Vcache = origin_heads_value_states[head_idx].gather(dim=2,index=cache_index)
+            selected_k = torch.cat([top_Kcache,origin_heads_key_states[head_idx][:, :, -self.window_size:, :]],dim=2)
+            selected_v = torch.cat([top_Vcache,origin_heads_value_states[head_idx][:, :, -self.window_size:, :]],dim=2)
+
+            # NOTE: flatten view
+            heads_key_states.append(selected_k.view(-1, head_dim))
+            heads_value_states.append(selected_v.view(-1, head_dim))
+
+        init_metadata(num_heads, k_lens, klen_sum, max_seqlen_k)
+
+        # NOTE: compose as flatten view
+        heads_key_states = torch.cat(heads_key_states, dim=0)
+        heads_value_states = torch.cat(heads_value_states, dim=0)
+
+        return heads_key_states,heads_value_states
+
+
+class HeadKVCluster():
+    '''
+    adapt from https://github.com/FFY0/AdaKV.
+    '''
+    def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool',max_capacity_prompt=None, layer_idx = None, num_hidden_layers=None, head_capacity=None):
+        self.window_size = window_size
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.base_capacity = max_capacity_prompt - window_size
+        self.head_adaptive_capacity = head_capacity
+        self.num_hidden_layers = num_hidden_layers
+
+        self.layer_idx = layer_idx
+
+        self.head_lens = None
+        self.max_seqlen_k = 0
+        self.klen_sum = 0
+        self.cu_klen = 0
+        self.cu_offset = None
+        self.cu_headlens = None
+
+    def calcul_attn_sore(self, key_states, query_states):
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(
+            head_dim)
+        mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min,
+                          device=attn_weights.device)
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(attn_weights.device)
+        attention_mask = mask[None, None, :, :]
+
+        attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
+        if self.pooling == 'avgpool':
+            attn_weights_mean_pooling = F.avg_pool1d(attn_weights_mean, kernel_size=self.kernel_size,
+                                                     padding=self.kernel_size // 2,
+                                                     stride=1)
+        elif self.pooling == 'maxpool':
+            attn_weights_mean_pooling = F.max_pool1d(attn_weights_mean, kernel_size=self.kernel_size,
+                                                     padding=self.kernel_size // 2,
+                                                     stride=1)
+        else:
+            raise ValueError('Pooling method not supported')
+        return attn_weights_mean_pooling
+
+    def update_kv(self,  key_states, query_states, value_states):
+        # check if prefix phase        assert key_states.shape[-2] == query_states.shape[-2]
+        _device = key_states.device
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        attn_score= self.calcul_attn_sore(key_states,query_states)
+        origin_heads_key_states = torch.split(key_states, 1, dim=1)
+        origin_heads_value_states = torch.split(value_states, 1, dim=1)
+
+        def init_metadata(num_heads, k_lens, klen_sum, max_seqlen_k):
+            # init metadata
+            self.head_lens = torch.tensor(k_lens, dtype=torch.int32, device=_device)
+            self.klen_sum = klen_sum
+            self.max_seqlen_k = max_seqlen_k
+            self.cu_headlens = torch.cumsum(self.head_lens, dim=0, dtype=torch.int32)
+            # init varlen flash attention metadata
+            self.cu_klen = self.cu_headlens - self.head_lens
+            self.cu_klen = torch.cat(
+                [self.cu_klen, torch.tensor([self.klen_sum], dtype=torch.int32, device=_device)], dim=0)
+            self.layer_qlens = torch.ones(num_heads, dtype=torch.int32,device=_device)
+            self.qlen_sum = num_heads
+            self.cu_qlen = torch.cumsum(self.layer_qlens, dim=0, dtype=torch.int32) - self.layer_qlens
+            self.cu_qlen = torch.cat(
+                [self.cu_qlen, torch.tensor([self.qlen_sum], dtype=torch.int32, device=_device)], dim=0)
+            self.cu_offset = torch.arange(0, num_heads + 1, dtype=torch.int32, device=_device)
+            self.cu_head_offset = torch.arange(1, num_heads+1, dtype=torch.int32, device=_device)
+
+        if self.base_capacity > attn_score.size(-1):
+            init_metadata(num_heads, [q_len] * num_heads, q_len * num_heads, q_len)
+            # not compress
+            return key_states.reshape(-1, head_dim), value_states.reshape(-1, head_dim)
+
+        # if you need to weight the attn_score
+        _,sorted_attn_score_indices = attn_score.sort(dim=-1,descending=True)
+        sorted_attn_score_indices = sorted_attn_score_indices.split(1,dim=1)
+
+        heads_key_states = []
+        heads_value_states = []
+        assert bsz == 1
+
+        # per head
+        # reinit varlen metadata
+        k_lens = []
+        klen_sum = 0
+        max_seqlen_k = 0
+        self.cu_klen = 0
+
+        for head_idx in range(num_heads):
+            cache_index = sorted_attn_score_indices[head_idx][...,:self.head_adaptive_capacity[self.layer_idx][head_idx]]
+
+            l = cache_index.shape[-1] + self.window_size
+            k_lens.append(l)
+            max_seqlen_k = max(max_seqlen_k, l)
+            klen_sum += l
+
+            cache_index = cache_index.view(1, 1, -1, 1).expand(-1, -1, -1, head_dim)
+            top_Kcache = origin_heads_key_states[head_idx].gather(dim=2,index=cache_index)
+            top_Vcache = origin_heads_value_states[head_idx].gather(dim=2,index=cache_index)
+            selected_k = torch.cat([top_Kcache,origin_heads_key_states[head_idx][:, :, -self.window_size:, :]],dim=2)
+            selected_v = torch.cat([top_Vcache,origin_heads_value_states[head_idx][:, :, -self.window_size:, :]],dim=2)
+
+            # NOTE: flatten view
+            heads_key_states.append(selected_k.view(-1, head_dim))
+            heads_value_states.append(selected_v.view(-1, head_dim))
+
+        init_metadata(num_heads, k_lens, klen_sum, max_seqlen_k)
+
+        # NOTE: compose as flatten view
+        heads_key_states = torch.cat(heads_key_states, dim=0)
+        heads_value_states = torch.cat(heads_value_states, dim=0)
+
+        return heads_key_states,heads_value_states
+
+def init_pyramidkv(self, num_hidden_layers):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+        if not hasattr(self.config, 'merge'):
+            self.config.merge = None
+    
+    
+    self.kv_cluster = PyramidKVCluster( 
+        num_hidden_layers = num_hidden_layers,
+        layer_idx = self.layer_idx,
+        window_size = self.config.window_size, 
+        max_capacity_prompt = self.config.max_capacity_prompt, 
+        kernel_size = self.config.kernel_size,
+        pooling = self.config.pooling,
+        merge = self.config.merge,
+        )
+ 
+def init_snapkv(self):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 4096
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+        if not hasattr(self.config, 'merge'):
+            self.config.merge = None
+    
+    
+    self.kv_cluster = SnapKVCluster( 
+        window_size = self.config.window_size, 
+        max_capacity_prompt = self.config.max_capacity_prompt, 
+        kernel_size = self.config.kernel_size,
+        pooling = self.config.pooling,
+        merge = self.config.merge,
+        )
+
+def init_think(self):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 4096
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+        if not hasattr(self.config, 'merge'):
+            self.config.merge = None
+        if not hasattr(self.config, 'recent_size'):
+            self.config.recent_size = 32
+        if not hasattr(self.config, 'ratio'):
+            self.config.ratio = 0.4
+    
+    
+    self.kv_cluster = SnapKVCluster( 
+        window_size = self.config.window_size, 
+        max_capacity_prompt = self.config.max_capacity_prompt, 
+        kernel_size = self.config.kernel_size,
+        pooling = self.config.pooling,
+        merge = self.config.merge,
+        recent_size = self.config.recent_size,
+        ratio = self.config.ratio
+        )
+
+def init_l2norm(self):
+    
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 4096
+        if not hasattr(self.config, 'layer_idx'):
+            self.config.layer_idx = 0
+        if not hasattr(self.config, 'skip_layers'):
+            self.config.skip_layers = [0,1]
+
+    self.kv_cluster = L2NormCluster( 
+        max_capacity_prompt = self.config.max_capacity_prompt,
+        layer_idx = self.layer_idx,
+        skip_layers = self.config.skip_layers
+    )
+
+def init_CAM(self):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+    
+    
+    self.kv_cluster = CAMKVCluster(
+        window_size = self.config.window_size, 
+        max_capacity_prompt = self.config.max_capacity_prompt, 
+        kernel_size = self.config.kernel_size,
+        pooling = self.config.pooling,
+        merge = self.config.merge,
+        )
+
+def init_H2O(self):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+        if not hasattr(self.config, 'merge'):
+            self.config.merge = None
+    
+    self.kv_cluster = H2OKVCluster(
+        window_size = self.config.window_size, 
+        max_capacity_prompt = self.config.max_capacity_prompt, 
+        kernel_size = self.config.kernel_size,
+        pooling = self.config.pooling,
+        merge = self.config.merge,
+        )
+
+def init_StreamingLLM(self):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+        if not hasattr(self.config, 'merge'):
+            self.config.merge = None
+    
+    
+    self.kv_cluster = StreamingLLMKVCluster(
+        window_size = self.config.window_size, 
+        max_capacity_prompt = self.config.max_capacity_prompt, 
+        kernel_size = self.config.kernel_size,
+        pooling = self.config.pooling,
+        merge = self.config.merge,
+        )
+
+def init_adakv(self):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'maxpool'
+        if not hasattr(self.config, 'floor_ratio'):
+            self.config.floor_ratio = 0.2
+        if not hasattr(self.config, 'normalize'):
+            self.config.normalize = True
+    # max_capacity_prompt --> base_capacity
+    # init only once
+    if not hasattr(self, "kv_cluster"):
+        self.kv_cluster = AdaKVCluster( 
+            num_hidden_layers = self.config.num_hidden_layers,
+            layer_idx = self.layer_idx,
+            window_size = self.config.window_size, 
+            max_capacity_prompt = self.config.max_capacity_prompt, 
+            kernel_size = self.config.kernel_size,
+            pooling = self.config.pooling,
+            floor = self.config.floor,
+            normalize = self.config.normalize
+            )
+
+
+def init_headkv(self):
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 32
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'maxpool'
+        if not hasattr(self.config, 'head_capacity'):
+            raise ValueError("Must have head_capacity")
+    # max_capacity_prompt --> base_capacity
+    # init only once
+    if not hasattr(self, "kv_cluster"):
+        self.kv_cluster = HeadKVCluster(
+            num_hidden_layers = self.config.num_hidden_layers,
+            layer_idx = self.layer_idx,
+            window_size = self.config.window_size,
+            max_capacity_prompt = self.config.max_capacity_prompt,
+            kernel_size = self.config.kernel_size,
+            pooling = self.config.pooling,
+            head_capacity=self.config.head_capacity
+            )
+
+
+
+# ============================================================================
+# CircuitKV: Capacitive State-Space Model for KV Cache Eviction
+# ============================================================================
+
+class CircuitKVCluster():
+    """
+    Capacitive CircuitKV with Observation Window (P0+P1).
+
+    Physics Model (RC Circuit):
+    - Tokens are CAPACITORS that accumulate charge over time
+    - INITIALIZATION (End of Prefill): Observation Window Strategy
+      * P1: Real H2O from softmax(Q[-W:]@K^T).sum() - true attention importance
+      * P0: Multi-source walks from ALL W tokens - distributed bridge detection
+      * Combined: max(H2O, Circuit) - keeps tokens high on EITHER signal
+    - UPDATE (During Generation): Current from CircuitKV walker updates via EMA
+      Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
+
+    Key Innovations:
+    - P1 (Real H2O): Uses actual attention scores, not key norms
+      * Catches true Heavy Hitters that receive high attention
+    - P0 (Multi-source): Runs walks from observation window, not single token
+      * Catches distributed importance patterns (summarization, few-shot)
+      * Single-source only captures last-token dependencies
+
+    Unlike H2O alone (degree centrality) or raw CircuitKV (instant current),
+    this combines real attention importance with multi-source bridge detection.
+    """
+
+    def __init__(
+        self,
+        window_size: int = 32,
+        max_capacity_prompt: int = 2048,
+        kernel_size: int = 5,
+        pooling: str = 'avgpool',
+        merge = None,
+        # CircuitKV-specific parameters
+        sink_size: int = 4,  # Absorbing boundary (first 4 tokens)
+        top_k: int = 32,
+        alpha: float = 0.85,  # Unused by CircuitKV, kept for API compatibility
+        num_walkers: int = 1024,
+        num_steps: int = 100,  # MAX_STEPS for safety timeout
+        # Capacitive model parameters
+        decay: float = 0.95,  # EMA decay for charge accumulation
+        observation_window: int = 1,  # P0+P1: Last W tokens for H2O attention + multi-source walks
+        # RC+B: Bidirectional Circuit Walks
+        # NOTE: Disabled - R@65 improved but narrativeqa dropped (25.10 -> 23.78)
+        bidirectional: bool = False,
+    ):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        self.sink_size = sink_size
+        self.top_k = top_k
+        self.alpha = alpha
+        self.num_walkers = num_walkers
+        self.num_steps = num_steps
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+        self.decay = decay
+        self.observation_window = observation_window
+        self.bidirectional = bidirectional
+
+        # Lazy initialization of CUDA graph
+        self._graph = None
+        self._device = None
+        self._max_seq_len = 8192  # Will be updated on first use
+
+        # Capacitive State: Accumulated charge for each token
+        self._accumulated_charge = None
+        self._prefill_initialized = False
+
+    def reset(
+        self,
+        window_size: int = 64,
+        max_capacity_prompt: int = 2048,
+        kernel_size: int = 5,
+        pooling: str = 'avgpool',
+        merge = None,
+    ):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+        if self._graph is not None:
+            self._graph.reset()
+        # Reset capacitive state
+        self._accumulated_charge = None
+        self._prefill_initialized = False
+
+    def _lazy_init(self, device, seq_len: int):
+        """Initialize CUDA graph on first use."""
+        if self._graph is None or self._device != device:
+            try:
+                from circuit_kv import _C as circuit_kv_cuda
+                self._max_seq_len = max(seq_len * 2, 8192)  # Buffer for growth
+                self._graph = circuit_kv_cuda.CircuitGraph(
+                    self._max_seq_len,
+                    self.top_k,
+                    self.alpha,
+                    self.num_walkers,
+                    self.num_steps,
+                )
+                self._device = device
+            except ImportError:
+                raise ImportError(
+                    "CircuitKV CUDA extension not found. "
+                    "Install with: pip install -e ./CircuitKV"
+                )
+
+    def _get_keep_mask(self, scores: torch.Tensor, budget: int, seq_len: int) -> torch.Tensor:
+        """
+        Get a boolean mask indicating which tokens to keep.
+
+        Implements Static Budgeting logic:
+        1. Handle both static (int) and dynamic (float) budgets
+        2. Always keep Sink tokens (first sink_size) and Local window (last window_size)
+        3. Fill remaining budget with top current-flow scored tokens
+
+        Args:
+            scores: Current-flow scores from random walks [seq_len]
+            budget: Total tokens to keep (static) or ratio (dynamic)
+            seq_len: Current sequence length
+
+        Returns:
+            Boolean mask [seq_len] where True = keep
+        """
+        # 1. Handle Budget Types (Static vs Dynamic)
+        if isinstance(budget, float) and budget <= 1.0:
+            # Dynamic: 0.2 means 20% of sequence
+            target_count = int(seq_len * budget)
+        else:
+            # Static: 1024 means exactly 1024 tokens
+            target_count = int(budget)
+
+        # 2. Safety Constraints: Always keep Sink + Local
+        min_required = self.sink_size + self.window_size
+        if target_count < min_required:
+            target_count = min_required
+
+        # 3. Circuit Selection
+        device = scores.device
+        mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        mask[:self.sink_size] = True  # Keep Sink
+
+        local_start = max(self.sink_size, seq_len - self.window_size)
+        mask[local_start:] = True  # Keep Local
+
+        current_kept = mask.sum().item()
+        remaining_slots = max(0, target_count - current_kept)
+
+        if remaining_slots > 0:
+            # Zero out scores for tokens we already force-kept
+            scores_masked = scores[:seq_len].clone()
+            scores_masked[mask] = float('-inf')
+
+            # Top-K selection for the remaining budget
+            k = min(remaining_slots, (~mask).sum().item())
+            if k > 0:
+                _, topk_indices = torch.topk(scores_masked, k)
+                mask[topk_indices] = True
+
+        return mask
+
+    def _initialize_charge_from_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        q_len: int,
+        head_dim: int,
+    ):
+        """
+        Initialize capacitor charge using Observation Window + Union (Max).
+
+        **P0+P1 Implementation:**
+        - P1 (Real H2O): Compute softmax(Q[-W:]@K^T).sum() instead of key norms
+          * Uses actual attention importance from observation window queries
+          * Captures true "Heavy Hitters" that receive high attention
+        - P0 (Multi-source walks): Run walks from ALL tokens in observation window
+          * Aggregates visit counts from W parallel walks
+          * Captures distributed importance, not just last-token dependencies
+        - Combination: max(H2O, Circuit) - keeps tokens high on EITHER signal
+
+        Args:
+            query_states: [bsz, num_heads, seq_len, head_dim]
+            key_states: [bsz, num_heads, seq_len, head_dim]
+            q_len: Sequence length
+            head_dim: Dimension of attention heads
+        """
+        import math
+        import torch.nn.functional as F
+
+        device = key_states.device
+
+        # Observation window size (capped by sequence length)
+        W = min(self.observation_window, q_len - self.sink_size)
+        W = max(W, 1)  # At least 1 token
+
+        # =====================================================================
+        # P1: REAL ATTENTION-BASED H2O (Not key norms!)
+        # Compute softmax(Q[-W:] @ K^T / sqrt(d)).sum(dim=0) for true importance
+        # =====================================================================
+        # Get queries from observation window: [W, head_dim] (first head)
+        queries_window = query_states[0, 0, -W:, :].contiguous()  # [W, head_dim]
+        keys_flat = key_states[0, 0, :q_len, :].contiguous()  # [q_len, head_dim]
+
+        # Compute attention scores: [W, q_len] = [W, head_dim] @ [head_dim, q_len]
+        attn_logits = queries_window @ keys_flat.T / math.sqrt(head_dim)
+
+        # Apply causal mask: query at position (q_len - W + i) can only attend to [0, q_len - W + i]
+        causal_mask = torch.ones(W, q_len, device=device, dtype=torch.bool)
+        for i in range(W):
+            query_pos = q_len - W + i
+            causal_mask[i, query_pos + 1:] = False  # Mask future tokens
+
+        attn_logits = attn_logits.masked_fill(~causal_mask, float('-inf'))
+
+        # Softmax and sum across window queries -> H2O importance
+        attn_weights = F.softmax(attn_logits.float(), dim=-1)  # [W, q_len]
+        h2o = attn_weights.sum(dim=0)  # [q_len] - total attention received from window
+
+        # Normalize to [0, 1]
+        h2o_max = h2o.max()
+        if h2o_max > 0:
+            h2o = h2o / h2o_max
+
+        # =====================================================================
+        # P0+P3: CIRCUIT WALKS (CUDA-parallelized)
+        # Run walks from observation window - either unidirectional or bidirectional
+        # =====================================================================
+        if self._graph is not None:
+            # Build source indices array
+            source_indices = torch.arange(
+                q_len - W, q_len,
+                device=device, dtype=torch.int32
+            )
+
+            # Convert queries to FP32 for CUDA kernel
+            queries_fp32 = queries_window.float().contiguous()
+            keys_fp32 = keys_flat[:q_len].float().contiguous()
+
+            if self.bidirectional:
+                # =====================================================================
+                # RC+B: BIDIRECTIONAL CIRCUIT WALKS
+                # Run walks in BOTH directions:
+                # - Backward: Query -> Sink (who does query attend to)
+                # - Forward: Sink -> Query (who attends to sink, via transpose graph)
+                # Bridge bonus for tokens visited by BOTH directions
+                # =====================================================================
+                self._graph.update_and_step_circuit_bidirectional(
+                    queries_fp32, keys_fp32, source_indices
+                )
+
+                # Get combined bidirectional scores (includes bridge bonus)
+                circuit_total = self._graph.get_bidirectional_scores()[:q_len].float()
+            else:
+                # Standard unidirectional multi-source walks
+                self._graph.update_and_step_circuit_multi_source(
+                    queries_fp32, keys_fp32, source_indices
+                )
+
+                # Get aggregated visit counts from all W sources
+                circuit_total = self._graph.get_scores()[:q_len].float()
+
+            # =====================================================================
+            # FIXED SCALING (NOT dynamic normalization)
+            # Scale by (num_walkers * W) so 10% visits across all walks -> ~1.0
+            # =====================================================================
+            scale_factor = 10.0 / (self.num_walkers * W)
+            circuit = circuit_total * scale_factor
+        else:
+            # Fallback if graph not initialized
+            circuit = torch.ones(q_len, device=device, dtype=torch.float32)
+
+        # =====================================================================
+        # UNION (MAX) STRATEGY: Keep tokens high on EITHER signal
+        # - Heavy Hitters (H2O from real attention) are preserved
+        # - Circuit Bridges (from multi-source walks) are added
+        # =====================================================================
+        combined = torch.maximum(h2o, circuit)
+
+        # Initialize accumulated charge buffer
+        self._accumulated_charge = torch.zeros(
+            self._max_seq_len,
+            device=device,
+            dtype=torch.float32,
+        )
+        self._accumulated_charge[:q_len] = combined
+        self._prefill_initialized = True
+
+    def update_kv(
+        self,
+        key_states: torch.Tensor,
+        query_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask,
+        num_key_value_groups: int,
+    ):
+        """
+        Update KV cache using Capacitive CircuitKV eviction.
+
+        This implements the RC Circuit model:
+        1. INITIALIZATION: If first call, compute H2O scores from attention
+           and use them to initialize capacitor charge (steady state)
+        2. UPDATE: Run circuit walker and apply EMA to accumulated charge
+        3. EVICTION: Select top tokens by accumulated charge
+
+        Args:
+            key_states: [bsz, num_heads, seq_len, head_dim]
+            query_states: [bsz, num_heads, seq_len, head_dim]
+            value_states: [bsz, num_heads, seq_len, head_dim]
+            attention_mask: Attention mask
+            num_key_value_groups: Number of KV groups
+
+        Returns:
+            Compressed key_states, value_states
+        """
+        # Check if prefix phase
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+
+        print(f"CircuitKV max_capacity_prompt {self.max_capacity_prompt}")
+
+        # If sequence is shorter than budget, no eviction needed
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+
+        # Initialize CUDA graph if needed
+        self._lazy_init(key_states.device, q_len)
+
+        # =====================================================================
+        # STEP 1: H2O INITIALIZATION (Steady State from Prefill)
+        # =====================================================================
+        if not self._prefill_initialized:
+            self._initialize_charge_from_attention(
+                query_states, key_states, q_len, head_dim
+            )
+
+        # =====================================================================
+        # STEP 2: CIRCUIT WALKER UPDATE (Dynamic Current Injection)
+        # =====================================================================
+        # We use the last query's attention as the "current" token (source)
+        current_idx = q_len - 1
+
+        # Extract query and keys for graph update (using last query)
+        query_flat = query_states[0, 0, -1, :].contiguous()  # Last query (SOURCE)
+        keys_flat = key_states[0, 0, :, :].contiguous()  # All keys
+
+        # Run absorbing walks to get instant current flow
+        self._graph.update_and_step_circuit(query_flat, keys_flat, current_idx)
+
+        # Get instant current from walker
+        instant_current = self._graph.get_scores()
+
+        # Normalize instant current to [0, 1]
+        max_current = instant_current[:current_idx + 1].max()
+        if max_current > 0:
+            instant_current_norm = instant_current / max_current
+        else:
+            instant_current_norm = instant_current
+
+        # =====================================================================
+        # STEP 3: EMA CHARGE UPDATE
+        # Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
+        # =====================================================================
+        self._accumulated_charge = (
+            self.decay * self._accumulated_charge +
+            (1 - self.decay) * instant_current_norm.float()
+        )
+
+        # =====================================================================
+        # STEP 4: EVICTION BASED ON ACCUMULATED CHARGE
+        # =====================================================================
+        # Use accumulated charge for selection (not raw instant current)
+        scores = self._accumulated_charge
+
+        # Compute keep mask using static budgeting
+        keep_mask = self._get_keep_mask(
+            scores,
+            self.max_capacity_prompt,
+            q_len
+        )
+
+        # Apply eviction per head
+        # Get indices of tokens to keep (excluding local window which is appended)
+        non_local_mask = keep_mask.clone()
+        non_local_mask[-self.window_size:] = False
+        keep_indices = non_local_mask.nonzero(as_tuple=True)[0]
+
+        # Number of non-local tokens to keep
+        num_keep = keep_indices.shape[0]
+
+        # Gather selected tokens
+        indices_expanded = keep_indices.view(1, 1, -1, 1).expand(bsz, num_heads, -1, head_dim)
+
+        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
+        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
+
+        # Append local window
+        k_cur = key_states[:, :, -self.window_size:, :]
+        v_cur = value_states[:, :, -self.window_size:, :]
+
+        key_states = torch.cat([k_past_compress, k_cur], dim=2)
+        value_states = torch.cat([v_past_compress, v_cur], dim=2)
+
+        return key_states, value_states
+
+
+def init_circuitkv(self):
+    """Initialize Capacitive CircuitKV cluster for attention layer."""
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 64
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+        if not hasattr(self.config, 'merge'):
+            self.config.merge = None
+        # CircuitKV-specific defaults
+        if not hasattr(self.config, 'sink_size'):
+            self.config.sink_size = 4  # Absorbing boundary
+        if not hasattr(self.config, 'top_k'):
+            self.config.top_k = 32
+        if not hasattr(self.config, 'alpha'):
+            self.config.alpha = 0.85  # Unused, kept for API compatibility
+        if not hasattr(self.config, 'num_walkers'):
+            self.config.num_walkers = 2048
+        if not hasattr(self.config, 'num_steps'):
+            self.config.num_steps = 100  # MAX_STEPS for safety timeout
+        # Capacitive model parameter
+        if not hasattr(self.config, 'decay'):
+            self.config.decay = 0.99  # EMA decay for charge accumulation
+        # RC+B: Bidirectional Circuit Walks (disabled - hurt narrativeqa score)
+        if not hasattr(self.config, 'bidirectional'):
+            self.config.bidirectional = False
+
+    self.kv_cluster = CircuitKVCluster(
+        window_size=self.config.window_size,
+        max_capacity_prompt=self.config.max_capacity_prompt,
+        kernel_size=self.config.kernel_size,
+        pooling=self.config.pooling,
+        merge=self.config.merge,
+        sink_size=self.config.sink_size,
+        top_k=self.config.top_k,
+        alpha=self.config.alpha,
+        num_walkers=self.config.num_walkers,
+        num_steps=self.config.num_steps,
+        decay=self.config.decay,
+        bidirectional=self.config.bidirectional,
+    )
