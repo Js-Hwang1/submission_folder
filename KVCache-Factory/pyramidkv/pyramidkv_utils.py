@@ -1092,30 +1092,26 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    Capacitive CircuitKV with Distributed Observation Sampling.
+    Capacitive CircuitKV with Entropy-Adaptive Weighting.
 
-    Physics Model (RC Circuit with Multi-Probe Measurement):
+    Physics Model (RC Circuit with Adaptive Impedance):
     - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill): Distributed Observation Strategy
-      * For long documents: Sample observations at 25%, 50%, 75%, 100% of sequence
-      * Each observation computes H2O + Circuit from its OWN query position
-      * MAX aggregation: "If ANY probe thinks you're important, keep it"
+    - INITIALIZATION (End of Prefill): Entropy-Adaptive combination
+      * H2O: Attention-based importance (what the question attends to)
+      * Circuit: Walk-based importance (path from question to sink)
+      * Entropy: Measures attention spread (sharp vs broad)
+      * Combined: alpha*H2O + (1-alpha)*Circuit where alpha = normalized_entropy
     - UPDATE (During Generation): Current from CircuitKV walker updates via EMA
-      Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
 
-    Key Innovation - Distributed Observation:
-    - Problem: Single-source walk (from last token) misses content important
-      to earlier parts of the document. Coverage tasks (summarization) fail.
-    - Solution: Sample multiple observation points throughout the document.
-      Each observation gets its OWN query-specific graph and walk.
-    - MAX Aggregation (not SUM): Preserves needle signal (from last position)
-      while adding coverage signal (from earlier positions).
+    Key Innovation - Entropy-Adaptive Weighting:
+    - High entropy (broad attention) → Coverage task → Trust H2O more
+    - Low entropy (sharp attention) → Needle task → Trust Circuit more
+    - Automatically adapts to task characteristics without explicit task labels
 
     Physics Interpretation:
-    - Each observation = voltage probe at different document location
-    - MAX = peak importance potential across all probes
-    - Needle preserved: 100% position finds the needle path
-    - Coverage added: Earlier positions capture distributed importance
+    - Entropy = spread of electrical potential field
+    - Sharp potential → current flows on clear path (Circuit useful)
+    - Diffuse potential → current spreads everywhere (Circuit noisy, use H2O)
     """
 
     def __init__(
@@ -1263,24 +1259,22 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using Distributed Observation Sampling.
+        Initialize capacitor charge using Entropy-Adaptive Weighting.
 
-        **Distributed Observation Strategy:**
-        For long documents, importance varies throughout. A single observation
-        point (last token) misses content important to earlier positions.
+        **Entropy-Adaptive Strategy:**
+        The attention entropy tells us whether the question is focused (needle)
+        or broad (coverage):
+        - Low entropy = sharp attention = needle task → Circuit finds the path
+        - High entropy = broad attention = coverage task → Circuit adds noise
 
-        This implementation samples multiple observation points throughout
-        the document (e.g., 25%, 50%, 75%, 100%) and aggregates via MAX:
-        - Each observation point computes H2O + Circuit with its OWN query
-        - MAX aggregation: "If ANY observation thinks you're important, keep it"
+        We adaptively weight H2O vs Circuit based on attention entropy:
+        - combined = alpha * h2o + (1 - alpha) * circuit
+        - alpha = normalized_entropy (0 to 1)
 
         Physics Interpretation:
-        - Each observation = voltage probe at different document locations
-        - MAX = peak importance potential across all probes
-
-        Key Properties:
-        - Needle Preserved: Last position (100%) finds needle path
-        - Coverage Added: Earlier positions capture distributed importance
+        - Entropy measures "spread" of electrical potential
+        - Sharp potential (low entropy) → current flows on clear path (use Circuit)
+        - Diffuse potential (high entropy) → current spreads everywhere (use H2O)
 
         Args:
             query_states: [bsz, num_heads, seq_len, head_dim]
@@ -1293,84 +1287,62 @@ class CircuitKVCluster():
 
         device = key_states.device
 
-        # =====================================================================
-        # DISTRIBUTED OBSERVATION: Sample multiple positions throughout document
-        # - Short docs (<1000): Just use last position (original behavior)
-        # - Long docs: Sample at 25%, 50%, 75%, 100% of sequence
-        # =====================================================================
-        if q_len < 1000:
-            # Short document: single observation at end (original behavior)
-            sample_fractions = [1.0]
-        else:
-            # Long document: distributed sampling for coverage
-            sample_fractions = [0.25, 0.50, 0.75, 1.0]
+        # Get query and keys from last position
+        Q_last = query_states[0, 0, -1, :].contiguous()  # [head_dim]
+        K_all = key_states[0, 0, :q_len, :].contiguous()  # [q_len, head_dim]
 
-        # Convert fractions to positions, ensuring valid indices
-        sample_positions = []
-        for f in sample_fractions:
-            pos = max(self.sink_size + 1, int(f * q_len) - 1)
-            pos = min(pos, q_len - 1)  # Clamp to valid range
-            sample_positions.append(pos)
+        # ---------------------------------------------------------------------
+        # H2O: Attention-based importance from question position
+        # ---------------------------------------------------------------------
+        attn_logits = Q_last @ K_all.T / math.sqrt(head_dim)
+        attn_probs = F.softmax(attn_logits.float(), dim=-1)  # [q_len] - actual probabilities
 
-        # Ensure last position is exactly q_len - 1 (for needle preservation)
-        sample_positions[-1] = q_len - 1
-        # Remove duplicates and sort
-        sample_positions = sorted(set(sample_positions))
+        # ---------------------------------------------------------------------
+        # Compute Attention Entropy (measures spread)
+        # High entropy = broad attention (coverage task)
+        # Low entropy = focused attention (needle task)
+        # ---------------------------------------------------------------------
+        # Entropy: H = -sum(p * log(p))
+        entropy = -torch.sum(attn_probs * torch.log(attn_probs + 1e-10))
+        max_entropy = math.log(q_len)  # Maximum possible entropy (uniform distribution)
+        normalized_entropy = (entropy / max_entropy).clamp(0, 1)  # [0, 1]
 
-        # Initialize combined scores buffer
-        combined = torch.zeros(q_len, device=device, dtype=torch.float32)
+        # H2O normalized to [0, 1]
+        h2o = attn_probs.clone()
+        h2o_max = h2o.max()
+        if h2o_max > 0:
+            h2o = h2o / h2o_max
 
-        # Scale factor for circuit scores
+        # ---------------------------------------------------------------------
+        # Circuit: Walk-based importance from question position
+        # ---------------------------------------------------------------------
         scale_factor = 10.0 / self.num_walkers
 
-        # =====================================================================
-        # OBSERVATION LOOP: For each sample position, compute H2O + Circuit
-        # =====================================================================
-        for p in sample_positions:
-            # Skip invalid positions
-            if p < self.sink_size + 1:
-                continue
+        if self._graph is not None:
+            Q_fp32 = Q_last.float().unsqueeze(0).contiguous()  # [1, head_dim]
+            K_fp32 = K_all.float().contiguous()
 
-            # -----------------------------------------------------------------
-            # H2O: Attention-based importance from position p
-            # Query at p can only see keys [0, p] (causal)
-            # -----------------------------------------------------------------
-            Q_p = query_states[0, 0, p, :].contiguous()  # [head_dim]
-            K_p = key_states[0, 0, :p+1, :].contiguous()  # [p+1, head_dim]
+            # Build graph from question's attention and run walk
+            self._graph.update_and_step_circuit(Q_fp32, K_fp32, q_len - 1)
+            circuit = self._graph.get_scores()[:q_len].float()
+            circuit = circuit * scale_factor
 
-            attn_logits = Q_p @ K_p.T / math.sqrt(head_dim)
-            h2o_p = F.softmax(attn_logits.float(), dim=-1)  # [p+1]
+            # Normalize circuit to [0, 1] for fair combination
+            circuit_max = circuit.max()
+            if circuit_max > 0:
+                circuit = circuit / circuit_max
+        else:
+            circuit = torch.zeros(q_len, device=device, dtype=torch.float32)
 
-            # Normalize to [0, 1]
-            h2o_max = h2o_p.max()
-            if h2o_max > 0:
-                h2o_p = h2o_p / h2o_max
+        # ---------------------------------------------------------------------
+        # ENTROPY-ADAPTIVE WEIGHTING
+        # High entropy (coverage) → trust H2O more (alpha → 1)
+        # Low entropy (needle) → trust Circuit more (alpha → 0)
+        # ---------------------------------------------------------------------
+        alpha = normalized_entropy.item()
 
-            # -----------------------------------------------------------------
-            # Circuit: Walk-based importance from position p
-            # Graph built from Q_p's attention pattern, walk starts at p
-            # -----------------------------------------------------------------
-            if self._graph is not None:
-                Q_fp32 = Q_p.float().unsqueeze(0).contiguous()  # [1, head_dim]
-                K_fp32 = K_p.float().contiguous()
-
-                # Build graph from Q_p and run walk from position p
-                self._graph.update_and_step_circuit(Q_fp32, K_fp32, p)
-                circuit_p = self._graph.get_scores()[:p+1].float()
-                circuit_p = circuit_p * scale_factor
-            else:
-                circuit_p = torch.zeros(p+1, device=device, dtype=torch.float32)
-
-            # -----------------------------------------------------------------
-            # Local MAX: Combine H2O and Circuit for this observation
-            # -----------------------------------------------------------------
-            local = torch.maximum(h2o_p, circuit_p)
-
-            # -----------------------------------------------------------------
-            # Global MAX: Update combined scores
-            # "If ANY observation thinks you're important, you're important"
-            # -----------------------------------------------------------------
-            combined[:p+1] = torch.maximum(combined[:p+1], local)
+        # Weighted combination instead of MAX
+        combined = alpha * h2o + (1 - alpha) * circuit
 
         # Initialize accumulated charge buffer
         self._accumulated_charge = torch.zeros(
