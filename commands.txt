@@ -1,0 +1,17 @@
+tar -czvf /Users/j/Desktop/submission_folder.tar.gz -C /Users/j/Desktop submission_folder
+
+ssh -o StrictHostKeyChecking=no -i /Users/j/Downloads/lambdakey.pem  ubuntu@192.222.57.
+
+# 1. Download the ARM64 installer
+wget "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
+
+# 2. Run the installer (batch mode -b for no interaction)
+bash Miniforge3-Linux-aarch64.sh -b
+
+# 3. Initialize conda for your shell
+~/miniforge3/bin/conda init bash
+
+# 4. Refresh your shell so the 'conda' command works
+source ~/.bashrc
+
+ssh-keygen -t ed25519 -C "gh200_lambda"
