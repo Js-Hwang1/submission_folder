@@ -5,7 +5,7 @@
 **Model:** Meta-Llama-3-8B-Instruct
 **KV Budget:** 2048 tokens
 **Attention:** flash_attention_2
-**Hardware:** GH200 Superchip
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
 
 ### Results Table
 

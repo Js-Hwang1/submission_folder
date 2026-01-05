@@ -1358,48 +1358,26 @@ class CircuitKVCluster():
             h2o = h2o / h2o_max
 
         # =====================================================================
-        # P0+P3: CIRCUIT WALKS (CUDA-parallelized)
-        # Run walks from observation window - either unidirectional or bidirectional
+        # P0: CIRCUIT WALKS (Single-source from last query position)
+        # Run walks from the last token in observation window
         # =====================================================================
         if self._graph is not None:
-            # Build source indices array
-            source_indices = torch.arange(
-                q_len - W, q_len,
-                device=device, dtype=torch.int32
-            )
-
-            # Convert queries to FP32 for CUDA kernel
-            queries_fp32 = queries_window.float().contiguous()
+            # Convert to FP32 for CUDA kernel
+            # Use last query in window as the source
+            last_query = queries_window[-1:].float().contiguous()  # [1, head_dim]
             keys_fp32 = keys_flat[:q_len].float().contiguous()
 
-            if self.bidirectional:
-                # =====================================================================
-                # RC+B: BIDIRECTIONAL CIRCUIT WALKS
-                # Run walks in BOTH directions:
-                # - Backward: Query -> Sink (who does query attend to)
-                # - Forward: Sink -> Query (who attends to sink, via transpose graph)
-                # Bridge bonus for tokens visited by BOTH directions
-                # =====================================================================
-                self._graph.update_and_step_circuit_bidirectional(
-                    queries_fp32, keys_fp32, source_indices
-                )
+            # Run circuit walk from last position
+            self._graph.update_and_step_circuit(last_query, keys_fp32, q_len - 1)
 
-                # Get combined bidirectional scores (includes bridge bonus)
-                circuit_total = self._graph.get_bidirectional_scores()[:q_len].float()
-            else:
-                # Standard unidirectional multi-source walks
-                self._graph.update_and_step_circuit_multi_source(
-                    queries_fp32, keys_fp32, source_indices
-                )
-
-                # Get aggregated visit counts from all W sources
-                circuit_total = self._graph.get_scores()[:q_len].float()
+            # Get visit counts
+            circuit_total = self._graph.get_scores()[:q_len].float()
 
             # =====================================================================
             # FIXED SCALING (NOT dynamic normalization)
-            # Scale by (num_walkers * W) so 10% visits across all walks -> ~1.0
+            # Scale by num_walkers so 10% visits -> ~1.0
             # =====================================================================
-            scale_factor = 10.0 / (self.num_walkers * W)
+            scale_factor = 10.0 / self.num_walkers
             circuit = circuit_total * scale_factor
         else:
             # Fallback if graph not initialized
