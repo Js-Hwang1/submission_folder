@@ -1259,48 +1259,80 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using H2O scores from attention weights.
+        Initialize capacitor charge using Dual H2O strategy.
 
-        This is the EXACT working implementation that produced Qasper 30.85.
-        Uses window_size queries across ALL heads, averages across heads.
-        Pure H2O initialization - no circuit walker in init.
+        Combines two H2O signals with MAX:
+        1. Full-Query H2O (like H2O method): Captures narrative flow, early context
+        2. Window H2O (like SnapKV): Captures question focus, local relevance
+
+        MAX ensures we never lose tokens important to EITHER signal:
+        - NarrativeQA benefits from full-query (narrative dependencies)
+        - Qasper benefits from window (structured paper, question focus)
         """
-        # Compute attention weights for H2O scores
-        # Use last window_size queries to compute importance (like SnapKV)
-        attn_weights = torch.matmul(
+        device = key_states.device
+
+        # =====================================================================
+        # SIGNAL 1: Full-Query H2O (like H2O method)
+        # Uses ALL queries - captures narrative flow and early context importance
+        # =====================================================================
+        attn_full = torch.matmul(
+            query_states,
+            key_states.transpose(2, 3)
+        ) / math.sqrt(head_dim)
+
+        # Causal mask for full attention
+        causal_mask = torch.triu(
+            torch.full((q_len, q_len), torch.finfo(attn_full.dtype).min, device=device),
+            diagonal=1
+        )
+        attn_full = attn_full + causal_mask[None, None, :, :]
+        attn_full = F.softmax(attn_full, dim=-1, dtype=torch.float32)
+
+        # Sum across all queries, average across heads
+        h2o_full = attn_full[:, :, :, :-self.window_size].sum(dim=-2).mean(dim=(0, 1))
+        h2o_full_max = h2o_full.max()
+        if h2o_full_max > 0:
+            h2o_full = h2o_full / h2o_full_max
+
+        # =====================================================================
+        # SIGNAL 2: Window H2O (like SnapKV/working baseline)
+        # Uses last window_size queries - captures question focus
+        # =====================================================================
+        attn_window = torch.matmul(
             query_states[..., -self.window_size:, :],
             key_states.transpose(2, 3)
         ) / math.sqrt(head_dim)
 
-        # Apply causal mask to window
-        mask = torch.full(
+        # Causal mask for window
+        window_mask = torch.full(
             (self.window_size, self.window_size),
-            torch.finfo(attn_weights.dtype).min,
-            device=attn_weights.device
+            torch.finfo(attn_window.dtype).min,
+            device=device
         )
-        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        attn_weights[:, :, -self.window_size:, -self.window_size:] += mask[None, None, :, :]
+        mask_cond = torch.arange(window_mask.size(-1), device=device)
+        window_mask.masked_fill_(mask_cond < (mask_cond + 1).view(window_mask.size(-1), 1), 0)
+        attn_window[:, :, -self.window_size:, -self.window_size:] += window_mask[None, None, :, :]
+        attn_window = F.softmax(attn_window, dim=-1, dtype=torch.float32)
 
-        # Softmax and sum across queries (H2O accumulated attention)
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        # Sum across window queries, average across heads
+        h2o_window = attn_window[:, :, :, :-self.window_size].sum(dim=-2).mean(dim=(0, 1))
+        h2o_window_max = h2o_window.max()
+        if h2o_window_max > 0:
+            h2o_window = h2o_window / h2o_window_max
 
-        # Sum across query positions and average across heads -> H2O scores
-        # Shape: [seq_len]
-        h2o_scores = attn_weights[:, :, :, :-self.window_size].sum(dim=-2).mean(dim=(0, 1))
-
-        # Normalize to [0, 1]
-        max_score = h2o_scores.max()
-        if max_score > 0:
-            h2o_scores = h2o_scores / max_score
+        # =====================================================================
+        # COMBINE: MAX of both signals
+        # Never lose tokens important to EITHER narrative flow OR question focus
+        # =====================================================================
+        h2o_scores = torch.maximum(h2o_full, h2o_window)
 
         # Initialize accumulated charge
         self._accumulated_charge = torch.zeros(
             self._max_seq_len,
-            device=key_states.device,
+            device=device,
             dtype=torch.float32,
         )
-        # Fill non-window portion with H2O scores
+        # Fill non-window portion with combined H2O scores
         non_window_len = min(q_len - self.window_size, h2o_scores.shape[0])
         if non_window_len > 0:
             self._accumulated_charge[:non_window_len] = h2o_scores[:non_window_len]
