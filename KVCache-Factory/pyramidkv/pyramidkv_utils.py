@@ -1092,26 +1092,26 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    Capacitive CircuitKV with Entropy-Adaptive Weighting.
+    Capacitive CircuitKV with Entropy-Adaptive Gating.
 
     Physics Model (RC Circuit with Adaptive Impedance):
     - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill): Entropy-Adaptive combination
+    - INITIALIZATION (End of Prefill): Entropy-Adaptive gating
       * H2O: Attention-based importance (what the question attends to)
       * Circuit: Walk-based importance (path from question to sink)
       * Entropy: Measures attention spread (sharp vs broad)
-      * Combined: alpha*H2O + (1-alpha)*Circuit where alpha = normalized_entropy
+      * Combined: MAX(H2O, Circuit) gated by entropy
     - UPDATE (During Generation): Current from CircuitKV walker updates via EMA
 
-    Key Innovation - Entropy-Adaptive Weighting:
-    - High entropy (broad attention) → Coverage task → Trust H2O more
-    - Low entropy (sharp attention) → Needle task → Trust Circuit more
-    - Automatically adapts to task characteristics without explicit task labels
+    Key Innovation - Entropy-Adaptive Gating:
+    - Low entropy (<0.6): Use MAX(H2O, Circuit) - Circuit finds useful bridges
+    - High entropy (>0.85): Use H2O only - Circuit adds noise, remove it
+    - In between: Smooth transition preserving both behaviors
 
     Physics Interpretation:
-    - Entropy = spread of electrical potential field
-    - Sharp potential → current flows on clear path (Circuit useful)
-    - Diffuse potential → current spreads everywhere (Circuit noisy, use H2O)
+    - MAX preserves peak signals (critical for needle tasks)
+    - Entropy gates whether Circuit contributes or just adds noise
+    - Automatically adapts without explicit task labels
     """
 
     def __init__(
@@ -1259,22 +1259,23 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using Entropy-Adaptive Weighting.
+        Initialize capacitor charge using Entropy-Adaptive Gating.
 
-        **Entropy-Adaptive Strategy:**
+        **Entropy-Adaptive Gating Strategy:**
         The attention entropy tells us whether the question is focused (needle)
         or broad (coverage):
-        - Low entropy = sharp attention = needle task → Circuit finds the path
+        - Low entropy = sharp attention = needle task → Circuit finds bridges
         - High entropy = broad attention = coverage task → Circuit adds noise
 
-        We adaptively weight H2O vs Circuit based on attention entropy:
-        - combined = alpha * h2o + (1 - alpha) * circuit
-        - alpha = normalized_entropy (0 to 1)
+        Key insight: MAX preserves peak signals, weighted average dilutes them.
+        We use MAX as baseline, and only gate out Circuit for high entropy:
+        - entropy < 0.6: pure MAX(H2O, Circuit) - preserves needle behavior
+        - entropy > 0.85: pure H2O - removes circuit noise for coverage
+        - in between: smooth transition
 
         Physics Interpretation:
-        - Entropy measures "spread" of electrical potential
-        - Sharp potential (low entropy) → current flows on clear path (use Circuit)
-        - Diffuse potential (high entropy) → current spreads everywhere (use H2O)
+        - Low entropy = concentrated potential → current has clear path (Circuit useful)
+        - High entropy = diffuse potential → current spreads everywhere (Circuit noisy)
 
         Args:
             query_states: [bsz, num_heads, seq_len, head_dim]
@@ -1335,14 +1336,26 @@ class CircuitKVCluster():
             circuit = torch.zeros(q_len, device=device, dtype=torch.float32)
 
         # ---------------------------------------------------------------------
-        # ENTROPY-ADAPTIVE WEIGHTING
-        # High entropy (coverage) → trust H2O more (alpha → 1)
-        # Low entropy (needle) → trust Circuit more (alpha → 0)
+        # ENTROPY-ADAPTIVE GATING (Preserve MAX, gate Circuit for high entropy)
+        #
+        # Key insight: MAX preserves peak signals, weighted average dilutes them.
+        # - Low entropy (needle): Use MAX - Circuit finds useful bridges
+        # - High entropy (coverage): Use H2O only - Circuit adds noise
+        #
+        # Smooth transition between MAX and H2O-only based on entropy.
         # ---------------------------------------------------------------------
-        alpha = normalized_entropy.item()
+        entropy_val = normalized_entropy.item()
 
-        # Weighted combination instead of MAX
-        combined = alpha * h2o + (1 - alpha) * circuit
+        # Smooth transition: 0 at entropy=0.6, 1 at entropy=0.85
+        # Below 0.6: pure MAX (needle tasks)
+        # Above 0.85: pure H2O (coverage tasks)
+        gate = max(0.0, min(1.0, (entropy_val - 0.6) / 0.25))
+
+        # MAX preserves peaks (baseline behavior)
+        max_combined = torch.maximum(h2o, circuit)
+
+        # Interpolate: low entropy → MAX, high entropy → H2O only
+        combined = gate * h2o + (1 - gate) * max_combined
 
         # Initialize accumulated charge buffer
         self._accumulated_charge = torch.zeros(
