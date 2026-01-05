@@ -9,9 +9,19 @@ from tqdm import tqdm
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+# All available datasets
+ALL_DATASETS = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
             "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
             "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+
+# Slow datasets (512 output tokens - summarization tasks)
+SLOW_DATASETS = ["gov_report", "qmsum", "multi_news"]
+
+# Fast datasets (everything except slow ones)
+FAST_DATASETS = [d for d in ALL_DATASETS if d not in SLOW_DATASETS]
+
+# Default to all datasets
+datasets = ALL_DATASETS
 
 dataset2maxlen = {
     "narrativeqa": 128,
@@ -324,6 +334,10 @@ if __name__ == "__main__":
     parser.add_argument("--base_dir", type=str, default="")
     parser.add_argument("--dataset", type=str, default="")
     parser.add_argument("--data_file", type=str, default="")
+    parser.add_argument("--datasets", type=str, default=None,
+                        help="Comma-separated list of datasets to run (e.g., 'hotpotqa,triviaqa,musique'). Default: all datasets")
+    parser.add_argument("--fast_mode", action="store_true",
+                        help="Skip slow summarization tasks (gov_report, qmsum, multi_news). Runs 13/16 datasets.")
     parser.add_argument("--save_dir", type=str, default="")
 
     parser.add_argument("--model_name", type=str, default=None, help="if specified, we will load the model to generate the predictions.")
@@ -403,13 +417,32 @@ if __name__ == "__main__":
     model.eval()
     
     save_dir = args.save_dir
-    
-        
+
+
     max_capacity_prompts = args.max_capacity_prompts
-    
-    for idx, dataset in enumerate(datasets):
-        
-        print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx}/{len(datasets)}")
+
+    # Determine which datasets to run
+    if args.datasets:
+        # User specified explicit list
+        selected_datasets = [d.strip() for d in args.datasets.split(',')]
+        # Validate datasets
+        invalid = [d for d in selected_datasets if d not in ALL_DATASETS]
+        if invalid:
+            print(f"Warning: Unknown datasets will be skipped: {invalid}")
+        selected_datasets = [d for d in selected_datasets if d in ALL_DATASETS]
+    elif args.fast_mode:
+        # Fast mode: skip slow summarization tasks
+        selected_datasets = FAST_DATASETS
+        print(f"Fast mode: skipping slow datasets {SLOW_DATASETS}")
+    else:
+        # Default: all datasets
+        selected_datasets = ALL_DATASETS
+
+    print(f"Running {len(selected_datasets)} datasets: {selected_datasets}")
+
+    for idx, dataset in enumerate(selected_datasets):
+
+        print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(selected_datasets)}")
         
         args.dataset = dataset
         
