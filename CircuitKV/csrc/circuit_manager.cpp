@@ -42,9 +42,16 @@ CircuitGraph::CircuitGraph(
     , adj_weights_(nullptr)
     , visit_counts_(nullptr)
     , rng_states_(nullptr)
+    , spectral_v_(nullptr)
+    , spectral_v_temp_(nullptr)
+    , spectral_partial_(nullptr)
+    , spectral_scalar_(nullptr)
+    , walker_scores_(nullptr)
+    , combined_scores_(nullptr)
     , main_stream_(nullptr)
     , sidecar_stream_(nullptr)
     , rng_initialized_(false)
+    , num_power_iterations_(10)
 {
     TORCH_CHECK(max_seq_len > 0, "max_seq_len must be positive");
     TORCH_CHECK(top_k > 0 && top_k <= 64, "top_k must be in (0, 64]");
@@ -85,15 +92,28 @@ CircuitGraph::CircuitGraph(CircuitGraph&& other) noexcept
     , adj_weights_(other.adj_weights_)
     , visit_counts_(other.visit_counts_)
     , rng_states_(other.rng_states_)
+    , spectral_v_(other.spectral_v_)
+    , spectral_v_temp_(other.spectral_v_temp_)
+    , spectral_partial_(other.spectral_partial_)
+    , spectral_scalar_(other.spectral_scalar_)
+    , walker_scores_(other.walker_scores_)
+    , combined_scores_(other.combined_scores_)
     , main_stream_(other.main_stream_)
     , sidecar_stream_(other.sidecar_stream_)
     , rng_initialized_(other.rng_initialized_)
+    , num_power_iterations_(other.num_power_iterations_)
 {
     // Null out other's pointers to prevent double-free
     other.adj_list_ = nullptr;
     other.adj_weights_ = nullptr;
     other.visit_counts_ = nullptr;
     other.rng_states_ = nullptr;
+    other.spectral_v_ = nullptr;
+    other.spectral_v_temp_ = nullptr;
+    other.spectral_partial_ = nullptr;
+    other.spectral_scalar_ = nullptr;
+    other.walker_scores_ = nullptr;
+    other.combined_scores_ = nullptr;
     other.sidecar_stream_ = nullptr;
 }
 
@@ -119,15 +139,28 @@ CircuitGraph& CircuitGraph::operator=(CircuitGraph&& other) noexcept {
         adj_weights_ = other.adj_weights_;
         visit_counts_ = other.visit_counts_;
         rng_states_ = other.rng_states_;
+        spectral_v_ = other.spectral_v_;
+        spectral_v_temp_ = other.spectral_v_temp_;
+        spectral_partial_ = other.spectral_partial_;
+        spectral_scalar_ = other.spectral_scalar_;
+        walker_scores_ = other.walker_scores_;
+        combined_scores_ = other.combined_scores_;
         main_stream_ = other.main_stream_;
         sidecar_stream_ = other.sidecar_stream_;
         rng_initialized_ = other.rng_initialized_;
+        num_power_iterations_ = other.num_power_iterations_;
 
         // Null out other's pointers
         other.adj_list_ = nullptr;
         other.adj_weights_ = nullptr;
         other.visit_counts_ = nullptr;
         other.rng_states_ = nullptr;
+        other.spectral_v_ = nullptr;
+        other.spectral_v_temp_ = nullptr;
+        other.spectral_partial_ = nullptr;
+        other.spectral_scalar_ = nullptr;
+        other.walker_scores_ = nullptr;
+        other.combined_scores_ = nullptr;
         other.sidecar_stream_ = nullptr;
     }
     return *this;
@@ -143,6 +176,11 @@ void CircuitGraph::allocate_memory() {
     size_t visit_counts_size = max_seq_len_ * sizeof(int32_t);
     size_t rng_states_size = num_walkers_ * 2 * sizeof(uint64_t);
 
+    // Spectral buffers
+    size_t spectral_v_size = max_seq_len_ * sizeof(float);
+    size_t spectral_partial_size = 256 * sizeof(float);  // For reduction
+    size_t spectral_scalar_size = sizeof(float);
+
     // Adjacency graph
     CUDA_CHECK(cudaMalloc(&adj_list_, adj_list_size));
     CUDA_CHECK(cudaMalloc(&adj_weights_, adj_weights_size));
@@ -151,10 +189,24 @@ void CircuitGraph::allocate_memory() {
     CUDA_CHECK(cudaMalloc(&visit_counts_, visit_counts_size));
     CUDA_CHECK(cudaMalloc(&rng_states_, rng_states_size));
 
+    // Spectral power iteration buffers
+    CUDA_CHECK(cudaMalloc(&spectral_v_, spectral_v_size));
+    CUDA_CHECK(cudaMalloc(&spectral_v_temp_, spectral_v_size));
+    CUDA_CHECK(cudaMalloc(&spectral_partial_, spectral_partial_size));
+    CUDA_CHECK(cudaMalloc(&spectral_scalar_, spectral_scalar_size));
+
+    // Combined scoring buffers
+    CUDA_CHECK(cudaMalloc(&walker_scores_, spectral_v_size));
+    CUDA_CHECK(cudaMalloc(&combined_scores_, spectral_v_size));
+
     // Initialize all to default values
     CUDA_CHECK(cudaMemset(adj_list_, -1, adj_list_size));
     CUDA_CHECK(cudaMemset(adj_weights_, 0, adj_weights_size));
     CUDA_CHECK(cudaMemset(visit_counts_, 0, visit_counts_size));
+    CUDA_CHECK(cudaMemset(spectral_v_, 0, spectral_v_size));
+    CUDA_CHECK(cudaMemset(spectral_v_temp_, 0, spectral_v_size));
+    CUDA_CHECK(cudaMemset(walker_scores_, 0, spectral_v_size));
+    CUDA_CHECK(cudaMemset(combined_scores_, 0, spectral_v_size));
 }
 
 void CircuitGraph::free_memory() {
@@ -173,6 +225,30 @@ void CircuitGraph::free_memory() {
     if (rng_states_) {
         cudaFree(rng_states_);
         rng_states_ = nullptr;
+    }
+    if (spectral_v_) {
+        cudaFree(spectral_v_);
+        spectral_v_ = nullptr;
+    }
+    if (spectral_v_temp_) {
+        cudaFree(spectral_v_temp_);
+        spectral_v_temp_ = nullptr;
+    }
+    if (spectral_partial_) {
+        cudaFree(spectral_partial_);
+        spectral_partial_ = nullptr;
+    }
+    if (spectral_scalar_) {
+        cudaFree(spectral_scalar_);
+        spectral_scalar_ = nullptr;
+    }
+    if (walker_scores_) {
+        cudaFree(walker_scores_);
+        walker_scores_ = nullptr;
+    }
+    if (combined_scores_) {
+        cudaFree(combined_scores_);
+        combined_scores_ = nullptr;
     }
 }
 
@@ -348,6 +424,178 @@ void CircuitGraph::synchronize() {
     if (sidecar_stream_) {
         CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
     }
+}
+
+void CircuitGraph::update_and_step_circuit_combined(
+    torch::Tensor query,
+    torch::Tensor keys,
+    int current_idx,
+    int num_iterations
+) {
+    CHECK_CUDA(query);
+    CHECK_CUDA(keys);
+    CHECK_CONTIGUOUS(query);
+    CHECK_CONTIGUOUS(keys);
+
+    // Get dimensions
+    int seq_len = keys.size(0);
+    int head_dim = keys.size(1);
+
+    TORCH_CHECK(current_idx >= 0 && current_idx < max_seq_len_,
+                "current_idx out of bounds");
+    TORCH_CHECK(seq_len <= max_seq_len_,
+                "seq_len exceeds max_seq_len");
+
+    // Update current sequence length and power iterations
+    current_seq_len_ = seq_len;
+    num_power_iterations_ = num_iterations;
+
+    // Get current CUDA stream from PyTorch
+    main_stream_ = at::cuda::getCurrentCUDAStream();
+
+    // Ensure main stream is done with query/keys before we use them
+    CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+    // STEP 1: Build the attention graph (same as before)
+    // Dispatch based on dtype
+    if (query.dtype() == torch::kFloat16) {
+        const __half* query_ptr = reinterpret_cast<const __half*>(query.data_ptr<at::Half>());
+        const __half* keys_ptr = reinterpret_cast<const __half*>(keys.data_ptr<at::Half>());
+
+        launch_graph_update_kernel(
+            query_ptr,
+            keys_ptr,
+            adj_list_,
+            adj_weights_,
+            current_idx,
+            seq_len,
+            head_dim,
+            top_k_,
+            sidecar_stream_
+        );
+    } else if (query.dtype() == torch::kFloat32) {
+        const float* query_ptr = query.data_ptr<float>();
+        const float* keys_ptr = keys.data_ptr<float>();
+
+        launch_graph_update_kernel_fp32(
+            query_ptr,
+            keys_ptr,
+            adj_list_,
+            adj_weights_,
+            current_idx,
+            seq_len,
+            head_dim,
+            top_k_,
+            sidecar_stream_
+        );
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype. Use float16 or float32.");
+    }
+    CUDA_CHECK_LAST();
+
+    // STEP 2: Clear visit counts for fresh walker measurement
+    launch_reset_counts_kernel(
+        visit_counts_,
+        max_seq_len_,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 3: Run Absorbing Walker kernel (BOND scoring)
+    launch_absorbing_walker_kernel(
+        adj_list_,
+        adj_weights_,
+        visit_counts_,
+        rng_states_,
+        current_idx,
+        seq_len,
+        top_k_,
+        num_walkers_,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 4: Run Spectral Power Iteration (ATOM scoring)
+    launch_power_iteration(
+        adj_list_,
+        adj_weights_,
+        spectral_v_,
+        spectral_v_temp_,
+        spectral_partial_,
+        spectral_scalar_,
+        seq_len,
+        top_k_,
+        num_power_iterations_,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 5: Convert walker visit counts to float scores
+    launch_convert_visits_kernel(
+        visit_counts_,
+        walker_scores_,
+        seq_len,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 6: Normalize both scores to [0, 1] range
+    int num_reduce_blocks = (seq_len + 255) / 256;
+    if (num_reduce_blocks > 256) num_reduce_blocks = 256;
+
+    // Normalize spectral scores
+    launch_normalize_to_unit_max(
+        spectral_v_,
+        spectral_partial_,
+        spectral_scalar_,
+        seq_len,
+        num_reduce_blocks,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // Normalize walker scores
+    launch_normalize_to_unit_max(
+        walker_scores_,
+        spectral_partial_,
+        spectral_scalar_,
+        seq_len,
+        num_reduce_blocks,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 7: Combine with element-wise MAX
+    launch_max_combine_kernel(
+        spectral_v_,
+        walker_scores_,
+        combined_scores_,
+        seq_len,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+}
+
+torch::Tensor CircuitGraph::get_combined_scores() {
+    // Synchronize sidecar stream to ensure all operations are complete
+    CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
+
+    // Create output tensor on GPU
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(torch::kCUDA);
+
+    torch::Tensor scores = torch::empty({max_seq_len_}, options);
+
+    // Copy combined scores directly (already float)
+    CUDA_CHECK(cudaMemcpy(
+        scores.data_ptr<float>(),
+        combined_scores_,
+        max_seq_len_ * sizeof(float),
+        cudaMemcpyDeviceToDevice
+    ));
+
+    return scores;
 }
 
 }  // namespace circuit_kv

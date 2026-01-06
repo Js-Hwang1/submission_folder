@@ -116,10 +116,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         R"pbdoc(
         Wait for all async operations to complete.
         )pbdoc"
+    )
+    .def("update_and_step_circuit_combined", &CircuitGraph::update_and_step_circuit_combined,
+        py::arg("query"),
+        py::arg("keys"),
+        py::arg("current_idx"),
+        py::arg("num_iterations") = 10,
+        R"pbdoc(
+        Spectral + Walker + MAX: Combined scoring for CircuitKV.
+
+        This method computes importance scores using TWO complementary methods:
+        1. SPECTRAL (Power Iteration): Captures "hub" tokens with global importance
+        2. WALKER (Absorbing Random Walk): Captures "bridge" tokens on Q→Sink path
+
+        Final scores use element-wise MAX to preserve BOTH types of important tokens:
+            combined_score[i] = max(spectral[i], walker[i])
+
+        This is particularly effective for summarization tasks where both global
+        structure (spectral) and reasoning paths (walker) matter.
+
+        Args:
+            query: Query vector [1, head_dim] or [head_dim], FP16/FP32.
+            keys: Key cache [seq_len, head_dim], FP16/FP32.
+            current_idx: Index of the current token (source node for walker).
+            num_iterations: Number of power iterations for spectral (default 10).
+        )pbdoc"
+    )
+    .def("get_combined_scores", &CircuitGraph::get_combined_scores,
+        R"pbdoc(
+        Get the combined (Spectral + Walker + MAX) importance scores.
+
+        Synchronizes the sidecar stream before returning.
+
+        Returns:
+            Tensor of shape [max_seq_len] with combined scores (normalized to [0, 1]).
+        )pbdoc"
     );
 
     // Version info
-    m.attr("__version__") = "0.1.0";
+    m.attr("__version__") = "0.2.0";
 }
 
 }  // namespace circuit_kv

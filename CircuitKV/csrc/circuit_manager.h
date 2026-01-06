@@ -116,6 +116,38 @@ public:
      */
     void synchronize();
 
+    /**
+     * Spectral + Walker + MAX: Combined scoring for CircuitKV.
+     *
+     * This method computes importance scores using TWO complementary methods:
+     * 1. SPECTRAL (Power Iteration): Captures "hub" tokens with global importance
+     * 2. WALKER (Absorbing Random Walk): Captures "bridge" tokens on Q→Sink path
+     *
+     * Final scores use element-wise MAX to preserve BOTH types of important tokens:
+     *   combined_score[i] = max(spectral[i], walker[i])
+     *
+     * This is particularly effective for summarization tasks where both global
+     * structure (spectral) and reasoning paths (walker) matter.
+     *
+     * @param query         Query vector [1, head_dim] or [head_dim], FP16/FP32
+     * @param keys          Key cache [seq_len, head_dim], FP16/FP32
+     * @param current_idx   Index of the current token (source node for walker)
+     * @param num_iterations Number of power iterations for spectral (default 10)
+     */
+    void update_and_step_circuit_combined(
+        torch::Tensor query,
+        torch::Tensor keys,
+        int current_idx,
+        int num_iterations = 10
+    );
+
+    /**
+     * Get the combined (Spectral + Walker + MAX) scores.
+     *
+     * @return Tensor of shape [max_seq_len] with combined scores
+     */
+    torch::Tensor get_combined_scores();
+
 private:
     // Configuration
     int max_seq_len_;
@@ -136,12 +168,25 @@ private:
     // GPU memory: PRNG states
     uint64_t* rng_states_;     // [num_walkers * 2]
 
+    // GPU memory: Spectral power iteration buffers
+    float* spectral_v_;           // [max_seq_len] - eigenvector
+    float* spectral_v_temp_;      // [max_seq_len] - temp for SpMV
+    float* spectral_partial_;     // [256] - for reduction
+    float* spectral_scalar_;      // [1] - for norm/max
+
+    // GPU memory: Combined scores
+    float* walker_scores_;        // [max_seq_len] - normalized walker scores
+    float* combined_scores_;      // [max_seq_len] - final combined scores
+
     // CUDA streams
     cudaStream_t main_stream_;      // Inherited from PyTorch
     cudaStream_t sidecar_stream_;   // Async walker stream
 
     // Initialization flag
     bool rng_initialized_;
+
+    // Spectral configuration
+    int num_power_iterations_;
 
     // Helper methods
     void allocate_memory();

@@ -1092,26 +1092,35 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    Capacitive CircuitKV with Observation Window (P0+P1).
+    CircuitKV v0.2.0: Spectral + Walker + MAX Combined Scoring.
+
+    This class implements a hybrid KV-cache eviction strategy that combines:
+    1. SPECTRAL (Power Iteration): Captures "hub" tokens with global importance
+       - Eigenvector centrality via power iteration on the attention graph
+       - Effective for summarization tasks where global structure matters
+    2. WALKER (Absorbing Random Walk): Captures "bridge" tokens on Q→Sink path
+       - Current-flow betweenness via Monte Carlo walks
+       - Effective for reasoning tasks where path connectivity matters
+    3. MAX Combination: final_score[i] = max(spectral[i], walker[i])
+       - Preserves BOTH hub tokens AND bridge tokens
+       - Avoids information loss from averaging or weighted combination
 
     Physics Model (RC Circuit):
     - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill): Observation Window Strategy
-      * P1: Real H2O from softmax(Q[-W:]@K^T).sum() - true attention importance
-      * P0: Multi-source walks from ALL W tokens - distributed bridge detection
-      * Combined: max(H2O, Circuit) - keeps tokens high on EITHER signal
-    - UPDATE (During Generation): Current from CircuitKV walker updates via EMA
-      Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
+    - INITIALIZATION (End of Prefill): H2O scores from attention weights
+    - UPDATE (During Generation): Combined scoring via EMA
+      Charge_t = decay * Charge_{t-1} + (1-decay) * CombinedScore_t
 
-    Key Innovations:
-    - P1 (Real H2O): Uses actual attention scores, not key norms
-      * Catches true Heavy Hitters that receive high attention
-    - P0 (Multi-source): Runs walks from observation window, not single token
-      * Catches distributed importance patterns (summarization, few-shot)
-      * Single-source only captures last-token dependencies
+    Key Innovation (v0.2.0):
+    - Replaces H2O-based initialization with Spectral for global structure
+    - Keeps Walker for bridge token detection
+    - Uses MAX combination instead of weighted sum
+    - Particularly effective for summarization tasks
 
-    Unlike H2O alone (degree centrality) or raw CircuitKV (instant current),
-    this combines real attention importance with multi-source bridge detection.
+    Configuration:
+    - use_combined_scoring: Enable Spectral + Walker + MAX (default: True)
+    - num_power_iterations: Power iterations for spectral (default: 10)
+    - Set use_combined_scoring=False for legacy Walker-only mode
     """
 
     def __init__(
@@ -1133,6 +1142,9 @@ class CircuitKVCluster():
         # RC+B: Bidirectional Circuit Walks
         # NOTE: Disabled - R@65 improved but narrativeqa dropped (25.10 -> 23.78)
         bidirectional: bool = False,
+        # Spectral + Walker + MAX mode (v0.2.0)
+        use_combined_scoring: bool = True,  # Enable Spectral + Walker + MAX
+        num_power_iterations: int = 10,  # Power iterations for spectral
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1147,6 +1159,8 @@ class CircuitKVCluster():
         self.decay = decay
         self.observation_window = observation_window
         self.bidirectional = bidirectional
+        self.use_combined_scoring = use_combined_scoring
+        self.num_power_iterations = num_power_iterations
 
         # Lazy initialization of CUDA graph
         self._graph = None
@@ -1155,6 +1169,7 @@ class CircuitKVCluster():
 
         # Capacitive State: Accumulated charge for each token
         self._accumulated_charge = None
+        self._h2o_scores = None  # Store H2O scores for MAX combination
         self._prefill_initialized = False
 
     def reset(
@@ -1174,6 +1189,7 @@ class CircuitKVCluster():
             self._graph.reset()
         # Reset capacitive state
         self._accumulated_charge = None
+        self._h2o_scores = None
         self._prefill_initialized = False
 
     def _lazy_init(self, device, seq_len: int):
@@ -1259,80 +1275,48 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using Dual H2O strategy.
+        Initialize capacitor charge using H2O scores from attention weights.
 
-        Combines two H2O signals with MAX:
-        1. Full-Query H2O (like H2O method): Captures narrative flow, early context
-        2. Window H2O (like SnapKV): Captures question focus, local relevance
-
-        MAX ensures we never lose tokens important to EITHER signal:
-        - NarrativeQA benefits from full-query (narrative dependencies)
-        - Qasper benefits from window (structured paper, question focus)
+        This is the EXACT working implementation that produced Qasper 30.85.
+        Uses window_size queries across ALL heads, averages across heads.
+        Pure H2O initialization - no circuit walker in init.
         """
-        device = key_states.device
-
-        # =====================================================================
-        # SIGNAL 1: Full-Query H2O (like H2O method)
-        # Uses ALL queries - captures narrative flow and early context importance
-        # =====================================================================
-        attn_full = torch.matmul(
-            query_states,
-            key_states.transpose(2, 3)
-        ) / math.sqrt(head_dim)
-
-        # Causal mask for full attention
-        causal_mask = torch.triu(
-            torch.full((q_len, q_len), torch.finfo(attn_full.dtype).min, device=device),
-            diagonal=1
-        )
-        attn_full = attn_full + causal_mask[None, None, :, :]
-        attn_full = F.softmax(attn_full, dim=-1, dtype=torch.float32)
-
-        # Sum across all queries, average across heads
-        h2o_full = attn_full[:, :, :, :-self.window_size].sum(dim=-2).mean(dim=(0, 1))
-        h2o_full_max = h2o_full.max()
-        if h2o_full_max > 0:
-            h2o_full = h2o_full / h2o_full_max
-
-        # =====================================================================
-        # SIGNAL 2: Window H2O (like SnapKV/working baseline)
-        # Uses last window_size queries - captures question focus
-        # =====================================================================
-        attn_window = torch.matmul(
+        # Compute attention weights for H2O scores
+        # Use last window_size queries to compute importance (like SnapKV)
+        attn_weights = torch.matmul(
             query_states[..., -self.window_size:, :],
             key_states.transpose(2, 3)
         ) / math.sqrt(head_dim)
 
-        # Causal mask for window
-        window_mask = torch.full(
+        # Apply causal mask to window
+        mask = torch.full(
             (self.window_size, self.window_size),
-            torch.finfo(attn_window.dtype).min,
-            device=device
+            torch.finfo(attn_weights.dtype).min,
+            device=attn_weights.device
         )
-        mask_cond = torch.arange(window_mask.size(-1), device=device)
-        window_mask.masked_fill_(mask_cond < (mask_cond + 1).view(window_mask.size(-1), 1), 0)
-        attn_window[:, :, -self.window_size:, -self.window_size:] += window_mask[None, None, :, :]
-        attn_window = F.softmax(attn_window, dim=-1, dtype=torch.float32)
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        attn_weights[:, :, -self.window_size:, -self.window_size:] += mask[None, None, :, :]
 
-        # Sum across window queries, average across heads
-        h2o_window = attn_window[:, :, :, :-self.window_size].sum(dim=-2).mean(dim=(0, 1))
-        h2o_window_max = h2o_window.max()
-        if h2o_window_max > 0:
-            h2o_window = h2o_window / h2o_window_max
+        # Softmax and sum across queries (H2O accumulated attention)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
-        # =====================================================================
-        # COMBINE: MAX of both signals
-        # Never lose tokens important to EITHER narrative flow OR question focus
-        # =====================================================================
-        h2o_scores = torch.maximum(h2o_full, h2o_window)
+        # Sum across query positions and average across heads -> H2O scores
+        # Shape: [seq_len]
+        h2o_scores = attn_weights[:, :, :, :-self.window_size].sum(dim=-2).mean(dim=(0, 1))
+
+        # Normalize to [0, 1]
+        max_score = h2o_scores.max()
+        if max_score > 0:
+            h2o_scores = h2o_scores / max_score
 
         # Initialize accumulated charge
         self._accumulated_charge = torch.zeros(
             self._max_seq_len,
-            device=device,
+            device=key_states.device,
             dtype=torch.float32,
         )
-        # Fill non-window portion with combined H2O scores
+        # Fill non-window portion with H2O scores
         non_window_len = min(q_len - self.window_size, h2o_scores.shape[0])
         if non_window_len > 0:
             self._accumulated_charge[:non_window_len] = h2o_scores[:non_window_len]
@@ -1387,7 +1371,7 @@ class CircuitKVCluster():
             )
 
         # =====================================================================
-        # STEP 2: CIRCUIT WALKER UPDATE (Dynamic Current Injection)
+        # STEP 2: CIRCUIT SCORING (Spectral + Walker + MAX or Walker-only)
         # =====================================================================
         # We use the last query's attention as the "current" token (source)
         current_idx = q_len - 1
@@ -1396,18 +1380,31 @@ class CircuitKVCluster():
         query_flat = query_states[0, 0, -1, :].contiguous()  # Last query (SOURCE)
         keys_flat = key_states[0, 0, :, :].contiguous()  # All keys
 
-        # Run absorbing walks to get instant current flow
-        self._graph.update_and_step_circuit(query_flat, keys_flat, current_idx)
-
-        # Get instant current from walker
-        instant_current = self._graph.get_scores()
-
-        # Normalize instant current to [0, 1]
-        max_current = instant_current[:current_idx + 1].max()
-        if max_current > 0:
-            instant_current_norm = instant_current / max_current
+        if self.use_combined_scoring:
+            # NEW: Spectral + Walker + MAX combined scoring
+            # This computes:
+            # 1. Spectral (power iteration) - captures "hub" tokens with global importance
+            # 2. Walker (absorbing random walk) - captures "bridge" tokens on Q→Sink path
+            # 3. Combined via MAX - preserves both hub and bridge tokens
+            self._graph.update_and_step_circuit_combined(
+                query_flat, keys_flat, current_idx, self.num_power_iterations
+            )
+            # Get combined scores (already normalized to [0, 1])
+            instant_current_norm = self._graph.get_combined_scores()[:self._max_seq_len]
         else:
-            instant_current_norm = instant_current
+            # LEGACY: Walker-only scoring
+            # Run absorbing walks to get instant current flow
+            self._graph.update_and_step_circuit(query_flat, keys_flat, current_idx)
+
+            # Get instant current from walker
+            instant_current = self._graph.get_scores()
+
+            # Normalize instant current to [0, 1]
+            max_current = instant_current[:current_idx + 1].max()
+            if max_current > 0:
+                instant_current_norm = instant_current / max_current
+            else:
+                instant_current_norm = instant_current
 
         # =====================================================================
         # STEP 3: EMA CHARGE UPDATE

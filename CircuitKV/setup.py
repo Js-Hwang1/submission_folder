@@ -21,6 +21,7 @@ def get_extensions():
         "csrc/circuit_manager.cpp",
         "csrc/kernels/graph_update.cu",
         "csrc/kernels/circuit_walker.cu",
+        "csrc/kernels/spectral_power.cu",
     ]
 
     # Include directories (absolute paths required for compiler)
@@ -62,7 +63,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="0.1.0",
+    version="0.2.0",
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",

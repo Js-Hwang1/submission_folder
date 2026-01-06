@@ -161,4 +161,152 @@ void launch_reset_graph_kernel(
     cudaStream_t stream
 );
 
+// =============================================================================
+// Kernel 3: Spectral Power Iteration (Eigenvector Centrality)
+// =============================================================================
+
+/**
+ * Launch sparse matrix-vector multiply: v_out = A @ v_in
+ * Uses adjacency list representation for efficient SpMV.
+ *
+ * @param adj_list     Sparse neighbors [seq_len, top_k]
+ * @param adj_weights  Edge weights [seq_len, top_k]
+ * @param v_in         Input vector [seq_len]
+ * @param v_out        Output vector [seq_len]
+ * @param seq_len      Current sequence length
+ * @param top_k        Max neighbors per token
+ * @param stream       CUDA stream
+ */
+void launch_spmv_kernel(
+    const int32_t* adj_list,
+    const float* adj_weights,
+    const float* v_in,
+    float* v_out,
+    int seq_len,
+    int top_k,
+    cudaStream_t stream
+);
+
+/**
+ * Launch vector normalization (L2 norm).
+ * Computes v = v / ||v||_2 in-place.
+ *
+ * @param v               Vector to normalize in-place [seq_len]
+ * @param partial_sums    Temporary buffer for reduction [num_reduce_blocks]
+ * @param norm_out        Temporary scalar for norm [1]
+ * @param seq_len         Vector length
+ * @param num_reduce_blocks Number of blocks for reduction
+ * @param stream          CUDA stream
+ */
+void launch_normalize_vector_kernel(
+    float* v,
+    float* partial_sums,
+    float* norm_out,
+    int seq_len,
+    int num_reduce_blocks,
+    cudaStream_t stream
+);
+
+/**
+ * Initialize vector to uniform: v[i] = 1/sqrt(N)
+ *
+ * @param v         Output vector [seq_len]
+ * @param seq_len   Vector length
+ * @param stream    CUDA stream
+ */
+void launch_init_uniform_kernel(
+    float* v,
+    int seq_len,
+    cudaStream_t stream
+);
+
+/**
+ * Run power iteration to compute dominant eigenvector.
+ * This is the main entry point for spectral scoring.
+ *
+ * Algorithm:
+ *   1. Initialize v = uniform
+ *   2. For num_iterations:
+ *      v = normalize(A @ v)
+ *   3. Return v as importance scores
+ *
+ * @param adj_list       Sparse neighbors [seq_len, top_k]
+ * @param adj_weights    Edge weights [seq_len, top_k]
+ * @param v              Output eigenvector [seq_len]
+ * @param v_temp         Temporary buffer [seq_len]
+ * @param partial_sums   Temporary for reduction [256]
+ * @param norm_out       Temporary scalar [1]
+ * @param seq_len        Current sequence length
+ * @param top_k          Max neighbors per token
+ * @param num_iterations Number of power iterations (default 10)
+ * @param stream         CUDA stream
+ */
+void launch_power_iteration(
+    const int32_t* adj_list,
+    const float* adj_weights,
+    float* v,
+    float* v_temp,
+    float* partial_sums,
+    float* norm_out,
+    int seq_len,
+    int top_k,
+    int num_iterations,
+    cudaStream_t stream
+);
+
+/**
+ * Convert integer visit counts to float scores.
+ *
+ * @param visit_counts  Integer visit counts from walker [seq_len]
+ * @param scores        Output float scores [seq_len]
+ * @param seq_len       Array length
+ * @param stream        CUDA stream
+ */
+void launch_convert_visits_kernel(
+    const int32_t* visit_counts,
+    float* scores,
+    int seq_len,
+    cudaStream_t stream
+);
+
+/**
+ * Normalize scores to [0, 1] range by dividing by max.
+ *
+ * @param v               Vector to normalize in-place [seq_len]
+ * @param partial_max     Temporary for reduction [num_reduce_blocks]
+ * @param max_out         Temporary scalar for max [1]
+ * @param seq_len         Vector length
+ * @param num_reduce_blocks Number of blocks for reduction
+ * @param stream          CUDA stream
+ */
+void launch_normalize_to_unit_max(
+    float* v,
+    float* partial_max,
+    float* max_out,
+    int seq_len,
+    int num_reduce_blocks,
+    cudaStream_t stream
+);
+
+/**
+ * Combine spectral and walker scores using element-wise MAX.
+ *
+ * combined[i] = max(spectral[i], walker[i])
+ *
+ * This preserves BOTH hub tokens (high spectral) AND bridge tokens (high walker).
+ *
+ * @param spectral_scores  Normalized spectral scores [seq_len]
+ * @param walker_scores    Normalized walker scores [seq_len]
+ * @param combined_scores  Output combined scores [seq_len]
+ * @param seq_len          Array length
+ * @param stream           CUDA stream
+ */
+void launch_max_combine_kernel(
+    const float* spectral_scores,
+    const float* walker_scores,
+    float* combined_scores,
+    int seq_len,
+    cudaStream_t stream
+);
+
 }  // namespace circuit_kv
