@@ -1,6 +1,7 @@
 .env
 commands.txt
 PoC.ipynb
+PoC1_bridge_tokens.ipynb
 
 # =============================================================================
 # CircuitKV Build Artifacts - MUST be excluded for fresh builds on clone

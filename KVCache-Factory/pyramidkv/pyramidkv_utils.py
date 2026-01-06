@@ -1143,7 +1143,7 @@ class CircuitKVCluster():
         # NOTE: Disabled - R@65 improved but narrativeqa dropped (25.10 -> 23.78)
         bidirectional: bool = False,
         # Spectral + Walker + MAX mode (v0.2.0)
-        use_combined_scoring: bool = True,  # Enable Spectral + Walker + MAX
+        use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
     ):
         self.window_size = window_size
@@ -1275,18 +1275,18 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using Spectral scores from attention weights.
+        Initialize capacitor charge using Walker scores (Absorbing Random Walk).
 
-        This uses Power Iteration (eigenvector centrality) instead of H2O (degree).
-        Spectral captures "hub" tokens that are globally important in the attention
-        graph structure, complementing the Walker's "bridge" detection during generation.
+        This runs Monte Carlo absorbing random walks from the last token (source)
+        to the sink (first few tokens), counting visits to each token.
 
         Algorithm:
         1. Build attention matrix A from window queries to all keys
-        2. Run power iteration: v = A^T @ A @ v, normalize
-        3. Final v is the principal right singular vector (key importance)
+        2. Run absorbing random walks from last token toward sink
+        3. Count visits to each token (current-flow betweenness)
+        4. Use visit counts as initial importance scores
         """
-        # Compute attention weights for Spectral scores
+        # Compute attention weights
         # Use last window_size queries to compute importance (like SnapKV)
         attn_weights = torch.matmul(
             query_states[..., -self.window_size:, :],
@@ -1303,15 +1303,14 @@ class CircuitKVCluster():
         mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
         attn_weights[:, :, -self.window_size:, -self.window_size:] += mask[None, None, :, :]
 
-        # Softmax to get probability distribution (adjacency matrix)
+        # Softmax to get probability distribution (transition matrix)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
-        # Average across batch and heads to get single adjacency matrix
+        # Average across batch and heads to get single transition matrix
         # Shape: [window_size, seq_len]
-        A = attn_weights.mean(dim=(0, 1))
+        P = attn_weights.mean(dim=(0, 1))
 
-        # Extract non-window portion for scoring
-        seq_len = A.shape[-1]
+        seq_len = P.shape[-1]
         non_window_len = max(0, seq_len - self.window_size)
 
         if non_window_len <= 0:
@@ -1324,43 +1323,112 @@ class CircuitKVCluster():
             self._prefill_initialized = True
             return
 
-        # Get attention to non-window keys only
-        # Shape: [window_size, non_window_len]
-        A_nonwindow = A[:, :non_window_len]
+        # =====================================================================
+        # Absorbing Random Walk Simulation (CPU for simplicity during init)
+        # =====================================================================
+        # We need a full seq_len x seq_len transition matrix for walks
+        # Build it from the available attention patterns
 
-        # Power Iteration for eigenvector centrality
-        # We compute principal right singular vector of A via: v = A^T @ A @ v
-        # This captures: key j is important if queries that attend to j
-        # also attend to other important keys.
-        num_iterations = 20
-        v = torch.ones(non_window_len, device=A.device, dtype=torch.float32)
-        v = v / v.norm()
+        # For prefill init, we use H2O-style scoring as base, then run a few
+        # absorbing walks from the last window query position
 
-        for _ in range(num_iterations):
-            # Step 1: u = A @ v (query scores based on key importance)
-            u = A_nonwindow @ v  # [window_size]
-            # Step 2: v_new = A^T @ u (key importance from query scores)
-            v = A_nonwindow.T @ u  # [non_window_len]
-            # Normalize to prevent overflow/underflow
-            v_norm = v.norm()
-            if v_norm > 1e-8:
-                v = v / v_norm
+        # H2O base: sum of attention received by each key
+        h2o_scores = P.sum(dim=0)  # [seq_len]
 
-        # v is now the principal right singular vector (spectral importance)
-        spectral_scores = v
+        # Now run absorbing walks from last position toward sink
+        # This adds the "path importance" signal on top of H2O
+        P_np = P.cpu().numpy()
+        device = key_states.device
+
+        num_walkers = 1000
+        max_steps = 100
+        sink_boundary = self.sink_size  # First few tokens are absorbing
+
+        # Visit counts for non-window tokens
+        visits = torch.zeros(seq_len, dtype=torch.float32)
+
+        # Source: last position in window (maps to last token in seq)
+        # But we're scoring non-window tokens, so walks go through them
+
+        # Simplified: Use attention-weighted visits
+        # Each window query position contributes visits based on its attention
+        for q_idx in range(self.window_size):
+            # This query's attention distribution over all keys
+            attn_dist = P_np[q_idx, :]  # [seq_len]
+
+            # Tokens this query attends to get "visit" credit
+            # Weight by position in window (later queries = more important)
+            position_weight = (q_idx + 1) / self.window_size
+            visits += torch.from_numpy(attn_dist).float() * position_weight
+
+        # Run actual absorbing walks from last window position
+        import numpy as np
+        last_q_attn = P_np[-1, :]  # Last query's attention distribution
+
+        walk_visits = np.zeros(seq_len)
+        for _ in range(num_walkers):
+            # Start from a position sampled by last query's attention
+            if last_q_attn.sum() < 1e-8:
+                continue
+            probs = last_q_attn / last_q_attn.sum()
+            current = np.random.choice(seq_len, p=probs)
+
+            for step in range(max_steps):
+                # Record visit (except sink)
+                if current >= sink_boundary:
+                    walk_visits[current] += 1
+
+                # Check if absorbed
+                if current < sink_boundary:
+                    break
+
+                # For positions outside window, use uniform backward movement
+                # (simplified since we don't have full transition matrix)
+                if current >= seq_len - self.window_size:
+                    # In window region, use actual attention
+                    window_offset = current - (seq_len - self.window_size)
+                    if window_offset >= 0 and window_offset < self.window_size:
+                        probs = P_np[window_offset, :]
+                        if probs.sum() > 1e-8:
+                            probs = probs / probs.sum()
+                            current = np.random.choice(seq_len, p=probs)
+                        else:
+                            current = max(0, current - 1)
+                    else:
+                        current = max(0, current - 1)
+                else:
+                    # Outside window: move toward sink with some randomness
+                    # Bias toward earlier tokens (toward sink)
+                    if np.random.random() < 0.7:
+                        current = max(0, current - np.random.randint(1, 10))
+                    else:
+                        current = max(0, current - 1)
+
+        # Combine H2O base with walk visits
+        walk_visits_tensor = torch.from_numpy(walk_visits).float()
+
+        # Normalize both components
+        h2o_norm = h2o_scores / (h2o_scores.max() + 1e-8)
+        walk_norm = walk_visits_tensor / (walk_visits_tensor.max() + 1e-8)
+
+        # Combine: Walker emphasis (walk signal is primary)
+        walker_scores = 0.3 * h2o_norm + 0.7 * walk_norm
+
+        # Extract non-window portion
+        walker_scores_nonwindow = walker_scores[:non_window_len]
 
         # Normalize to [0, 1]
-        max_score = spectral_scores.max()
+        max_score = walker_scores_nonwindow.max()
         if max_score > 0:
-            spectral_scores = spectral_scores / max_score
+            walker_scores_nonwindow = walker_scores_nonwindow / max_score
 
         # Initialize accumulated charge
         self._accumulated_charge = torch.zeros(
             self._max_seq_len,
-            device=key_states.device,
+            device=device,
             dtype=torch.float32,
         )
-        self._accumulated_charge[:non_window_len] = spectral_scores
+        self._accumulated_charge[:non_window_len] = walker_scores_nonwindow.to(device)
         self._prefill_initialized = True
 
     def update_kv(
@@ -1375,9 +1443,9 @@ class CircuitKVCluster():
         Update KV cache using Capacitive CircuitKV eviction.
 
         This implements the RC Circuit model:
-        1. INITIALIZATION: If first call, compute Spectral scores from attention
-           via power iteration and use them to initialize capacitor charge
-        2. UPDATE: Run circuit walker (Spectral + Walker + MAX) and apply EMA
+        1. INITIALIZATION: If first call, compute Walker scores from attention
+           via absorbing random walks and use them to initialize capacitor charge
+        2. UPDATE: Run circuit walker (absorbing random walks) and apply EMA
         3. EVICTION: Select top tokens by accumulated charge
 
         Args:
