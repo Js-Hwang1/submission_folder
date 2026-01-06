@@ -1275,13 +1275,18 @@ class CircuitKVCluster():
         head_dim: int,
     ):
         """
-        Initialize capacitor charge using H2O scores from attention weights.
+        Initialize capacitor charge using Spectral scores from attention weights.
 
-        This is the EXACT working implementation that produced Qasper 30.85.
-        Uses window_size queries across ALL heads, averages across heads.
-        Pure H2O initialization - no circuit walker in init.
+        This uses Power Iteration (eigenvector centrality) instead of H2O (degree).
+        Spectral captures "hub" tokens that are globally important in the attention
+        graph structure, complementing the Walker's "bridge" detection during generation.
+
+        Algorithm:
+        1. Build attention matrix A from window queries to all keys
+        2. Run power iteration: v = A^T @ A @ v, normalize
+        3. Final v is the principal right singular vector (key importance)
         """
-        # Compute attention weights for H2O scores
+        # Compute attention weights for Spectral scores
         # Use last window_size queries to compute importance (like SnapKV)
         attn_weights = torch.matmul(
             query_states[..., -self.window_size:, :],
@@ -1298,17 +1303,56 @@ class CircuitKVCluster():
         mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
         attn_weights[:, :, -self.window_size:, -self.window_size:] += mask[None, None, :, :]
 
-        # Softmax and sum across queries (H2O accumulated attention)
+        # Softmax to get probability distribution (adjacency matrix)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
-        # Sum across query positions and average across heads -> H2O scores
-        # Shape: [seq_len]
-        h2o_scores = attn_weights[:, :, :, :-self.window_size].sum(dim=-2).mean(dim=(0, 1))
+        # Average across batch and heads to get single adjacency matrix
+        # Shape: [window_size, seq_len]
+        A = attn_weights.mean(dim=(0, 1))
+
+        # Extract non-window portion for scoring
+        seq_len = A.shape[-1]
+        non_window_len = max(0, seq_len - self.window_size)
+
+        if non_window_len <= 0:
+            # No non-window tokens to score
+            self._accumulated_charge = torch.zeros(
+                self._max_seq_len,
+                device=key_states.device,
+                dtype=torch.float32,
+            )
+            self._prefill_initialized = True
+            return
+
+        # Get attention to non-window keys only
+        # Shape: [window_size, non_window_len]
+        A_nonwindow = A[:, :non_window_len]
+
+        # Power Iteration for eigenvector centrality
+        # We compute principal right singular vector of A via: v = A^T @ A @ v
+        # This captures: key j is important if queries that attend to j
+        # also attend to other important keys.
+        num_iterations = 20
+        v = torch.ones(non_window_len, device=A.device, dtype=torch.float32)
+        v = v / v.norm()
+
+        for _ in range(num_iterations):
+            # Step 1: u = A @ v (query scores based on key importance)
+            u = A_nonwindow @ v  # [window_size]
+            # Step 2: v_new = A^T @ u (key importance from query scores)
+            v = A_nonwindow.T @ u  # [non_window_len]
+            # Normalize to prevent overflow/underflow
+            v_norm = v.norm()
+            if v_norm > 1e-8:
+                v = v / v_norm
+
+        # v is now the principal right singular vector (spectral importance)
+        spectral_scores = v
 
         # Normalize to [0, 1]
-        max_score = h2o_scores.max()
+        max_score = spectral_scores.max()
         if max_score > 0:
-            h2o_scores = h2o_scores / max_score
+            spectral_scores = spectral_scores / max_score
 
         # Initialize accumulated charge
         self._accumulated_charge = torch.zeros(
@@ -1316,10 +1360,7 @@ class CircuitKVCluster():
             device=key_states.device,
             dtype=torch.float32,
         )
-        # Fill non-window portion with H2O scores
-        non_window_len = min(q_len - self.window_size, h2o_scores.shape[0])
-        if non_window_len > 0:
-            self._accumulated_charge[:non_window_len] = h2o_scores[:non_window_len]
+        self._accumulated_charge[:non_window_len] = spectral_scores
         self._prefill_initialized = True
 
     def update_kv(
@@ -1334,9 +1375,9 @@ class CircuitKVCluster():
         Update KV cache using Capacitive CircuitKV eviction.
 
         This implements the RC Circuit model:
-        1. INITIALIZATION: If first call, compute H2O scores from attention
-           and use them to initialize capacitor charge (steady state)
-        2. UPDATE: Run circuit walker and apply EMA to accumulated charge
+        1. INITIALIZATION: If first call, compute Spectral scores from attention
+           via power iteration and use them to initialize capacitor charge
+        2. UPDATE: Run circuit walker (Spectral + Walker + MAX) and apply EMA
         3. EVICTION: Select top tokens by accumulated charge
 
         Args:
