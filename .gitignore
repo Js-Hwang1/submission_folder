@@ -1,3 +1,38 @@
 .env
 commands.txt
 PoC.ipynb
+
+# =============================================================================
+# CircuitKV Build Artifacts - MUST be excluded for fresh builds on clone
+# =============================================================================
+
+# Python/pip build directories
+build/
+dist/
+*.egg-info/
+
+# Compiled extensions
+*.so
+*.o
+*.a
+*.dylib
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# CUDA compilation
+*.cubin
+*.fatbin
+*.ptx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
