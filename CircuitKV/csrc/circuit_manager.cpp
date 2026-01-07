@@ -712,7 +712,8 @@ void CircuitGraph::update_and_step_landmark_walker(
     int walkers_per_source,
     float query_boost,
     int min_spacing,
-    float position_alpha
+    float position_alpha,
+    bool use_reachability  // true = reachability (default), false = positional
 ) {
     CHECK_CUDA(attention_matrix);
     CHECK_CONTIGUOUS(attention_matrix);
@@ -839,21 +840,36 @@ void CircuitGraph::update_and_step_landmark_walker(
     );
     CUDA_CHECK_LAST();
 
-    // STEP 7: Apply reachability normalization (WINNING STRATEGY from PoC ablation)
-    // Reachability normalization accounts for actual walker distribution,
-    // not just position, which is better for discovering bridge tokens.
+    // STEP 7: Apply normalization (reachability or positional)
     int sink_size = 4;  // Standard sink size
-    launch_reachability_normalize_kernel(
-        visit_counts_,
-        landmark_normalized_,
-        landmark_positions_,
-        actual_landmarks,
-        walkers_per_source,
-        query_boost,
-        seq_len,
-        sink_size,
-        sidecar_stream_
-    );
+
+    if (use_reachability) {
+        // Reachability normalization: accounts for actual walker distribution
+        // normalized[p] = visits[p] / total_walkers_that_could_reach[p]
+        launch_reachability_normalize_kernel(
+            visit_counts_,
+            landmark_normalized_,
+            landmark_positions_,
+            actual_landmarks,
+            walkers_per_source,
+            query_boost,
+            seq_len,
+            sink_size,
+            sidecar_stream_
+        );
+    } else {
+        // Positional normalization: assumes uniform walker distribution
+        // normalized[p] = visits[p] / (1/distance^alpha)
+        launch_positional_normalize_kernel(
+            visit_counts_,
+            landmark_normalized_,
+            landmark_partial_max_,
+            seq_len,
+            sink_size,
+            position_alpha,
+            sidecar_stream_
+        );
+    }
     CUDA_CHECK_LAST();
 }
 

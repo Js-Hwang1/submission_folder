@@ -47,12 +47,12 @@ class CircuitKVConfig:
 
 @dataclass
 class LandmarkWalkerConfig:
-    """Configuration for Landmark-Diverse Walker with Reachability Normalization.
+    """Configuration for Landmark-Diverse Walker with Positional Normalization.
 
-    WINNING CONFIGURATION from PoC ablation study:
+    Configuration (v0.4.0):
     - Stratified landmark selection (one per segment, best H2O within segment)
-    - 16 landmarks for better coverage
-    - Reachability normalization (accounts for walker distribution)
+    - 32 landmarks for better coverage
+    - Positional normalization (default): visits / (1/distance^alpha)
     """
 
     # Graph parameters
@@ -60,15 +60,17 @@ class LandmarkWalkerConfig:
     top_k: int = 32  # Kept for CircuitGraph initialization (not used by landmark walker)
 
     # Landmark selection parameters (STRATIFIED strategy)
-    num_landmarks: int = 16  # Number of diverse landmarks (16 works best from ablation)
+    num_landmarks: int = 32  # Number of diverse landmarks (32 for comprehensive coverage)
     min_spacing: int = 50  # Minimum segment size for stratified sampling
 
     # Walker parameters
     walkers_per_source: int = 100  # Walkers launched from each source
     query_boost: float = 2.0  # Weight multiplier for query-sourced walkers
 
-    # Normalization method: 'reachability' (default, winning) or 'positional'
-    # position_alpha kept for backward compatibility with positional normalization
+    # Normalization mode: True = reachability, False = positional (default)
+    use_reachability: bool = False  # Positional normalization: visits / (1/distance^alpha)
+
+    # Positional normalization parameter (only used if use_reachability=False)
     position_alpha: float = 0.6  # Exponent for expected visits (1/distance^alpha)
 
     # Eviction parameters
@@ -436,7 +438,7 @@ class LandmarkWalkerMonitor:
             attention_matrix = attention_matrix.float()
         attention_matrix = attention_matrix.contiguous()
 
-        # Run landmark walker
+        # Run landmark walker with configured normalization mode
         self._graph.update_and_step_landmark_walker(
             attention_matrix,
             current_idx,
@@ -445,6 +447,7 @@ class LandmarkWalkerMonitor:
             self.config.query_boost,
             self.config.min_spacing,
             self.config.position_alpha,
+            self.config.use_reachability,
         )
 
         # Cache the scores

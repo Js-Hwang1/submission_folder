@@ -151,32 +151,38 @@ public:
     /**
      * Landmark-Diverse Walker: Multi-source absorbing random walks.
      *
-     * This method implements the Landmark-Diverse walker approach from PoC2/PoC3:
-     * 1. Select diverse landmarks using H2O scores with spacing constraint
+     * This method implements the Landmark-Diverse walker approach (v0.4.0):
+     * 1. STRATIFIED landmark selection: one per segment, best H2O within segment
      * 2. Launch walkers from ALL sources (landmarks + query) in parallel
-     * 3. Apply positional normalization to remove -log bias
+     * 3. Apply normalization (reachability or positional)
      *
      * Key Insight:
      *   Single-source walks miss important tokens not directly visible from query.
      *   By launching walks from geographically-diverse landmarks, we discover
      *   "bridge tokens" through path convergence.
      *
+     * Normalization Modes:
+     *   - Reachability (default): normalized[p] = visits[p] / total_walkers_that_could_reach[p]
+     *   - Positional: normalized[p] = visits[p] / (1/distance^alpha)
+     *
      * @param attention_matrix   Full attention matrix [seq_len, seq_len], FP32
      * @param current_idx        Current token index (query position)
-     * @param num_landmarks      Number of landmarks to select (default 8)
+     * @param num_landmarks      Number of landmarks to select (default 32)
      * @param walkers_per_source Walkers per source (default 100)
      * @param query_boost        Weight multiplier for query walkers (default 2.0)
-     * @param min_spacing        Minimum spacing between landmarks (default 100)
+     * @param min_spacing        Minimum segment size for stratified (default 50)
      * @param position_alpha     Positional normalization exponent (default 0.6)
+     * @param use_reachability   true = reachability norm, false = positional norm (default)
      */
     void update_and_step_landmark_walker(
         torch::Tensor attention_matrix,
         int current_idx,
-        int num_landmarks = 8,
+        int num_landmarks = 32,
         int walkers_per_source = 100,
         float query_boost = 2.0f,
-        int min_spacing = 100,
-        float position_alpha = 0.6f
+        int min_spacing = 50,
+        float position_alpha = 0.6f,
+        bool use_reachability = false
     );
 
     /**

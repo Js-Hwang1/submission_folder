@@ -155,32 +155,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("update_and_step_landmark_walker", &CircuitGraph::update_and_step_landmark_walker,
         py::arg("attention_matrix"),
         py::arg("current_idx"),
-        py::arg("num_landmarks") = 8,
+        py::arg("num_landmarks") = 32,
         py::arg("walkers_per_source") = 100,
         py::arg("query_boost") = 2.0f,
-        py::arg("min_spacing") = 100,
+        py::arg("min_spacing") = 50,
         py::arg("position_alpha") = 0.6f,
+        py::arg("use_reachability") = false,
         R"pbdoc(
-        Landmark-Diverse Walker: Multi-source absorbing random walks.
+        Landmark-Diverse Walker: Multi-source absorbing random walks (v0.4.0).
 
         This method implements the Landmark-Diverse walker approach:
-        1. Select diverse landmarks using H2O scores with spacing constraint
+        1. STRATIFIED landmark selection (one per segment, best H2O within segment)
         2. Launch walkers from ALL sources (landmarks + query) in parallel
-        3. Apply positional normalization to remove -log bias
+        3. Apply normalization (reachability or positional)
 
         Key Insight:
             Single-source walks miss important tokens not directly visible from query.
             By launching walks from geographically-diverse landmarks, we discover
             "bridge tokens" through path convergence.
 
+        Normalization Modes:
+            - Reachability (default): normalized[p] = visits[p] / total_walkers_that_could_reach[p]
+            - Positional: normalized[p] = visits[p] / (1/distance^alpha)
+
         Args:
             attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
             current_idx: Current token index (query position).
-            num_landmarks: Number of landmarks to select (default 8).
+            num_landmarks: Number of landmarks to select (default 32).
             walkers_per_source: Walkers per source (default 100).
             query_boost: Weight multiplier for query walkers (default 2.0).
-            min_spacing: Minimum spacing between landmarks (default 100).
-            position_alpha: Positional normalization exponent (default 0.6).
+            min_spacing: Minimum segment size for stratified selection (default 50).
+            position_alpha: Positional normalization exponent (default 0.6, only used if use_reachability=false).
+            use_reachability: If false (default), use positional normalization. If true, use reachability normalization.
         )pbdoc"
     )
     .def("get_landmark_scores", &CircuitGraph::get_landmark_scores,
@@ -195,7 +201,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "0.2.0";
+    m.attr("__version__") = "0.4.0";
 }
 
 }  // namespace circuit_kv
