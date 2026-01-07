@@ -2,6 +2,9 @@
 commands.txt
 PoC.ipynb
 PoC1_bridge_tokens.ipynb
+PoC2_landmark_walkers.ipynb
+PoC3_real_attention.ipynb
+LANDMARK_WALKER_DESIGN.md
 
 # =============================================================================
 # CircuitKV Build Artifacts - MUST be excluded for fresh builds on clone

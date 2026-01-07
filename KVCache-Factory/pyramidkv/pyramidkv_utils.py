@@ -1092,35 +1092,35 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v0.2.0: Spectral + Walker + MAX Combined Scoring.
+    CircuitKV v0.3.0: Landmark-Diverse Walker for KV Cache Eviction.
 
-    This class implements a hybrid KV-cache eviction strategy that combines:
-    1. SPECTRAL (Power Iteration): Captures "hub" tokens with global importance
-       - Eigenvector centrality via power iteration on the attention graph
-       - Effective for summarization tasks where global structure matters
-    2. WALKER (Absorbing Random Walk): Captures "bridge" tokens on Q→Sink path
-       - Current-flow betweenness via Monte Carlo walks
-       - Effective for reasoning tasks where path connectivity matters
-    3. MAX Combination: final_score[i] = max(spectral[i], walker[i])
-       - Preserves BOTH hub tokens AND bridge tokens
-       - Avoids information loss from averaging or weighted combination
+    This class implements multi-source absorbing walks from geographically-diverse
+    landmarks to discover "bridge tokens" that connect the query to important context.
 
-    Physics Model (RC Circuit):
-    - Tokens are CAPACITORS that accumulate charge over time
-    - INITIALIZATION (End of Prefill): H2O scores from attention weights
-    - UPDATE (During Generation): Combined scoring via EMA
-      Charge_t = decay * Charge_{t-1} + (1-decay) * CombinedScore_t
+    Key Innovation (v0.3.0 - Landmark Walker):
+    - Single-source walks miss important tokens not directly visible from query
+    - By launching walks from diverse landmarks (spread across the sequence),
+      we discover "bridge tokens" through path convergence
+    - Positional normalization removes the natural -log bias of absorbing walks
 
-    Key Innovation (v0.2.0):
-    - Replaces H2O-based initialization with Spectral for global structure
-    - Keeps Walker for bridge token detection
-    - Uses MAX combination instead of weighted sum
-    - Particularly effective for summarization tasks
+    Algorithm:
+    1. Compute full attention matrix from query/key states
+    2. Select diverse landmarks using H2O scores with spacing constraint
+    3. Launch walkers from ALL sources (landmarks + query) in parallel
+    4. Apply positional normalization: score[p] = visits[p] / expected_visits[p]
+    5. Select top tokens by normalized scores for KV cache retention
+
+    Particularly effective for:
+    - Multi-hop reasoning (HotpotQA, 2WikiMQA)
+    - Long document QA (NarrativeQA, Qasper)
+    - Cases where important tokens are not directly attended by the query
 
     Configuration:
-    - use_combined_scoring: Enable Spectral + Walker + MAX (default: True)
-    - num_power_iterations: Power iterations for spectral (default: 10)
-    - Set use_combined_scoring=False for legacy Walker-only mode
+    - num_landmarks: Number of diverse landmarks to select (default: 8)
+    - min_spacing: Minimum spacing between landmarks (default: 100)
+    - walkers_per_source: Walkers launched from each source (default: 100)
+    - query_boost: Weight multiplier for query-sourced walkers (default: 2.0)
+    - position_alpha: Exponent for positional normalization (default: 0.6)
     """
 
     def __init__(
@@ -1145,6 +1145,12 @@ class CircuitKVCluster():
         # Spectral + Walker + MAX mode (v0.2.0)
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
+        # Landmark Walker parameters (v0.3.0)
+        num_landmarks: int = 8,  # Number of diverse landmarks
+        min_spacing: int = 100,  # Minimum spacing between landmarks
+        walkers_per_source: int = 100,  # Walkers per source (landmark/query)
+        query_boost: float = 2.0,  # Weight multiplier for query-sourced walkers
+        position_alpha: float = 0.6,  # Exponent for positional normalization
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1161,6 +1167,12 @@ class CircuitKVCluster():
         self.bidirectional = bidirectional
         self.use_combined_scoring = use_combined_scoring
         self.num_power_iterations = num_power_iterations
+        # Landmark Walker
+        self.num_landmarks = num_landmarks
+        self.min_spacing = min_spacing
+        self.walkers_per_source = walkers_per_source
+        self.query_boost = query_boost
+        self.position_alpha = position_alpha
 
         # Lazy initialization of CUDA graph
         self._graph = None
@@ -1321,8 +1333,12 @@ class CircuitKVCluster():
         P_np = P.cpu().numpy()
 
         num_walkers = 1000
-        max_steps = 100
         sink_boundary = self.sink_size
+
+        # Adaptive max_steps: ensure we can reach sink from any position
+        # With adaptive jumps, we need ~20 steps to cross seq_len
+        # Be conservative: allow 2x that for stochastic variance
+        max_steps = max(100, seq_len // 20)
 
         # Visit counts - PURE walker signal
         walk_visits = np.zeros(seq_len, dtype=np.float32)
@@ -1360,10 +1376,18 @@ class CircuitKVCluster():
                         else:
                             current = max(0, current - 1)
                     else:
-                        # Outside window: bias toward sink
-                        if np.random.random() < 0.7:
-                            current = max(0, current - np.random.randint(1, 10))
+                        # Outside window: ADAPTIVE jump toward sink
+                        # Jump size scales with distance to sink (faster when far, slower when close)
+                        distance_to_sink = current - sink_boundary
+
+                        if np.random.random() < 0.8:
+                            # 80%: Adaptive jump - ~5% of remaining distance
+                            jump = max(1, distance_to_sink // 20)
+                            # Add some randomness: 0.5x to 1.5x the base jump
+                            jump = max(1, int(jump * (0.5 + np.random.random())))
+                            current = max(sink_boundary, current - jump)
                         else:
+                            # 20%: Small step (allows fine-grained exploration near sink)
                             current = max(0, current - 1)
 
         # Convert to tensor and normalize
@@ -1393,13 +1417,15 @@ class CircuitKVCluster():
         num_key_value_groups: int,
     ):
         """
-        Update KV cache using Capacitive CircuitKV eviction.
+        Update KV cache using Landmark-Diverse Walker eviction (v0.3.0).
 
-        This implements the RC Circuit model:
-        1. INITIALIZATION: If first call, compute Walker scores from attention
-           via absorbing random walks and use them to initialize capacitor charge
-        2. UPDATE: Run circuit walker (absorbing random walks) and apply EMA
-        3. EVICTION: Select top tokens by accumulated charge
+        This implements multi-source absorbing walks from geographically-diverse landmarks:
+        1. Compute full attention matrix from query/key states
+        2. Run landmark walker (CUDA kernel):
+           - Select diverse landmarks using H2O scores with spacing constraint
+           - Launch walkers from ALL sources (landmarks + query) in parallel
+           - Apply positional normalization to remove -log bias
+        3. EVICTION: Select top tokens by landmark walker scores
 
         Args:
             key_states: [bsz, num_heads, seq_len, head_dim]
@@ -1415,7 +1441,7 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        print(f"CircuitKV max_capacity_prompt {self.max_capacity_prompt}")
+        print(f"CircuitKV (LandmarkWalker) max_capacity_prompt {self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -1425,64 +1451,61 @@ class CircuitKVCluster():
         self._lazy_init(key_states.device, q_len)
 
         # =====================================================================
-        # STEP 1: H2O INITIALIZATION (Steady State from Prefill)
+        # STEP 1: Compute full attention matrix (averaged across heads)
         # =====================================================================
-        if not self._prefill_initialized:
-            self._initialize_charge_from_attention(
-                query_states, key_states, q_len, head_dim
-            )
+        # Use last window queries for attention computation
+        attn_weights = torch.matmul(
+            query_states[..., -self.window_size:, :],
+            key_states.transpose(2, 3)
+        ) / math.sqrt(head_dim)
+
+        # Apply causal mask to window portion
+        mask = torch.full(
+            (self.window_size, self.window_size),
+            torch.finfo(attn_weights.dtype).min,
+            device=attn_weights.device
+        )
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        attn_weights[:, :, :, -self.window_size:] += mask[None, None, :, :]
+
+        # Softmax and average across batch and heads
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        attn_avg = attn_weights.mean(dim=(0, 1))  # [window_size, seq_len]
+
+        # Build full attention matrix approximation
+        # For positions outside the window, use uniform causal attention
+        full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
+
+        # Fill the window portion with actual attention
+        full_attn[-self.window_size:, :] = attn_avg
+
+        # For positions outside window, use uniform attention to past (approximation)
+        for i in range(q_len - self.window_size):
+            if i > 0:
+                full_attn[i, :i] = 1.0 / i
 
         # =====================================================================
-        # STEP 2: CIRCUIT SCORING (Spectral + Walker + MAX or Walker-only)
+        # STEP 2: Run Landmark Walker (CUDA kernel)
         # =====================================================================
-        # We use the last query's attention as the "current" token (source)
         current_idx = q_len - 1
 
-        # Extract query and keys for graph update (using last query)
-        query_flat = query_states[0, 0, -1, :].contiguous()  # Last query (SOURCE)
-        keys_flat = key_states[0, 0, :, :].contiguous()  # All keys
-
-        if self.use_combined_scoring:
-            # NEW: Spectral + Walker + MAX combined scoring
-            # This computes:
-            # 1. Spectral (power iteration) - captures "hub" tokens with global importance
-            # 2. Walker (absorbing random walk) - captures "bridge" tokens on Q→Sink path
-            # 3. Combined via MAX - preserves both hub and bridge tokens
-            self._graph.update_and_step_circuit_combined(
-                query_flat, keys_flat, current_idx, self.num_power_iterations
-            )
-            # Get combined scores (already normalized to [0, 1])
-            instant_current_norm = self._graph.get_combined_scores()[:self._max_seq_len]
-        else:
-            # LEGACY: Walker-only scoring
-            # Run absorbing walks to get instant current flow
-            self._graph.update_and_step_circuit(query_flat, keys_flat, current_idx)
-
-            # Get instant current from walker
-            instant_current = self._graph.get_scores()
-
-            # Normalize instant current to [0, 1]
-            max_current = instant_current[:current_idx + 1].max()
-            if max_current > 0:
-                instant_current_norm = instant_current / max_current
-            else:
-                instant_current_norm = instant_current
-
-        # =====================================================================
-        # STEP 3: EMA CHARGE UPDATE
-        # Charge_t = decay * Charge_{t-1} + (1-decay) * Current_t
-        # =====================================================================
-        self._accumulated_charge = (
-            self.decay * self._accumulated_charge +
-            (1 - self.decay) * instant_current_norm.float()
+        self._graph.update_and_step_landmark_walker(
+            full_attn.contiguous(),
+            current_idx,
+            self.num_landmarks,
+            self.walkers_per_source,
+            self.query_boost,
+            self.min_spacing,
+            self.position_alpha,
         )
 
-        # =====================================================================
-        # STEP 4: EVICTION BASED ON ACCUMULATED CHARGE
-        # =====================================================================
-        # Use accumulated charge for selection (not raw instant current)
-        scores = self._accumulated_charge
+        # Get normalized scores from landmark walker
+        scores = self._graph.get_landmark_scores()
 
+        # =====================================================================
+        # STEP 3: EVICTION BASED ON LANDMARK WALKER SCORES
+        # =====================================================================
         # Compute keep mask using static budgeting
         keep_mask = self._get_keep_mask(
             scores,
@@ -1516,7 +1539,7 @@ class CircuitKVCluster():
 
 
 def init_circuitkv(self):
-    """Initialize Capacitive CircuitKV cluster for attention layer."""
+    """Initialize CircuitKV cluster with Landmark-Diverse Walker (v0.3.0)."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 64
@@ -1545,6 +1568,17 @@ def init_circuitkv(self):
         # RC+B: Bidirectional Circuit Walks (disabled - hurt narrativeqa score)
         if not hasattr(self.config, 'bidirectional'):
             self.config.bidirectional = False
+        # Landmark Walker parameters (v0.3.0)
+        if not hasattr(self.config, 'num_landmarks'):
+            self.config.num_landmarks = 8  # Number of diverse landmarks
+        if not hasattr(self.config, 'min_spacing'):
+            self.config.min_spacing = 100  # Minimum spacing between landmarks
+        if not hasattr(self.config, 'walkers_per_source'):
+            self.config.walkers_per_source = 100  # Walkers per source
+        if not hasattr(self.config, 'query_boost'):
+            self.config.query_boost = 2.0  # Weight for query-sourced walkers
+        if not hasattr(self.config, 'position_alpha'):
+            self.config.position_alpha = 0.6  # Positional normalization exponent
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -1559,4 +1593,10 @@ def init_circuitkv(self):
         num_steps=self.config.num_steps,
         decay=self.config.decay,
         bidirectional=self.config.bidirectional,
+        # Landmark Walker parameters
+        num_landmarks=self.config.num_landmarks,
+        min_spacing=self.config.min_spacing,
+        walkers_per_source=self.config.walkers_per_source,
+        query_boost=self.config.query_boost,
+        position_alpha=self.config.position_alpha,
     )

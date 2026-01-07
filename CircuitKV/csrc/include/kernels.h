@@ -309,4 +309,143 @@ void launch_max_combine_kernel(
     cudaStream_t stream
 );
 
+// =============================================================================
+// Kernel 4: Landmark Walker (Multi-Source Absorbing Walks)
+// =============================================================================
+
+/**
+ * Launch the landmark walker kernel.
+ *
+ * Runs absorbing random walks from multiple geographically-diverse sources:
+ * - Landmarks selected via H2O (high column sum) with spacing constraint
+ * - Query token (with boosted weight)
+ *
+ * Key Insight:
+ *   Single-source walks miss important tokens not directly visible from query.
+ *   Multi-source walks from diverse landmarks discover "bridge tokens" through
+ *   path convergence.
+ *
+ * Block/Thread Mapping:
+ * - total_walkers = (num_landmarks + 1) * walkers_per_source
+ * - Each thread is one walker assigned to one source
+ * - Visit counts shared across all walkers (atomicAdd)
+ *
+ * @param landmark_attention  Cached attention rows [num_landmarks, seq_len]
+ * @param query_attention     Query's attention row [seq_len]
+ * @param visit_counts        Output visit counts [seq_len]
+ * @param rng_states          PRNG states [total_walkers * 2]
+ * @param landmark_positions  Landmark positions [num_landmarks]
+ * @param num_landmarks       Number of landmarks (not including query)
+ * @param walkers_per_source  Walkers per source
+ * @param query_boost         Weight multiplier for query walkers (default 2.0)
+ * @param seq_len             Current sequence length
+ * @param stream              CUDA stream
+ */
+void launch_landmark_walker_kernel(
+    const float* landmark_attention,
+    const float* query_attention,
+    int32_t* visit_counts,
+    uint64_t* rng_states,
+    const int32_t* landmark_positions,
+    int num_landmarks,
+    int walkers_per_source,
+    float query_boost,
+    int seq_len,
+    cudaStream_t stream
+);
+
+/**
+ * Launch positional normalization to remove -log bias.
+ *
+ * Absorbing walks create visits[p] ~ 1/distance because all walkers pass
+ * through early positions. This normalizes by expected visits to reveal
+ * tokens visited MORE than expected.
+ *
+ * normalized[p] = visits[p] / (1 / (p - sink_size + 1)^alpha)
+ *
+ * @param visit_counts       Raw visit counts [seq_len]
+ * @param normalized_scores  Output normalized scores [seq_len]
+ * @param partial_max        Temp buffer for max reduction [num_blocks]
+ * @param seq_len            Sequence length
+ * @param sink_size          Sink region size (default 4)
+ * @param alpha              Position exponent (default 0.6)
+ * @param stream             CUDA stream
+ */
+void launch_positional_normalize_kernel(
+    const int32_t* visit_counts,
+    float* normalized_scores,
+    float* partial_max,
+    int seq_len,
+    int sink_size,
+    float alpha,
+    cudaStream_t stream
+);
+
+/**
+ * Select diverse landmarks using H2O scores with spacing constraint.
+ *
+ * Algorithm:
+ *   1. Greedily select highest H2O position
+ *   2. Exclude positions within min_spacing
+ *   3. Repeat until max_landmarks reached
+ *
+ * @param attention_row_sums  H2O scores (column sums) [seq_len]
+ * @param landmark_positions  Output landmark positions [max_landmarks]
+ * @param num_landmarks_out   Output number of landmarks selected
+ * @param seq_len             Sequence length
+ * @param max_landmarks       Maximum landmarks to select
+ * @param min_spacing         Minimum spacing between landmarks
+ * @param sink_buffer         Extra buffer from sink region
+ * @param window_size         Last window_size tokens excluded
+ * @param stream              CUDA stream
+ */
+void launch_select_landmarks_kernel(
+    const float* attention_row_sums,
+    int32_t* landmark_positions,
+    int* num_landmarks_out,
+    int seq_len,
+    int max_landmarks,
+    int min_spacing,
+    int sink_buffer,
+    int window_size,
+    cudaStream_t stream
+);
+
+/**
+ * Cache attention rows for selected landmarks.
+ *
+ * @param full_attention       Full attention matrix or provided rows
+ * @param landmark_attention   Output cached attention [num_landmarks, seq_len]
+ * @param landmark_positions   Landmark positions [num_landmarks]
+ * @param num_landmarks        Number of landmarks
+ * @param seq_len              Sequence length
+ * @param stream               CUDA stream
+ */
+void launch_cache_landmark_attention_kernel(
+    const float* full_attention,
+    float* landmark_attention,
+    const int32_t* landmark_positions,
+    int num_landmarks,
+    int seq_len,
+    cudaStream_t stream
+);
+
+/**
+ * Compute H2O scores (column sums of attention matrix).
+ *
+ * H2O score for position j = sum_i(attention[i, j])
+ * This measures how much total attention each key receives.
+ *
+ * @param attention_matrix   Full attention [seq_len, seq_len] or sparse
+ * @param h2o_scores         Output scores [seq_len]
+ * @param seq_len            Sequence length
+ * @param stream             CUDA stream
+ */
+void launch_compute_h2o_scores_kernel(
+    const float* attention_matrix,
+    float* h2o_scores,
+    int seq_len,
+    cudaStream_t stream
+);
+
 }  // namespace circuit_kv

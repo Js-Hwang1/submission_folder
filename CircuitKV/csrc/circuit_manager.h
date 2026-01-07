@@ -148,6 +148,44 @@ public:
      */
     torch::Tensor get_combined_scores();
 
+    /**
+     * Landmark-Diverse Walker: Multi-source absorbing random walks.
+     *
+     * This method implements the Landmark-Diverse walker approach from PoC2/PoC3:
+     * 1. Select diverse landmarks using H2O scores with spacing constraint
+     * 2. Launch walkers from ALL sources (landmarks + query) in parallel
+     * 3. Apply positional normalization to remove -log bias
+     *
+     * Key Insight:
+     *   Single-source walks miss important tokens not directly visible from query.
+     *   By launching walks from geographically-diverse landmarks, we discover
+     *   "bridge tokens" through path convergence.
+     *
+     * @param attention_matrix   Full attention matrix [seq_len, seq_len], FP32
+     * @param current_idx        Current token index (query position)
+     * @param num_landmarks      Number of landmarks to select (default 8)
+     * @param walkers_per_source Walkers per source (default 100)
+     * @param query_boost        Weight multiplier for query walkers (default 2.0)
+     * @param min_spacing        Minimum spacing between landmarks (default 100)
+     * @param position_alpha     Positional normalization exponent (default 0.6)
+     */
+    void update_and_step_landmark_walker(
+        torch::Tensor attention_matrix,
+        int current_idx,
+        int num_landmarks = 8,
+        int walkers_per_source = 100,
+        float query_boost = 2.0f,
+        int min_spacing = 100,
+        float position_alpha = 0.6f
+    );
+
+    /**
+     * Get the landmark walker scores (positionally normalized).
+     *
+     * @return Tensor of shape [seq_len] with normalized scores
+     */
+    torch::Tensor get_landmark_scores();
+
 private:
     // Configuration
     int max_seq_len_;
@@ -178,12 +216,27 @@ private:
     float* walker_scores_;        // [max_seq_len] - normalized walker scores
     float* combined_scores_;      // [max_seq_len] - final combined scores
 
+    // GPU memory: Landmark walker buffers
+    static constexpr int MAX_LANDMARKS = 32;
+    float* landmark_attention_;      // [MAX_LANDMARKS, max_seq_len] - cached attention rows
+    float* query_attention_;         // [max_seq_len] - query's attention row
+    float* h2o_scores_;              // [max_seq_len] - H2O column sums
+    int32_t* landmark_positions_;    // [MAX_LANDMARKS] - selected landmark positions
+    int* num_landmarks_selected_;    // [1] - number of landmarks actually selected
+    float* landmark_normalized_;     // [max_seq_len] - positionally normalized scores
+    float* landmark_partial_max_;    // [256] - for max reduction
+    uint64_t* landmark_rng_states_;  // [max_walkers * 2] - RNG for landmark walkers
+
+    // Landmark walker configuration
+    int max_landmark_walkers_;       // Maximum total walkers for landmark method
+
     // CUDA streams
     cudaStream_t main_stream_;      // Inherited from PyTorch
     cudaStream_t sidecar_stream_;   // Async walker stream
 
-    // Initialization flag
+    // Initialization flags
     bool rng_initialized_;
+    bool landmark_rng_initialized_;
 
     // Spectral configuration
     int num_power_iterations_;

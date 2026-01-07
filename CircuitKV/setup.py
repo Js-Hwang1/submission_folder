@@ -22,6 +22,7 @@ def get_extensions():
         "csrc/kernels/graph_update.cu",
         "csrc/kernels/circuit_walker.cu",
         "csrc/kernels/spectral_power.cu",
+        "csrc/kernels/landmark_walker.cu",
     ]
 
     # Include directories (absolute paths required for compiler)

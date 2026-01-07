@@ -45,6 +45,33 @@ class CircuitKVConfig:
     dtype: torch.dtype = torch.float16
 
 
+@dataclass
+class LandmarkWalkerConfig:
+    """Configuration for Landmark-Diverse Walker."""
+
+    # Graph parameters
+    max_seq_len: int = 8192  # Maximum sequence length
+    top_k: int = 32  # Kept for CircuitGraph initialization (not used by landmark walker)
+
+    # Landmark selection parameters
+    num_landmarks: int = 8  # Number of diverse landmarks to select
+    min_spacing: int = 100  # Minimum spacing between landmarks
+
+    # Walker parameters
+    walkers_per_source: int = 100  # Walkers launched from each source
+    query_boost: float = 2.0  # Weight multiplier for query-sourced walkers
+
+    # Positional normalization
+    position_alpha: float = 0.6  # Exponent for expected visits (1/distance^alpha)
+
+    # Eviction parameters
+    sink_size: int = 4  # Absorbing boundary (first N tokens)
+    local_window: int = 64  # Local window to always keep
+
+    # Hardware
+    device: str = "cuda"
+
+
 class CircuitKVMonitor:
     """
     The Capacitive CircuitKV Monitor.
@@ -305,6 +332,175 @@ class CircuitKVMonitor:
         # Reset capacitive state
         self._accumulated_charge = None
         self._prefill_initialized = False
+
+    def synchronize(self) -> None:
+        """Wait for all async operations to complete."""
+        if self._graph is not None:
+            self._graph.synchronize()
+
+
+class LandmarkWalkerMonitor:
+    """
+    Landmark-Diverse Walker Monitor.
+
+    This class implements the Landmark-Diverse walker approach:
+    1. Select diverse landmarks using H2O scores with spacing constraint
+    2. Launch walkers from ALL sources (landmarks + query) in parallel
+    3. Apply positional normalization to remove -log bias
+
+    Key Insight:
+        Single-source walks miss important tokens not directly visible from query.
+        By launching walks from geographically-diverse landmarks, we discover
+        "bridge tokens" through path convergence.
+
+    This is particularly effective for:
+    - Multi-hop reasoning (HotpotQA, 2WikiMQA)
+    - Long document QA (NarrativeQA, Qasper)
+    - Cases where important tokens are not directly attended by the query
+
+    Usage:
+        config = LandmarkWalkerConfig()
+        monitor = LandmarkWalkerMonitor(config)
+
+        # Given a full attention matrix from the model:
+        monitor.update(attention_matrix, current_idx)
+
+        # Get importance scores:
+        scores = monitor.get_scores()
+        keep_mask = monitor.get_keep_mask(budget_ratio=0.25, seq_len=seq_len)
+    """
+
+    def __init__(self, config: LandmarkWalkerConfig):
+        self.config = config
+        self._graph: Optional[object] = None
+        self._initialized = False
+        self._current_scores: Optional[torch.Tensor] = None
+
+    def _lazy_init(self) -> None:
+        """Lazily initialize the CUDA circuit manager."""
+        if self._initialized:
+            return
+
+        # Import here to defer CUDA initialization
+        from circuit_kv import get_extension
+
+        ext = get_extension()
+        # Use placeholder values for parameters not used by landmark walker
+        self._graph = ext.CircuitGraph(
+            self.config.max_seq_len,
+            self.config.top_k,  # Not used by landmark walker
+            0.85,  # alpha - not used
+            1024,  # num_walkers - uses its own walkers
+            100,   # num_steps - uses its own
+        )
+        self._initialized = True
+
+    def update(
+        self,
+        attention_matrix: torch.Tensor,
+        current_idx: int,
+    ) -> None:
+        """
+        Run landmark-diverse walker on the attention matrix.
+
+        This triggers:
+        1. H2O Score Computation: Column sums to find high-attention tokens
+        2. Landmark Selection: Greedy selection with spacing constraint
+        3. Attention Caching: Cache landmark attention rows
+        4. Multi-source Walking: Launch walkers from all landmarks + query
+        5. Positional Normalization: Remove -log bias from visit counts
+
+        Args:
+            attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
+            current_idx: Index of the current token (query position).
+        """
+        self._lazy_init()
+
+        # Ensure correct dtype and contiguous
+        if attention_matrix.dtype != torch.float32:
+            attention_matrix = attention_matrix.float()
+        attention_matrix = attention_matrix.contiguous()
+
+        # Run landmark walker
+        self._graph.update_and_step_landmark_walker(
+            attention_matrix,
+            current_idx,
+            self.config.num_landmarks,
+            self.config.walkers_per_source,
+            self.config.query_boost,
+            self.config.min_spacing,
+            self.config.position_alpha,
+        )
+
+        # Cache the scores
+        self._current_scores = self._graph.get_landmark_scores()
+
+    def get_scores(self) -> torch.Tensor:
+        """
+        Get the landmark walker importance scores.
+
+        Returns positionally-normalized scores that reveal tokens visited
+        more than expected, accounting for the natural -log bias of
+        absorbing random walks.
+
+        Returns:
+            Tensor of shape [seq_len] with normalized importance scores.
+        """
+        self._lazy_init()
+
+        if self._current_scores is not None:
+            return self._current_scores
+        else:
+            # No update yet, return zeros
+            return torch.zeros(self.config.max_seq_len, device=self.config.device)
+
+    def get_keep_mask(
+        self,
+        budget_ratio: float,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """
+        Get a boolean mask indicating which tokens to keep.
+
+        The mask respects:
+        1. Attention sinks (always kept - absorbing boundary)
+        2. Local window (always kept)
+        3. Top tokens by landmark walker score (up to budget)
+
+        Args:
+            budget_ratio: Fraction of total tokens to keep (0.0-1.0)
+            seq_len: Current sequence length
+
+        Returns:
+            Boolean tensor of shape [seq_len] where True = keep.
+        """
+        scores = self.get_scores()[:seq_len]
+        budget = int(seq_len * budget_ratio)
+
+        # Always keep sinks and local window
+        keep_mask = torch.zeros(seq_len, dtype=torch.bool, device=scores.device)
+        keep_mask[: self.config.sink_size] = True  # Sinks (absorbing boundary)
+        local_start = max(0, seq_len - self.config.local_window)
+        keep_mask[local_start:] = True  # Local window
+
+        # Count how many we already kept
+        already_kept = keep_mask.sum().item()
+        remaining_budget = max(0, budget - already_kept)
+
+        # Select top tokens by score (excluding already kept)
+        if remaining_budget > 0:
+            scores_masked = scores.clone()
+            scores_masked[keep_mask] = float("-inf")  # Exclude already kept
+            _, top_indices = scores_masked.topk(remaining_budget)
+            keep_mask[top_indices] = True
+
+        return keep_mask
+
+    def reset(self) -> None:
+        """Reset the graph for a new sequence."""
+        if self._graph is not None:
+            self._graph.reset()
+        self._current_scores = None
 
     def synchronize(self) -> None:
         """Wait for all async operations to complete."""

@@ -151,6 +151,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         Returns:
             Tensor of shape [max_seq_len] with combined scores (normalized to [0, 1]).
         )pbdoc"
+    )
+    .def("update_and_step_landmark_walker", &CircuitGraph::update_and_step_landmark_walker,
+        py::arg("attention_matrix"),
+        py::arg("current_idx"),
+        py::arg("num_landmarks") = 8,
+        py::arg("walkers_per_source") = 100,
+        py::arg("query_boost") = 2.0f,
+        py::arg("min_spacing") = 100,
+        py::arg("position_alpha") = 0.6f,
+        R"pbdoc(
+        Landmark-Diverse Walker: Multi-source absorbing random walks.
+
+        This method implements the Landmark-Diverse walker approach:
+        1. Select diverse landmarks using H2O scores with spacing constraint
+        2. Launch walkers from ALL sources (landmarks + query) in parallel
+        3. Apply positional normalization to remove -log bias
+
+        Key Insight:
+            Single-source walks miss important tokens not directly visible from query.
+            By launching walks from geographically-diverse landmarks, we discover
+            "bridge tokens" through path convergence.
+
+        Args:
+            attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
+            current_idx: Current token index (query position).
+            num_landmarks: Number of landmarks to select (default 8).
+            walkers_per_source: Walkers per source (default 100).
+            query_boost: Weight multiplier for query walkers (default 2.0).
+            min_spacing: Minimum spacing between landmarks (default 100).
+            position_alpha: Positional normalization exponent (default 0.6).
+        )pbdoc"
+    )
+    .def("get_landmark_scores", &CircuitGraph::get_landmark_scores,
+        R"pbdoc(
+        Get the landmark walker scores (positionally normalized).
+
+        Synchronizes the sidecar stream before returning.
+
+        Returns:
+            Tensor of shape [seq_len] with normalized importance scores.
+        )pbdoc"
     );
 
     // Version info

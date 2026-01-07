@@ -11,11 +11,22 @@ Key Innovation:
 - Unlike PPR, these tokens accumulate current because they're on the path
 """
 
-from circuit_kv.engine import CircuitKVMonitor, CircuitKVConfig
+from circuit_kv.engine import (
+    CircuitKVMonitor,
+    CircuitKVConfig,
+    LandmarkWalkerMonitor,
+    LandmarkWalkerConfig,
+)
 from circuit_kv.utils import set_seed
 
-__version__ = "0.1.0"
-__all__ = ["CircuitKVMonitor", "CircuitKVConfig", "set_seed"]
+__version__ = "0.2.0"
+__all__ = [
+    "CircuitKVMonitor",
+    "CircuitKVConfig",
+    "LandmarkWalkerMonitor",
+    "LandmarkWalkerConfig",
+    "set_seed",
+]
 
 
 def _load_extension():
