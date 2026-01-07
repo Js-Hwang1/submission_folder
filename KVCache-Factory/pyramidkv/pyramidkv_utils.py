@@ -1134,7 +1134,7 @@ class CircuitKVCluster():
     Key Innovation (v0.4.0 - Stratified + Reachability):
     - STRATIFIED landmark selection: Divide sequence into segments, pick best H2O per segment
     - REACHABILITY normalization: normalized[p] = visits[p] / total_walkers_that_could_reach[p]
-    - 16 landmarks for better coverage (ablation showed improvement from 8 to 16)
+    - 32 landmarks for comprehensive coverage across long sequences
 
     Why Reachability > Positional:
     - Positional: normalized[p] = visits[p] / (1/distance^alpha) - assumes uniform walker distribution
@@ -1154,10 +1154,11 @@ class CircuitKVCluster():
     - Cases where important tokens are not directly attended by the query
 
     Configuration (v0.4.0 defaults - WINNING from PoC ablation):
-    - num_landmarks: Number of diverse landmarks (default: 16)
+    - num_landmarks: Number of diverse landmarks (default: 32)
     - min_spacing: Minimum segment size for stratified (default: 50)
     - walkers_per_source: Walkers launched from each source (default: 100)
     - query_boost: Weight multiplier for query-sourced walkers (default: 2.0)
+    - use_reachability: Use reachability normalization (default: False, positional norm)
     """
 
     def __init__(
@@ -1183,11 +1184,12 @@ class CircuitKVCluster():
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
         # Landmark Walker parameters (v0.4.0 - Stratified + Reachability)
-        num_landmarks: int = 16,  # Number of diverse landmarks (16 from ablation)
+        num_landmarks: int = 32,  # Number of diverse landmarks (32 for comprehensive coverage)
         min_spacing: int = 50,  # Minimum segment size for stratified sampling
         walkers_per_source: int = 100,  # Walkers per source (landmark/query)
         query_boost: float = 2.0,  # Weight multiplier for query-sourced walkers
-        position_alpha: float = 0.6,  # Kept for backward compat (reachability used by default)
+        position_alpha: float = 0.6,  # Exponent for positional normalization
+        use_reachability: bool = False,  # False = positional norm (default), True = reachability norm
         # Debug logging
         debug: bool = False,
     ):
@@ -1212,6 +1214,7 @@ class CircuitKVCluster():
         self.walkers_per_source = walkers_per_source
         self.query_boost = query_boost
         self.position_alpha = position_alpha
+        self.use_reachability = use_reachability
         # Debug
         self.debug = debug
         self._debug_log = None
@@ -1688,6 +1691,7 @@ class CircuitKVCluster():
             self.query_boost,
             self.min_spacing,
             self.position_alpha,
+            self.use_reachability,
         )
 
         # Get normalized scores from landmark walker
@@ -1766,15 +1770,17 @@ def init_circuitkv(self):
             self.config.bidirectional = False
         # Landmark Walker parameters (v0.4.0 - Stratified + Reachability)
         if not hasattr(self.config, 'num_landmarks'):
-            self.config.num_landmarks = 16  # WINNING from ablation (was 8)
+            self.config.num_landmarks = 32  # 32 for comprehensive coverage
         if not hasattr(self.config, 'min_spacing'):
-            self.config.min_spacing = 50  # Min segment size for stratified (was 100)
+            self.config.min_spacing = 50  # Min segment size for stratified
         if not hasattr(self.config, 'walkers_per_source'):
             self.config.walkers_per_source = 100  # Walkers per source
         if not hasattr(self.config, 'query_boost'):
             self.config.query_boost = 2.0  # Weight for query-sourced walkers
         if not hasattr(self.config, 'position_alpha'):
-            self.config.position_alpha = 0.6  # Kept for backward compat (reachability used)
+            self.config.position_alpha = 0.6  # Exponent for positional normalization
+        if not hasattr(self.config, 'use_reachability'):
+            self.config.use_reachability = False  # Positional norm (default)
         # Debug logging
         if not hasattr(self.config, 'circuitkv_debug'):
             self.config.circuitkv_debug = False
@@ -1798,6 +1804,7 @@ def init_circuitkv(self):
         walkers_per_source=self.config.walkers_per_source,
         query_boost=self.config.query_boost,
         position_alpha=self.config.position_alpha,
+        use_reachability=self.config.use_reachability,
         # Debug
         debug=self.config.circuitkv_debug,
     )

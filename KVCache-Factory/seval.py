@@ -32,12 +32,12 @@ def evaluate_file(filepath, dataset):
     return round(100 * total / len(predictions), 2)
 
 # Adjust this path to match your results directory
-results_dir = "/Users/j/Desktop/results/meta-llama-3-8b-instruct_SLM_2048"
+results_dir = "/Users/j/Desktop/submission_folder"
 
 print("CircuitKV Results:")
 print("-" * 40)
 for dataset in sorted(os.listdir(results_dir)):
-    filepath = os.path.join(results_dir, dataset, "streamingllm.json")
+    filepath = os.path.join(results_dir, dataset, "circuitkv.json")
     if os.path.exists(filepath):
         score = evaluate_file(filepath, dataset)
         print(f"{dataset:25} {score:6.2f}")
