@@ -3,12 +3,46 @@ import time
 import torch.nn.functional as F
 import torch.nn as nn
 import math
+import os
 
 from typing import List
 
 
 from typing import List, Optional, Tuple
 from transformers.cache_utils import Cache
+
+# =============================================================================
+# Module-level debug logging for CircuitKV (singleton pattern)
+# =============================================================================
+_CIRCUITKV_DEBUG_LOG = None
+_CIRCUITKV_DEBUG_INITIALIZED = False
+_CIRCUITKV_SAMPLE_COUNTER = 0
+_CIRCUITKV_LAYER_COUNTER = 0  # Track which layer we're on within a sample
+
+def _get_circuitkv_debug_log():
+    """Get or create the shared debug log file."""
+    global _CIRCUITKV_DEBUG_LOG, _CIRCUITKV_DEBUG_INITIALIZED
+    if not _CIRCUITKV_DEBUG_INITIALIZED:
+        log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
+        _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
+        _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n")
+        _CIRCUITKV_DEBUG_LOG.write("CircuitKV Debug Log - Landmark Walker Analysis\n")
+        _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n\n")
+        _CIRCUITKV_DEBUG_INITIALIZED = True
+    return _CIRCUITKV_DEBUG_LOG
+
+def _circuitkv_debug_next_sample():
+    """Increment sample counter and reset layer counter."""
+    global _CIRCUITKV_SAMPLE_COUNTER, _CIRCUITKV_LAYER_COUNTER
+    _CIRCUITKV_SAMPLE_COUNTER += 1
+    _CIRCUITKV_LAYER_COUNTER = 0
+    return _CIRCUITKV_SAMPLE_COUNTER
+
+def _circuitkv_debug_next_layer():
+    """Increment layer counter."""
+    global _CIRCUITKV_LAYER_COUNTER
+    _CIRCUITKV_LAYER_COUNTER += 1
+    return _CIRCUITKV_LAYER_COUNTER
 
 def key_pruner_query_driven(kv_states, q_states, recent_size=128, ratio=0.3):
     _, _, seqlen, head_dim = kv_states.shape
@@ -1151,6 +1185,8 @@ class CircuitKVCluster():
         walkers_per_source: int = 100,  # Walkers per source (landmark/query)
         query_boost: float = 2.0,  # Weight multiplier for query-sourced walkers
         position_alpha: float = 0.6,  # Exponent for positional normalization
+        # Debug logging
+        debug: bool = False,
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1173,6 +1209,10 @@ class CircuitKVCluster():
         self.walkers_per_source = walkers_per_source
         self.query_boost = query_boost
         self.position_alpha = position_alpha
+        # Debug
+        self.debug = debug
+        self._debug_log = None
+        self._sample_counter = 0
 
         # Lazy initialization of CUDA graph
         self._graph = None
@@ -1183,6 +1223,10 @@ class CircuitKVCluster():
         self._accumulated_charge = None
         self._h2o_scores = None  # Store H2O scores for MAX combination
         self._prefill_initialized = False
+
+        # Initialize debug log file
+        if self.debug:
+            self._init_debug_log()
 
     def reset(
         self,
@@ -1203,6 +1247,121 @@ class CircuitKVCluster():
         self._accumulated_charge = None
         self._h2o_scores = None
         self._prefill_initialized = False
+
+    def _init_debug_log(self):
+        """Initialize debug log (uses module-level singleton)."""
+        log = _get_circuitkv_debug_log()
+        # Only write config on first init (layer 0)
+        if _CIRCUITKV_LAYER_COUNTER == 0:
+            log.write(f"Configuration:\n")
+            log.write(f"  num_landmarks: {self.num_landmarks}\n")
+            log.write(f"  min_spacing: {self.min_spacing}\n")
+            log.write(f"  walkers_per_source: {self.walkers_per_source}\n")
+            log.write(f"  query_boost: {self.query_boost}\n")
+            log.write(f"  position_alpha: {self.position_alpha}\n")
+            log.write(f"  max_capacity_prompt: {self.max_capacity_prompt}\n")
+            log.write(f"  window_size: {self.window_size}\n")
+            log.write(f"  sink_size: {self.sink_size}\n")
+            log.write("\n" + "=" * 80 + "\n\n")
+            log.flush()
+
+    def _log_debug(
+        self,
+        q_len: int,
+        h2o_scores: torch.Tensor,
+        landmark_scores: torch.Tensor,
+        keep_mask: torch.Tensor,
+        full_attn: torch.Tensor,
+    ):
+        """Log detailed debug info for each eviction decision."""
+        if not self.debug:
+            return
+
+        log = _get_circuitkv_debug_log()
+        layer_num = _circuitkv_debug_next_layer()
+
+        # Only log detailed info for layer 0 (to avoid overwhelming output)
+        # Other layers just get a summary
+        if layer_num == 1:
+            # This is layer 0 (first call increments to 1)
+            sample_num = _circuitkv_debug_next_sample()
+
+            log.write(f"\n{'='*80}\n")
+            log.write(f"SAMPLE #{sample_num} | seq_len={q_len}\n")
+            log.write(f"{'='*80}\n\n")
+
+            # 1. H2O Scores Analysis
+            h2o_cpu = h2o_scores[:q_len].cpu()
+            h2o_top_k = 20
+            h2o_topk_vals, h2o_topk_idx = torch.topk(h2o_cpu, min(h2o_top_k, q_len))
+            log.write(f"H2O SCORES (column sums - total incoming attention):\n")
+            log.write(f"  Top {h2o_top_k} positions by H2O score:\n")
+            for i, (pos, val) in enumerate(zip(h2o_topk_idx.tolist(), h2o_topk_vals.tolist())):
+                log.write(f"    {i+1:2d}. pos={pos:5d}  h2o={val:.4f}\n")
+            log.write(f"  H2O stats: min={h2o_cpu.min():.4f}, max={h2o_cpu.max():.4f}, mean={h2o_cpu.mean():.4f}\n\n")
+
+            # 2. Landmark Walker Scores Analysis
+            lw_cpu = landmark_scores[:q_len].cpu()
+            lw_top_k = 30
+            lw_topk_vals, lw_topk_idx = torch.topk(lw_cpu, min(lw_top_k, q_len))
+            log.write(f"LANDMARK WALKER SCORES (positionally normalized):\n")
+            log.write(f"  Top {lw_top_k} positions by LW score:\n")
+            for i, (pos, val) in enumerate(zip(lw_topk_idx.tolist(), lw_topk_vals.tolist())):
+                h2o_val = h2o_cpu[pos].item() if pos < len(h2o_cpu) else 0
+                log.write(f"    {i+1:2d}. pos={pos:5d}  lw={val:.4f}  h2o={h2o_val:.4f}\n")
+            log.write(f"  LW stats: min={lw_cpu.min():.4f}, max={lw_cpu.max():.4f}, mean={lw_cpu.mean():.4f}\n\n")
+
+            # 3. Compare H2O vs LW rankings
+            log.write(f"H2O vs LANDMARK WALKER COMPARISON:\n")
+            h2o_rank = torch.argsort(h2o_cpu, descending=True)
+            lw_rank = torch.argsort(lw_cpu, descending=True)
+
+            # Find tokens that LW ranks much higher than H2O (bridge tokens!)
+            h2o_rank_map = {pos.item(): rank for rank, pos in enumerate(h2o_rank)}
+            lw_rank_map = {pos.item(): rank for rank, pos in enumerate(lw_rank)}
+
+            rank_diffs = []
+            for pos in range(q_len):
+                h2o_r = h2o_rank_map.get(pos, q_len)
+                lw_r = lw_rank_map.get(pos, q_len)
+                rank_diffs.append((pos, h2o_r - lw_r, h2o_r, lw_r))  # positive = LW ranks higher
+
+            rank_diffs.sort(key=lambda x: x[1], reverse=True)
+            log.write(f"  Tokens LW ranks HIGHER than H2O (potential bridge tokens):\n")
+            for pos, diff, h2o_r, lw_r in rank_diffs[:15]:
+                if diff > 10:  # Only show significant differences
+                    log.write(f"    pos={pos:5d}  h2o_rank={h2o_r:5d}  lw_rank={lw_r:5d}  diff={diff:+5d}\n")
+            log.write("\n")
+
+            # 4. Eviction Decision
+            kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
+            evicted_positions = (~keep_mask).nonzero(as_tuple=True)[0].cpu().tolist()
+
+            log.write(f"EVICTION DECISION:\n")
+            log.write(f"  Budget: {self.max_capacity_prompt} tokens\n")
+            log.write(f"  Kept: {len(kept_positions)} tokens\n")
+            log.write(f"  Evicted: {len(evicted_positions)} tokens\n")
+
+            # Show top evicted tokens (ones we might regret evicting)
+            evicted_with_scores = [(pos, lw_cpu[pos].item(), h2o_cpu[pos].item()) for pos in evicted_positions]
+            evicted_with_scores.sort(key=lambda x: x[1], reverse=True)  # Sort by LW score
+            log.write(f"  Top 20 evicted tokens (highest LW score among evicted):\n")
+            for pos, lw_val, h2o_val in evicted_with_scores[:20]:
+                log.write(f"    pos={pos:5d}  lw={lw_val:.4f}  h2o={h2o_val:.4f}\n")
+            log.write("\n")
+
+            # 5. Position distribution of kept tokens
+            kept_positions_sorted = sorted(kept_positions)
+            n_early = sum(1 for p in kept_positions_sorted if p < q_len // 4)
+            n_mid = sum(1 for p in kept_positions_sorted if q_len // 4 <= p < 3 * q_len // 4)
+            n_late = sum(1 for p in kept_positions_sorted if p >= 3 * q_len // 4)
+            log.write(f"POSITION DISTRIBUTION OF KEPT TOKENS:\n")
+            log.write(f"  Early (0-25%): {n_early}\n")
+            log.write(f"  Middle (25-75%): {n_mid}\n")
+            log.write(f"  Late (75-100%): {n_late}\n")
+            log.write("\n")
+
+            log.flush()
 
     def _lazy_init(self, device, seq_len: int):
         """Initialize CUDA graph on first use."""
@@ -1480,10 +1639,19 @@ class CircuitKVCluster():
         # Fill the window portion with actual attention
         full_attn[-self.window_size:, :] = attn_avg
 
-        # For positions outside window, use uniform attention to past (approximation)
-        for i in range(q_len - self.window_size):
-            if i > 0:
-                full_attn[i, :i] = 1.0 / i
+        # For positions outside window, use uniform attention to past (VECTORIZED)
+        # Row i gets uniform attention 1/i over positions [0, i-1]
+        n_prefix = q_len - self.window_size
+        if n_prefix > 1:
+            # Create row indices [0, 1, 2, ..., n-1]
+            row_idx = torch.arange(n_prefix, device=key_states.device, dtype=torch.float32)
+            # 1/i for each row (0 for row 0 to avoid div-by-zero)
+            recip = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
+            recip[1:] = 1.0 / row_idx[1:]
+            # Lower triangular mask (1s below diagonal, 0 on/above)
+            mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
+            # Broadcast: full_attn[i, j] = recip[i] for all j < i
+            full_attn[:n_prefix, :n_prefix] = mask * recip.unsqueeze(1)
 
         # =====================================================================
         # STEP 2: Run Landmark Walker (CUDA kernel)
@@ -1512,6 +1680,12 @@ class CircuitKVCluster():
             self.max_capacity_prompt,
             q_len
         )
+
+        # Debug logging
+        if self.debug:
+            # Compute H2O scores (column sums) for comparison
+            h2o_scores = full_attn.sum(dim=0)
+            self._log_debug(q_len, h2o_scores, scores, keep_mask, full_attn)
 
         # Apply eviction per head
         # Get indices of tokens to keep (excluding local window which is appended)
@@ -1579,6 +1753,9 @@ def init_circuitkv(self):
             self.config.query_boost = 2.0  # Weight for query-sourced walkers
         if not hasattr(self.config, 'position_alpha'):
             self.config.position_alpha = 0.6  # Positional normalization exponent
+        # Debug logging
+        if not hasattr(self.config, 'circuitkv_debug'):
+            self.config.circuitkv_debug = False
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -1599,4 +1776,6 @@ def init_circuitkv(self):
         walkers_per_source=self.config.walkers_per_source,
         query_boost=self.config.query_boost,
         position_alpha=self.config.position_alpha,
+        # Debug
+        debug=self.config.circuitkv_debug,
     )

@@ -269,6 +269,8 @@ def main(args):
                 model.model.layers[i].self_attn.config.floor = args.floor
                 model.model.layers[i].self_attn.config.ratio = ratio[i]
                 model.model.layers[i].self_attn.config.recent_size = recent_size[i]
+                # CircuitKV debug flag
+                model.model.layers[i].self_attn.config.circuitkv_debug = args.debug
             
 
         context_length = batch_input_ids.shape[-1]
@@ -366,6 +368,7 @@ if __name__ == "__main__":
     parser.add_argument('--head_beta', type=float, default=1.01, help='hyper-parameter used on HeadKV')
     parser.add_argument("--recent_size", type=int, default=32, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="pruning ratio of Key Cache")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging for CircuitKV (writes to longbench_CKV_dbg.log)")
 
     parser.add_argument(
         "--use_chat_format", 
