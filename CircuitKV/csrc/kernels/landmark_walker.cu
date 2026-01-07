@@ -224,7 +224,81 @@ __global__ void landmark_walker_kernel(
 }
 
 // =============================================================================
-// Positional Normalization Kernel
+// Reachability Normalization Kernel (WINNING STRATEGY from PoC ablation)
+// =============================================================================
+
+/**
+ * Compute reachability-based normalization.
+ *
+ * Key Insight: Normalize visits by TOTAL WALKERS THAT COULD REACH each position.
+ *
+ * Since walkers only go backwards (toward sink):
+ *   - Walker from source S can visit positions [sink_size, S-1]
+ *   - Position p can be visited by walkers from sources > p
+ *   - total_reachable[p] = sum over sources > p of (num_walkers * weight)
+ *   - normalized[p] = visits[p] / total_reachable[p]
+ *
+ * This is BETTER than positional normalization because:
+ *   - It accounts for the actual walker distribution, not just position
+ *   - Tokens far from any source get normalized properly
+ *   - Bridge tokens between landmarks get proper credit
+ *
+ * @param visit_counts       Raw visit counts [seq_len]
+ * @param normalized_scores  Output normalized scores [seq_len]
+ * @param landmark_positions Positions of landmarks [num_landmarks]
+ * @param num_landmarks      Number of landmarks (not including query)
+ * @param walkers_per_source Walkers launched per source
+ * @param query_boost        Weight multiplier for query walkers
+ * @param seq_len            Sequence length
+ * @param sink_size          Sink region size
+ */
+__global__ void reachability_normalize_kernel(
+    const int32_t* __restrict__ visit_counts,
+    float* __restrict__ normalized_scores,
+    const int32_t* __restrict__ landmark_positions,
+    int num_landmarks,
+    int walkers_per_source,
+    float query_boost,
+    int seq_len,
+    int sink_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= seq_len) return;
+
+    // Sink positions get zero (always kept)
+    if (idx < sink_size) {
+        normalized_scores[idx] = 0.0f;
+        return;
+    }
+
+    // Compute total reachable walkers for this position
+    // A position can be reached by walkers from sources > position
+    float total_reachable = 0.0f;
+
+    // Check landmarks
+    for (int lm = 0; lm < num_landmarks; ++lm) {
+        int source_pos = landmark_positions[lm];
+        if (source_pos > idx) {
+            total_reachable += (float)walkers_per_source * 1.0f;  // weight=1 for landmarks
+        }
+    }
+
+    // Check query (always at seq_len - 1)
+    int query_pos = seq_len - 1;
+    if (query_pos > idx) {
+        total_reachable += (float)walkers_per_source * query_boost;
+    }
+
+    // Normalize
+    if (total_reachable > 1e-8f) {
+        normalized_scores[idx] = (float)visit_counts[idx] / total_reachable;
+    } else {
+        normalized_scores[idx] = 0.0f;
+    }
+}
+
+// =============================================================================
+// Positional Normalization Kernel (kept for backward compatibility)
 // =============================================================================
 
 /**
@@ -527,6 +601,34 @@ void launch_positional_normalize_kernel(
         seq_len,
         sink_size,
         alpha
+    );
+}
+
+void launch_reachability_normalize_kernel(
+    const int32_t* visit_counts,
+    float* normalized_scores,
+    const int32_t* landmark_positions,
+    int num_landmarks,
+    int walkers_per_source,
+    float query_boost,
+    int seq_len,
+    int sink_size,
+    cudaStream_t stream
+) {
+    if (seq_len <= 0) return;
+
+    dim3 block(256);
+    dim3 grid((seq_len + block.x - 1) / block.x);
+
+    reachability_normalize_kernel<<<grid, block, 0, stream>>>(
+        visit_counts,
+        normalized_scores,
+        landmark_positions,
+        num_landmarks,
+        walkers_per_source,
+        query_boost,
+        seq_len,
+        sink_size
     );
 }
 

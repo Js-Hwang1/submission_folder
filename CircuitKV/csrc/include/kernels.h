@@ -384,6 +384,38 @@ void launch_positional_normalize_kernel(
 );
 
 /**
+ * Launch reachability normalization (WINNING STRATEGY from PoC ablation).
+ *
+ * Normalizes visits by total walkers that COULD REACH each position.
+ * This is better than positional normalization because it accounts for
+ * the actual walker distribution, not just position.
+ *
+ * normalized[p] = visits[p] / total_reachable[p]
+ * where total_reachable[p] = sum over sources > p of (num_walkers * weight)
+ *
+ * @param visit_counts       Raw visit counts [seq_len]
+ * @param normalized_scores  Output normalized scores [seq_len]
+ * @param landmark_positions Landmark positions [num_landmarks]
+ * @param num_landmarks      Number of landmarks
+ * @param walkers_per_source Walkers per source
+ * @param query_boost        Weight for query walkers
+ * @param seq_len            Sequence length
+ * @param sink_size          Sink region size (default 4)
+ * @param stream             CUDA stream
+ */
+void launch_reachability_normalize_kernel(
+    const int32_t* visit_counts,
+    float* normalized_scores,
+    const int32_t* landmark_positions,
+    int num_landmarks,
+    int walkers_per_source,
+    float query_boost,
+    int seq_len,
+    int sink_size,
+    cudaStream_t stream
+);
+
+/**
  * Select diverse landmarks using H2O scores with spacing constraint.
  *
  * Algorithm:

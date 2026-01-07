@@ -1126,22 +1126,26 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v0.3.0: Landmark-Diverse Walker for KV Cache Eviction.
+    CircuitKV v0.4.0: Stratified Landmarks + Reachability Normalization.
 
     This class implements multi-source absorbing walks from geographically-diverse
     landmarks to discover "bridge tokens" that connect the query to important context.
 
-    Key Innovation (v0.3.0 - Landmark Walker):
-    - Single-source walks miss important tokens not directly visible from query
-    - By launching walks from diverse landmarks (spread across the sequence),
-      we discover "bridge tokens" through path convergence
-    - Positional normalization removes the natural -log bias of absorbing walks
+    Key Innovation (v0.4.0 - Stratified + Reachability):
+    - STRATIFIED landmark selection: Divide sequence into segments, pick best H2O per segment
+    - REACHABILITY normalization: normalized[p] = visits[p] / total_walkers_that_could_reach[p]
+    - 16 landmarks for better coverage (ablation showed improvement from 8 to 16)
+
+    Why Reachability > Positional:
+    - Positional: normalized[p] = visits[p] / (1/distance^alpha) - assumes uniform walker distribution
+    - Reachability: accounts for actual walker distribution (which sources can reach p)
+    - Bridge tokens between landmarks get proper credit with reachability
 
     Algorithm:
     1. Compute full attention matrix from query/key states
-    2. Select diverse landmarks using H2O scores with spacing constraint
+    2. STRATIFIED landmark selection: one landmark per segment, best H2O within segment
     3. Launch walkers from ALL sources (landmarks + query) in parallel
-    4. Apply positional normalization: score[p] = visits[p] / expected_visits[p]
+    4. Apply REACHABILITY normalization: score[p] = visits[p] / total_reachable[p]
     5. Select top tokens by normalized scores for KV cache retention
 
     Particularly effective for:
@@ -1149,12 +1153,11 @@ class CircuitKVCluster():
     - Long document QA (NarrativeQA, Qasper)
     - Cases where important tokens are not directly attended by the query
 
-    Configuration:
-    - num_landmarks: Number of diverse landmarks to select (default: 8)
-    - min_spacing: Minimum spacing between landmarks (default: 100)
+    Configuration (v0.4.0 defaults - WINNING from PoC ablation):
+    - num_landmarks: Number of diverse landmarks (default: 16)
+    - min_spacing: Minimum segment size for stratified (default: 50)
     - walkers_per_source: Walkers launched from each source (default: 100)
     - query_boost: Weight multiplier for query-sourced walkers (default: 2.0)
-    - position_alpha: Exponent for positional normalization (default: 0.6)
     """
 
     def __init__(
@@ -1179,12 +1182,12 @@ class CircuitKVCluster():
         # Spectral + Walker + MAX mode (v0.2.0)
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
-        # Landmark Walker parameters (v0.3.0)
-        num_landmarks: int = 8,  # Number of diverse landmarks
-        min_spacing: int = 100,  # Minimum spacing between landmarks
+        # Landmark Walker parameters (v0.4.0 - Stratified + Reachability)
+        num_landmarks: int = 16,  # Number of diverse landmarks (16 from ablation)
+        min_spacing: int = 50,  # Minimum segment size for stratified sampling
         walkers_per_source: int = 100,  # Walkers per source (landmark/query)
         query_boost: float = 2.0,  # Weight multiplier for query-sourced walkers
-        position_alpha: float = 0.6,  # Exponent for positional normalization
+        position_alpha: float = 0.6,  # Kept for backward compat (reachability used by default)
         # Debug logging
         debug: bool = False,
     ):
@@ -1304,7 +1307,7 @@ class CircuitKVCluster():
             lw_cpu = landmark_scores[:q_len].cpu()
             lw_top_k = 30
             lw_topk_vals, lw_topk_idx = torch.topk(lw_cpu, min(lw_top_k, q_len))
-            log.write(f"LANDMARK WALKER SCORES (positionally normalized):\n")
+            log.write(f"LANDMARK WALKER SCORES (reachability normalized):\n")
             log.write(f"  Top {lw_top_k} positions by LW score:\n")
             for i, (pos, val) in enumerate(zip(lw_topk_idx.tolist(), lw_topk_vals.tolist())):
                 h2o_val = h2o_cpu[pos].item() if pos < len(h2o_cpu) else 0
@@ -1576,15 +1579,15 @@ class CircuitKVCluster():
         num_key_value_groups: int,
     ):
         """
-        Update KV cache using Landmark-Diverse Walker eviction (v0.3.0).
+        Update KV cache using Stratified + Reachability eviction (v0.4.0).
 
         This implements multi-source absorbing walks from geographically-diverse landmarks:
         1. Compute full attention matrix from query/key states
         2. Run landmark walker (CUDA kernel):
-           - Select diverse landmarks using H2O scores with spacing constraint
+           - STRATIFIED landmark selection: one per segment, best H2O within segment
            - Launch walkers from ALL sources (landmarks + query) in parallel
-           - Apply positional normalization to remove -log bias
-        3. EVICTION: Select top tokens by landmark walker scores
+           - Apply REACHABILITY normalization: visits / total_walkers_that_could_reach
+        3. EVICTION: Select top tokens by normalized landmark walker scores
 
         Args:
             key_states: [bsz, num_heads, seq_len, head_dim]
@@ -1732,7 +1735,7 @@ class CircuitKVCluster():
 
 
 def init_circuitkv(self):
-    """Initialize CircuitKV cluster with Landmark-Diverse Walker (v0.3.0)."""
+    """Initialize CircuitKV cluster with Stratified + Reachability (v0.4.0)."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 64
@@ -1761,17 +1764,17 @@ def init_circuitkv(self):
         # RC+B: Bidirectional Circuit Walks (disabled - hurt narrativeqa score)
         if not hasattr(self.config, 'bidirectional'):
             self.config.bidirectional = False
-        # Landmark Walker parameters (v0.3.0)
+        # Landmark Walker parameters (v0.4.0 - Stratified + Reachability)
         if not hasattr(self.config, 'num_landmarks'):
-            self.config.num_landmarks = 8  # Number of diverse landmarks
+            self.config.num_landmarks = 16  # WINNING from ablation (was 8)
         if not hasattr(self.config, 'min_spacing'):
-            self.config.min_spacing = 100  # Minimum spacing between landmarks
+            self.config.min_spacing = 50  # Min segment size for stratified (was 100)
         if not hasattr(self.config, 'walkers_per_source'):
             self.config.walkers_per_source = 100  # Walkers per source
         if not hasattr(self.config, 'query_boost'):
             self.config.query_boost = 2.0  # Weight for query-sourced walkers
         if not hasattr(self.config, 'position_alpha'):
-            self.config.position_alpha = 0.6  # Positional normalization exponent
+            self.config.position_alpha = 0.6  # Kept for backward compat (reachability used)
         # Debug logging
         if not hasattr(self.config, 'circuitkv_debug'):
             self.config.circuitkv_debug = False

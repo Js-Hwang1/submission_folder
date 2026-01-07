@@ -839,15 +839,19 @@ void CircuitGraph::update_and_step_landmark_walker(
     );
     CUDA_CHECK_LAST();
 
-    // STEP 7: Apply positional normalization
+    // STEP 7: Apply reachability normalization (WINNING STRATEGY from PoC ablation)
+    // Reachability normalization accounts for actual walker distribution,
+    // not just position, which is better for discovering bridge tokens.
     int sink_size = 4;  // Standard sink size
-    launch_positional_normalize_kernel(
+    launch_reachability_normalize_kernel(
         visit_counts_,
         landmark_normalized_,
-        landmark_partial_max_,
+        landmark_positions_,
+        actual_landmarks,
+        walkers_per_source,
+        query_boost,
         seq_len,
         sink_size,
-        position_alpha,
         sidecar_stream_
     );
     CUDA_CHECK_LAST();

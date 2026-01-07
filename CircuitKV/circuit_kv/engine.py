@@ -47,21 +47,28 @@ class CircuitKVConfig:
 
 @dataclass
 class LandmarkWalkerConfig:
-    """Configuration for Landmark-Diverse Walker."""
+    """Configuration for Landmark-Diverse Walker with Reachability Normalization.
+
+    WINNING CONFIGURATION from PoC ablation study:
+    - Stratified landmark selection (one per segment, best H2O within segment)
+    - 16 landmarks for better coverage
+    - Reachability normalization (accounts for walker distribution)
+    """
 
     # Graph parameters
     max_seq_len: int = 8192  # Maximum sequence length
     top_k: int = 32  # Kept for CircuitGraph initialization (not used by landmark walker)
 
-    # Landmark selection parameters
-    num_landmarks: int = 8  # Number of diverse landmarks to select
-    min_spacing: int = 100  # Minimum spacing between landmarks
+    # Landmark selection parameters (STRATIFIED strategy)
+    num_landmarks: int = 16  # Number of diverse landmarks (16 works best from ablation)
+    min_spacing: int = 50  # Minimum segment size for stratified sampling
 
     # Walker parameters
     walkers_per_source: int = 100  # Walkers launched from each source
     query_boost: float = 2.0  # Weight multiplier for query-sourced walkers
 
-    # Positional normalization
+    # Normalization method: 'reachability' (default, winning) or 'positional'
+    # position_alpha kept for backward compatibility with positional normalization
     position_alpha: float = 0.6  # Exponent for expected visits (1/distance^alpha)
 
     # Eviction parameters
@@ -341,17 +348,25 @@ class CircuitKVMonitor:
 
 class LandmarkWalkerMonitor:
     """
-    Landmark-Diverse Walker Monitor.
+    Landmark-Diverse Walker Monitor with Reachability Normalization.
 
-    This class implements the Landmark-Diverse walker approach:
-    1. Select diverse landmarks using H2O scores with spacing constraint
+    This class implements the WINNING CircuitKV approach from PoC ablation:
+    1. STRATIFIED landmark selection (one per segment, best H2O within segment)
     2. Launch walkers from ALL sources (landmarks + query) in parallel
-    3. Apply positional normalization to remove -log bias
+    3. Apply REACHABILITY normalization (accounts for walker distribution)
 
     Key Insight:
         Single-source walks miss important tokens not directly visible from query.
         By launching walks from geographically-diverse landmarks, we discover
         "bridge tokens" through path convergence.
+
+    Reachability Normalization (vs Positional):
+        - Positional: normalized[p] = visits[p] / (1/distance^alpha)
+        - Reachability: normalized[p] = visits[p] / total_walkers_that_could_reach[p]
+
+        Reachability is better because it accounts for the actual walker
+        distribution, not just position. Bridge tokens between landmarks
+        get proper credit.
 
     This is particularly effective for:
     - Multi-hop reasoning (HotpotQA, 2WikiMQA)
@@ -359,7 +374,7 @@ class LandmarkWalkerMonitor:
     - Cases where important tokens are not directly attended by the query
 
     Usage:
-        config = LandmarkWalkerConfig()
+        config = LandmarkWalkerConfig()  # Uses 16 landmarks + reachability by default
         monitor = LandmarkWalkerMonitor(config)
 
         # Given a full attention matrix from the model:
