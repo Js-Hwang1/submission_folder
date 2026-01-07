@@ -332,6 +332,7 @@ void launch_max_combine_kernel(
  *
  * @param landmark_attention  Cached attention rows [num_landmarks, seq_len]
  * @param query_attention     Query's attention row [seq_len]
+ * @param h2o_scores          H2O scores for fallback transitions [seq_len]
  * @param visit_counts        Output visit counts [seq_len]
  * @param rng_states          PRNG states [total_walkers * 2]
  * @param landmark_positions  Landmark positions [num_landmarks]
@@ -344,6 +345,7 @@ void launch_max_combine_kernel(
 void launch_landmark_walker_kernel(
     const float* landmark_attention,
     const float* query_attention,
+    const float* h2o_scores,
     int32_t* visit_counts,
     uint64_t* rng_states,
     const int32_t* landmark_positions,

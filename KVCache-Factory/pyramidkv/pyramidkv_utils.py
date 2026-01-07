@@ -1639,19 +1639,38 @@ class CircuitKVCluster():
         # Fill the window portion with actual attention
         full_attn[-self.window_size:, :] = attn_avg
 
-        # For positions outside window, use uniform attention to past (VECTORIZED)
-        # Row i gets uniform attention 1/i over positions [0, i-1]
+        # For positions outside window, use H2O-WEIGHTED transitions (not uniform)
+        # This guides walkers toward high-attention tokens instead of random backward jumps
         n_prefix = q_len - self.window_size
         if n_prefix > 1:
-            # Create row indices [0, 1, 2, ..., n-1]
-            row_idx = torch.arange(n_prefix, device=key_states.device, dtype=torch.float32)
-            # 1/i for each row (0 for row 0 to avoid div-by-zero)
-            recip = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
-            recip[1:] = 1.0 / row_idx[1:]
-            # Lower triangular mask (1s below diagonal, 0 on/above)
+            # Compute H2O scores (column sums) from window attention
+            # This captures how much recent tokens attend to each position
+            h2o_scores = attn_avg.sum(dim=0)  # [seq_len]
+            h2o_prefix = h2o_scores[:n_prefix].clone()
+
+            # Ensure positive scores (add small epsilon to avoid zeros)
+            h2o_prefix = h2o_prefix.clamp(min=1e-6)
+
+            # For row i, transition prob to j = h2o[j] / sum(h2o[0:i]) for j < i
+            # This creates a valid probability distribution that sums to 1
+            cumsum = h2o_prefix.cumsum(dim=0)  # [n_prefix]
+
+            # denom[i] = sum(h2o[0:i]) = cumsum[i-1]
+            denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
+            denom[1:] = cumsum[:-1]
+            denom[0] = 1.0  # Avoid div-by-zero (row 0 masked anyway)
+
+            # Broadcast to create transition matrix
+            # h2o_expanded[i,j] = h2o[j] for all i
+            h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
+            denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
+
+            # P[i,j] = h2o[j] / sum(h2o[0:i])
+            h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
+
+            # Apply causal mask (only attend to strictly previous positions)
             mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
-            # Broadcast: full_attn[i, j] = recip[i] for all j < i
-            full_attn[:n_prefix, :n_prefix] = mask * recip.unsqueeze(1)
+            full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
         # STEP 2: Run Landmark Walker (CUDA kernel)

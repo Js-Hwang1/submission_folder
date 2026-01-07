@@ -822,10 +822,12 @@ void CircuitGraph::update_and_step_landmark_walker(
     CUDA_CHECK_LAST();
 
     // STEP 6: Launch multi-source landmark walker
+    // Pass h2o_scores for on-the-fly transitions in non-landmark/non-window positions
     int actual_walkers = (actual_landmarks + 1) * walkers_per_source;
     launch_landmark_walker_kernel(
         landmark_attention_,
         query_attention_,
+        h2o_scores_,  // H2O scores for fallback transitions
         visit_counts_,
         landmark_rng_states_,
         landmark_positions_,

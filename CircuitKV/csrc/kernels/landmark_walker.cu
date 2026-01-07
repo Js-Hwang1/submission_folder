@@ -59,6 +59,7 @@ constexpr int MAX_LANDMARKS = 32;  // Maximum supported landmarks
 __global__ void landmark_walker_kernel(
     const float* __restrict__ landmark_attention,
     const float* __restrict__ query_attention,
+    const float* __restrict__ h2o_scores,  // H2O scores for fallback transitions
     int32_t* __restrict__ visit_counts,
     uint64_t* __restrict__ rng_states,
     const int32_t* __restrict__ landmark_positions,
@@ -136,46 +137,49 @@ __global__ void landmark_walker_kernel(
         }
 
         // Get transition probabilities from current position
-        // Use query attention if in window, otherwise find nearest landmark
-        const float* trans_row;
-        bool have_attention = false;
+        // Use query attention if in window, landmark attention if at landmark,
+        // otherwise use H2O-weighted transitions on-the-fly
+        const float* trans_row = nullptr;
+        bool have_cached_attention = false;
+        bool use_h2o_fallback = false;
 
         // Check if current position is in window (last 64 tokens)
         int window_start = max(0, seq_len - 64);
         if (current_pos >= window_start) {
-            trans_row = query_attention;  // Approximate: use query's view
-            have_attention = true;
+            trans_row = query_attention;  // Use query's view
+            have_cached_attention = true;
         }
 
         // Check if current position is a landmark
-        if (!have_attention) {
+        if (!have_cached_attention) {
             for (int lm = 0; lm < num_landmarks; ++lm) {
                 if (landmark_positions[lm] == current_pos) {
                     trans_row = landmark_attention + lm * seq_len;
-                    have_attention = true;
+                    have_cached_attention = true;
                     break;
                 }
             }
         }
 
-        // If no cached attention, use nearest landmark as proxy
-        if (!have_attention) {
-            int nearest_lm = 0;
-            int min_dist = abs(landmark_positions[0] - current_pos);
-            for (int lm = 1; lm < num_landmarks; ++lm) {
-                int dist = abs(landmark_positions[lm] - current_pos);
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    nearest_lm = lm;
-                }
-            }
-            trans_row = landmark_attention + nearest_lm * seq_len;
+        // If no cached attention, use H2O-weighted transitions on-the-fly
+        // This is the key fix: walkers can reach ANY previous position with
+        // probability proportional to H2O score, not limited by proxy attention
+        if (!have_cached_attention) {
+            use_h2o_fallback = true;
         }
 
-        // Sample next position (only to positions before current)
+        // Compute transition weights
         total_weight = 0.0f;
-        for (int j = 0; j < current_pos; ++j) {
-            total_weight += trans_row[j];
+        if (use_h2o_fallback) {
+            // H2O-weighted transitions: P(j) = h2o[j] / sum(h2o[0:current_pos])
+            for (int j = 0; j < current_pos; ++j) {
+                total_weight += h2o_scores[j];
+            }
+        } else {
+            // Cached attention transitions
+            for (int j = 0; j < current_pos; ++j) {
+                total_weight += trans_row[j];
+            }
         }
 
         if (total_weight <= 1e-8f) {
@@ -191,11 +195,23 @@ __global__ void landmark_walker_kernel(
         cumsum = 0.0f;
         int next_pos = 0;
 
-        for (int j = 0; j < current_pos; ++j) {
-            cumsum += trans_row[j];
-            if (cumsum >= target) {
-                next_pos = j;
-                break;
+        if (use_h2o_fallback) {
+            // Sample using H2O weights
+            for (int j = 0; j < current_pos; ++j) {
+                cumsum += h2o_scores[j];
+                if (cumsum >= target) {
+                    next_pos = j;
+                    break;
+                }
+            }
+        } else {
+            // Sample using cached attention
+            for (int j = 0; j < current_pos; ++j) {
+                cumsum += trans_row[j];
+                if (cumsum >= target) {
+                    next_pos = j;
+                    break;
+                }
             }
         }
 
@@ -300,12 +316,17 @@ __global__ void finalize_normalization_kernel(
 // =============================================================================
 
 /**
- * Select diverse landmarks from H2O scores.
+ * Select diverse landmarks using STRATIFIED sampling.
  *
- * Algorithm:
- *   1. Compute H2O score for each position (sum of incoming attention)
- *   2. Greedily select highest H2O positions with minimum spacing
- *   3. Skip sink region and window region
+ * Algorithm (STRATIFIED - ensures geographic diversity):
+ *   1. Divide valid range into max_landmarks equal segments
+ *   2. Within each segment, select the position with highest H2O score
+ *   3. This guarantees landmarks are spread across the entire sequence
+ *
+ * Key Insight:
+ *   Pure H2O-greedy selection clusters landmarks at the beginning (early tokens
+ *   have highest column sums). Stratified sampling ensures we have landmarks
+ *   in the MIDDLE of the sequence to discover bridge tokens.
  */
 __global__ void select_landmarks_kernel(
     const float* __restrict__ attention_row_sums,  // H2O scores [seq_len]
@@ -313,56 +334,59 @@ __global__ void select_landmarks_kernel(
     int* __restrict__ num_landmarks_out,
     int seq_len,
     int max_landmarks,
-    int min_spacing,
+    int min_spacing,      // Now used as minimum segment size
     int sink_buffer,      // Extra buffer from sink (e.g., 20)
     int window_size       // Last window_size tokens excluded
 ) {
     // This kernel is single-threaded (run with 1 block, 1 thread)
-    // Could be parallelized but landmark selection is not perf-critical
-
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
     int window_start = seq_len - window_size;
     int valid_start = LANDMARK_SINK_SIZE + sink_buffer;
     int valid_end = window_start;
+    int valid_range = valid_end - valid_start;
 
-    // Mask array to track excluded positions
-    // Using a simple approach: mark selected positions and their neighbors
-    bool* excluded = new bool[seq_len];
-    for (int i = 0; i < seq_len; ++i) {
-        excluded[i] = (i < valid_start || i >= valid_end);
+    // If range is too small, select fewer landmarks
+    if (valid_range <= 0) {
+        *num_landmarks_out = 0;
+        return;
+    }
+
+    // STRATIFIED SAMPLING: Divide range into equal segments
+    int actual_landmarks = max_landmarks;
+    int segment_size = valid_range / actual_landmarks;
+
+    // Ensure minimum segment size (use min_spacing as minimum)
+    if (segment_size < min_spacing && min_spacing > 0) {
+        actual_landmarks = valid_range / min_spacing;
+        if (actual_landmarks < 1) actual_landmarks = 1;
+        segment_size = valid_range / actual_landmarks;
     }
 
     int num_selected = 0;
 
-    while (num_selected < max_landmarks) {
-        // Find highest H2O score among non-excluded positions
+    for (int seg = 0; seg < actual_landmarks && num_selected < max_landmarks; ++seg) {
+        // Segment boundaries
+        int seg_start = valid_start + seg * segment_size;
+        int seg_end = (seg == actual_landmarks - 1) ? valid_end : (seg_start + segment_size);
+
+        // Find highest H2O score within this segment
         float best_score = -1e30f;
         int best_idx = -1;
 
-        for (int i = valid_start; i < valid_end; ++i) {
-            if (!excluded[i] && attention_row_sums[i] > best_score) {
+        for (int i = seg_start; i < seg_end; ++i) {
+            if (attention_row_sums[i] > best_score) {
                 best_score = attention_row_sums[i];
                 best_idx = i;
             }
         }
 
-        if (best_idx < 0) break;  // No more valid positions
-
-        // Add to landmarks
-        landmark_positions[num_selected++] = best_idx;
-
-        // Exclude nearby positions
-        int exclude_start = max(0, best_idx - min_spacing);
-        int exclude_end = min(seq_len, best_idx + min_spacing + 1);
-        for (int i = exclude_start; i < exclude_end; ++i) {
-            excluded[i] = true;
+        if (best_idx >= 0) {
+            landmark_positions[num_selected++] = best_idx;
         }
     }
 
     *num_landmarks_out = num_selected;
-
-    delete[] excluded;
 }
 
 // =============================================================================
@@ -449,6 +473,7 @@ __global__ void cache_landmark_attention_kernel(
 void launch_landmark_walker_kernel(
     const float* landmark_attention,
     const float* query_attention,
+    const float* h2o_scores,
     int32_t* visit_counts,
     uint64_t* rng_states,
     const int32_t* landmark_positions,
@@ -469,6 +494,7 @@ void launch_landmark_walker_kernel(
     landmark_walker_kernel<<<grid, block, 0, stream>>>(
         landmark_attention,
         query_attention,
+        h2o_scores,
         visit_counts,
         rng_states,
         landmark_positions,
