@@ -25,7 +25,19 @@ from datetime import datetime, timezone
 import time
 import torch
 
-from pyramidkv.monkeypatch import replace_llama,replace_mistral
+from pyramidkv.monkeypatch import replace_llama, replace_mistral, replace_qwen2
+
+
+def get_model_family(model_path):
+    """Detect model family from model path."""
+    model_path_lower = model_path.lower()
+    if "qwen" in model_path_lower:
+        return "qwen"
+    elif "mistral" in model_path_lower:
+        return "mistral"
+    elif "llama" in model_path_lower:
+        return "llama"
+    return "unknown"
 
 scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
 
@@ -138,7 +150,7 @@ class LLMNeedleHaystackTester:
         
         self.model_name = model_name
 
-        if(self.model_provider in ["LLaMA3", "Mistral"]):
+        if(self.model_provider in ["LLaMA3", "Mistral", "Qwen"]):
             self.enc = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             # self.enc.add_special_tokens({'pad_token': '[PAD]'})
             print("loading from %s" % model_name)
@@ -147,26 +159,28 @@ class LLMNeedleHaystackTester:
             # if torch.cuda.device_count()>1:
 
             from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-            from transformers import AutoConfig 
+            from transformers import AutoConfig
 
 
             if self.method == 'full':
                 self.model_to_test=AutoModelForCausalLM.from_pretrained(
-                    model_name, 
+                    model_name,
                     torch_dtype=torch.float16,
                     attn_implementation=self.attn_implementation,
                     device_map="auto",
-                    low_cpu_mem_usage=True, 
+                    low_cpu_mem_usage=True,
                     # use_cache=False
                     ).eval()
 
 
-            if self.method in ["pyramidkv", "snapkv","streamingllm","h2o","cam"]:
-            
+            if self.method in ["pyramidkv", "snapkv", "streamingllm", "h2o", "cam", "circuitkv"]:
+
                 if self.model_provider == 'LLaMA3':
                     replace_llama(self.method.lower())
                 elif self.model_provider == 'Mistral':
                     replace_mistral(self.method.lower())
+                elif self.model_provider == 'Qwen':
+                    replace_qwen2(self.method.lower())
                      
                 if self.max_capacity_prompts != -1:
                     max_capacity_prompts = self.max_capacity_prompts
@@ -207,7 +221,7 @@ class LLMNeedleHaystackTester:
                 
                 # self.model_to_test = tp.tensor_parallel(self.model_to_test, sharded=True)
 
-        else:raise ValueError("model_provider must be either 'LLaMA3' or 'Mistral'")
+        else:raise ValueError("model_provider must be 'LLaMA3', 'Mistral', or 'Qwen'")
             
 
     def logistic(self, x, L=100, x0=50, k=.1):
@@ -386,14 +400,14 @@ class LLMNeedleHaystackTester:
         return context
     
     def encode_text_to_tokens(self, text):
-        if self.model_provider in ["Mistral", "LLaMA3"]:
+        if self.model_provider in ["Mistral", "LLaMA3", "Qwen"]:
             return self.enc.encode(text, add_special_tokens=False)
         elif self.model_provider == "Anthropic":
             # Assuming you have a different encoder for Anthropic
             return self.enc.encode(text).ids
         else:
             return self.enc.encode(text)
-            raise ValueError("model_provider must be either 'OpenAI' or 'Anthropic'")
+            raise ValueError("model_provider must be 'LLaMA3', 'Mistral', or 'Qwen'")
     
     def insert_needle(self, context, depth_percent, context_length):
         tokens_needle = self.encode_text_to_tokens(self.needle)
@@ -420,6 +434,7 @@ class LLMNeedleHaystackTester:
             if(self.model_provider in ["LLaMA", "LongLLaMA"]): period_tokens = [29889, 869]
             elif(self.model_provider == "LLaMA3"): period_tokens = [13]
             elif(self.model_provider == "Mistral"): period_tokens = [842, 28723]
+            elif(self.model_provider == "Qwen"): period_tokens = [13]  # Qwen uses similar tokens to LLaMA3
             elif(self.model_provider == "GLM"): period_tokens = [918, 30930]
             else: period_tokens = self.encode_text_to_tokens('.')
             
@@ -438,11 +453,11 @@ class LLMNeedleHaystackTester:
         return new_context
 
     def get_context_length_in_tokens(self, context):
-        if self.model_provider in ["Mistral", "LLaMA3"]:
+        if self.model_provider in ["Mistral", "LLaMA3", "Qwen"]:
             return len(self.enc.encode(context, add_special_tokens=False))
         else:
             return len(self.enc.encode(context))
-            raise ValueError("model_provider must be either 'OpenAI' or 'Anthropic'")
+            raise ValueError("model_provider must be 'LLaMA3', 'Mistral', or 'Qwen'")
 
     def read_context_files(self):
         context = ""
@@ -455,18 +470,18 @@ class LLMNeedleHaystackTester:
         return context
 
     def get_tokens_from_context(self, context):
-        if self.model_provider in ["Mistral", "LLaMA3"]:
+        if self.model_provider in ["Mistral", "LLaMA3", "Qwen"]:
             return self.enc.encode(context, add_special_tokens=False)
         else:
             return self.enc.encode(context)
-            # raise ValueError("model_provider must be either 'OpenAI' or 'Anthropic'")
-        
+            # raise ValueError("model_provider must be 'LLaMA3', 'Mistral', or 'Qwen'")
+
     def decode_tokens(self, tokens, context_length=None):
-        if self.model_provider in ["Mistral", "LLaMA3"]:
+        if self.model_provider in ["Mistral", "LLaMA3", "Qwen"]:
             return self.enc.decode(tokens[:context_length], skip_special_tokens=True)
         else:
             return self.enc.decode(tokens[:context_length])
-            # raise ValueError("model_provider must be either 'OpenAI' or 'Anthropic'")
+            # raise ValueError("model_provider must be 'LLaMA3', 'Mistral', or 'Qwen'")
 
     def encode_and_trim(self, context, context_length):
         tokens = self.get_tokens_from_context(context)
@@ -502,10 +517,13 @@ if __name__ == "__main__":
     parser.add_argument("--attn_implementation", type=str,  default="flash_attention_2", choices=["flash_attention_2", "sdpa", "None"])
     parser.add_argument('--model_version', type=str, default=None, help='provider of model')
     parser.add_argument('--model_name_suffix', type=str, default=None, help='name of model')
-    parser.add_argument('--model_provider', type=str, default="LLaMA", help='which model to use')
+    parser.add_argument('--model_provider', type=str, default="LLaMA3",
+                        choices=['LLaMA3', 'Mistral', 'Qwen'],
+                        help='which model to use (LLaMA3, Mistral, or Qwen)')
     parser.add_argument('--api_key', type=str, default="", help='OpenAI API Key')
     parser.add_argument('--step', type=int, default=1000)
-    parser.add_argument('--method', type=str, default="full", choices=['full', 'pyramidkv', 'snapkv', 'streamingllm', 'h2o', 'cam'])
+    parser.add_argument('--method', type=str, default="full",
+                        choices=['full', 'pyramidkv', 'snapkv', 'streamingllm', 'h2o', 'cam', 'circuitkv'])
     parser.add_argument('--max_capacity_prompt', type=int, default=128)
     args = parser.parse_args()
 

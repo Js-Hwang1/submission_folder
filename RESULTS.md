@@ -3,6 +3,45 @@
 ## LongBench Evaluation
 
 **Model:** Meta-Llama-3-8B-Instruct
+**KV Budget:** 1024 tokens
+**Attention:** flash_attention_2
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
+
+### Results Table
+
+| Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
+|--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
+| FullKV | 25.56 | 32.27 | 39.71 | 43.56 | 35.29 | 21.18 | 28.74 | 23.20 | 26.73 | 74.00 | 90.48 | 42.53 | 4.80 | 69.75 | 59.27 | 53.92 | **41.94** |
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+### Task Categories
+
+| Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
+|--------|---------------|--------------|---------------|----------|-----------|------|-------------|
+| FullKV | 32.51 | 33.34 | 26.22 | 69.00 | 37.28 | 56.60 | **41.94** |
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+**Category Mapping:**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
+- Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
+- Summarization: GovReport, QMSum, MultiNews
+- Few-shot: TREC, TriviaQA, SAMSum
+- Synthetic: PassageCount, PassageRetrieval
+- Code: LCC, RepoBench-P  
+
+---
+
+**Model:** Meta-Llama-3-8B-Instruct
 **KV Budget:** 2048 tokens
 **Attention:** flash_attention_2
 **Hardware:** NVIDIA GH200 Grace Hopper Superchip
@@ -19,7 +58,6 @@
 | CircuitKV | 25.10 | 30.85 | 39.99 | 44.34 | 35.05 | 21.36 | 26.16 | 23.21 | 26.39 | 72.00 | 90.56 | 42.14 | 4.83 | 69.25 | 57.57 | 54.58 | **41.46** |
 
 
-
 ### Task Categories
 
 | Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
@@ -33,7 +71,166 @@
 
 
 **Category Mapping:**
-- Single-Doc QA: NarrativeQA , Qasper (25.76), MultifieldQA (37.16) → **Avg: 28.34**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
+- Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
+- Summarization: GovReport, QMSum, MultiNews
+- Few-shot: TREC, TriviaQA, SAMSum
+- Synthetic: PassageCount, PassageRetrieval
+- Code: LCC, RepoBench-P  
+
+---
+
+**Model:** Meta-Llama-3.1-8B-Instruct
+**KV Budget:** 1024 tokens
+**Attention:** flash_attention_2
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
+
+### Results Table
+
+| Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
+|--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+### Task Categories
+
+| Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
+|--------|---------------|--------------|---------------|----------|-----------|------|-------------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+**Category Mapping:**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
+- Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
+- Summarization: GovReport, QMSum, MultiNews
+- Few-shot: TREC, TriviaQA, SAMSum
+- Synthetic: PassageCount, PassageRetrieval
+- Code: LCC, RepoBench-P  
+
+---
+
+
+**Model:** Meta-Llama-3.1-8B-Instruct
+**KV Budget:** 2048 tokens
+**Attention:** flash_attention_2
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
+
+### Results Table
+
+| Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
+|--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+### Task Categories
+
+| Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
+|--------|---------------|--------------|---------------|----------|-----------|------|-------------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+**Category Mapping:**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
+- Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
+- Summarization: GovReport, QMSum, MultiNews
+- Few-shot: TREC, TriviaQA, SAMSum
+- Synthetic: PassageCount, PassageRetrieval
+- Code: LCC, RepoBench-P  
+
+---
+
+
+**Model:** Meta-Llama-3.3-70B-Instruct
+**KV Budget:** 1024 tokens
+**Attention:** flash_attention_2
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
+
+### Results Table
+
+| Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
+|--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+### Task Categories
+
+| Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
+|--------|---------------|--------------|---------------|----------|-----------|------|-------------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+**Category Mapping:**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
+- Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
+- Summarization: GovReport, QMSum, MultiNews
+- Few-shot: TREC, TriviaQA, SAMSum
+- Synthetic: PassageCount, PassageRetrieval
+- Code: LCC, RepoBench-P  
+
+---
+
+
+**Model:** Meta-Llama-3.3-70B-Instruct
+**KV Budget:** 2048 tokens
+**Attention:** flash_attention_2
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
+
+### Results Table
+
+| Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
+|--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+### Task Categories
+
+| Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
+|--------|---------------|--------------|---------------|----------|-----------|------|-------------|
+| FullKV | 
+| SnapKV |
+| PyramidKV |
+| H2O |
+| StreamingLLM |
+| CircuitKV |
+
+
+**Category Mapping:**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
 - Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
 - Summarization: GovReport, QMSum, MultiNews
 - Few-shot: TREC, TriviaQA, SAMSum

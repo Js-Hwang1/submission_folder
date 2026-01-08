@@ -83,11 +83,24 @@ model2prompt = {
 # }
 
 model2maxlen = {
+    # Llama 2 (4K context)
     "llama2": 3950,
     "llama-2": 3950,
+    # Llama 3 (8K context)
     "llama3": 7950,
     "llama-3": 7950,
-    "mistral": 31500
+    # Llama 3.1 (128K context)
+    "llama-3.1": 127500,
+    "llama3.1": 127500,
+    # Llama 3.3 (128K context)
+    "llama-3.3": 127500,
+    "llama3.3": 127500,
+    # Mistral (32K context)
+    "mistral": 31500,
+    # Qwen 2.5 (128K context)
+    "qwen2.5": 127500,
+    "qwen-2.5": 127500,
+    "qwen2": 31500,  # Qwen 2 base has 32K context
 }
 
 
@@ -101,16 +114,47 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-def build_chat(prompt):
-        prompt = f"[INST] {prompt} [/INST]"
-        return prompt
+def build_chat(prompt, model_path):
+    """Build chat template based on model type."""
+    model_path_lower = model_path.lower()
 
-# def build_prompt(prompt, dataset):
-    
-#     SYSTEM_PROMPT = model2prompt[dataset]
+    # Llama 2 format
+    if "llama-2" in model_path_lower or "llama2" in model_path_lower:
+        return f"[INST] {prompt} [/INST]"
 
-#     prompt = f"<<SYS>>\n {SYSTEM_PROMPT} \n<</SYS>>\n\n{prompt}"
-#     return prompt
+    # Llama 3.1/3.2/3.3 format (uses same template as Llama 3)
+    # These models use the tokenizer's chat template, but for raw prompts:
+    if any(x in model_path_lower for x in ["llama-3.1", "llama3.1", "llama-3.2", "llama3.2", "llama-3.3", "llama3.3"]):
+        return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    # Llama 3 format
+    if "llama-3" in model_path_lower or "llama3" in model_path_lower:
+        return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    # Qwen 2/2.5 format
+    if "qwen" in model_path_lower:
+        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+    # Mistral format (similar to Llama 2)
+    if "mistral" in model_path_lower:
+        return f"[INST] {prompt} [/INST]"
+
+    # Default: return prompt as-is
+    return prompt
+
+
+def get_model_family(model_path):
+    """Detect model family from model path."""
+    model_path_lower = model_path.lower()
+
+    if "qwen" in model_path_lower:
+        return "qwen"
+    elif "mistral" in model_path_lower:
+        return "mistral"
+    elif "llama" in model_path_lower:
+        return "llama"
+    else:
+        return "unknown"
 
 def main(args):
     
@@ -152,10 +196,14 @@ def main(args):
             
             template = model2prompt[args.dataset]
             prompt = template.format(**example)
-            
-            if "llama2" in args.model_path.lower():
-                prompt = build_chat(prompt)
-                
+
+            # Apply chat template for instruct models
+            if "instruct" in args.model_path.lower() or "chat" in args.model_path.lower():
+                prompt = build_chat(prompt, args.model_path)
+            # Legacy: also apply for llama2 without explicit instruct tag
+            elif "llama2" in args.model_path.lower() or "llama-2" in args.model_path.lower():
+                prompt = build_chat(prompt, args.model_path)
+
             example["prompt"] = prompt
                 
             test_data.append(example)
@@ -396,9 +444,22 @@ if __name__ == "__main__":
     )
 
 
-    from pyramidkv.monkeypatch import replace_llama,replace_mistral
-    replace_llama(args.method.lower())
-    replace_mistral(args.method.lower())
+    from pyramidkv.monkeypatch import replace_llama, replace_mistral, replace_qwen2
+
+    # Detect model family and apply appropriate patches
+    model_family = get_model_family(args.model_path)
+    print(f"Detected model family: {model_family}")
+
+    if model_family == "llama":
+        replace_llama(args.method.lower())
+    elif model_family == "mistral":
+        replace_mistral(args.method.lower())
+    elif model_family == "qwen":
+        replace_qwen2(args.method.lower())
+    else:
+        # Fallback: try all patches (some will silently fail if model not loaded)
+        print(f"Unknown model family '{model_family}', attempting Llama patches...")
+        replace_llama(args.method.lower())
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,

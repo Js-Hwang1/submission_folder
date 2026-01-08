@@ -16,6 +16,20 @@ from pyramidkv.mistral_model import adaptive_MistralModel_forward
 from pyramidkv.llama_model import prepare_inputs_for_generation_llama, prepare_inputs_for_generation_llama_new
 from pyramidkv.mistral_model import prepare_inputs_for_generation_mistral, prepare_inputs_for_generation_mistral_new
 
+# Qwen2 imports
+from pyramidkv.qwen2_model import (
+    qwen2_flash_attn2_forward_H2O, qwen2_flash_attn2_forward_SnapKV,
+    qwen2_flash_attn2_forward_PyramidKV, qwen2_flash_attn2_forward_StreamingLLM,
+    qwen2_flash_attn2_forward_CircuitKV,
+    qwen2_attn_forward_H2O, qwen2_attn_forward_SnapKV,
+    qwen2_attn_forward_PyramidKV, qwen2_attn_forward_StreamingLLM,
+    qwen2_attn_forward_CircuitKV,
+    qwen2_sdpa_attn_forward_H2O, qwen2_sdpa_attn_forward_SnapKV,
+    qwen2_sdpa_attn_forward_PyramidKV, qwen2_sdpa_attn_forward_StreamingLLM,
+    qwen2_sdpa_attn_forward_CircuitKV,
+    prepare_inputs_for_generation_qwen2, prepare_inputs_for_generation_qwen2_new,
+)
+
 
 def replace_llama(method, model_name=None):
    
@@ -150,3 +164,42 @@ def replace_mistral(method):
     
     if method not in ["fullkv"]:
         transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_mistral_new
+
+
+def replace_qwen2(method):
+    """
+    Replace Qwen2 attention forward methods for KV-cache eviction.
+    Supports: H2O, SnapKV, PyramidKV, StreamingLLM, CircuitKV.
+    """
+    if method == "pyramidkv":
+        print("Using PyramidKV for Qwen2!")
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = qwen2_attn_forward_PyramidKV
+        transformers.models.qwen2.modeling_qwen2.Qwen2FlashAttention2.forward = qwen2_flash_attn2_forward_PyramidKV
+        transformers.models.qwen2.modeling_qwen2.Qwen2SdpaAttention.forward = qwen2_sdpa_attn_forward_PyramidKV
+
+    elif method == "streamingllm":
+        print("Using StreamingLLM for Qwen2!")
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = qwen2_attn_forward_StreamingLLM
+        transformers.models.qwen2.modeling_qwen2.Qwen2FlashAttention2.forward = qwen2_flash_attn2_forward_StreamingLLM
+        transformers.models.qwen2.modeling_qwen2.Qwen2SdpaAttention.forward = qwen2_sdpa_attn_forward_StreamingLLM
+
+    elif method == "h2o":
+        print("Using H2O for Qwen2!")
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = qwen2_attn_forward_H2O
+        transformers.models.qwen2.modeling_qwen2.Qwen2FlashAttention2.forward = qwen2_flash_attn2_forward_H2O
+        transformers.models.qwen2.modeling_qwen2.Qwen2SdpaAttention.forward = qwen2_sdpa_attn_forward_H2O
+
+    elif method == "snapkv":
+        print("Using SnapKV for Qwen2!")
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = qwen2_attn_forward_SnapKV
+        transformers.models.qwen2.modeling_qwen2.Qwen2FlashAttention2.forward = qwen2_flash_attn2_forward_SnapKV
+        transformers.models.qwen2.modeling_qwen2.Qwen2SdpaAttention.forward = qwen2_sdpa_attn_forward_SnapKV
+
+    elif method == "circuitkv":
+        print("Using CircuitKV (Current-Flow Betweenness) for Qwen2!")
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = qwen2_attn_forward_CircuitKV
+        transformers.models.qwen2.modeling_qwen2.Qwen2FlashAttention2.forward = qwen2_flash_attn2_forward_CircuitKV
+        transformers.models.qwen2.modeling_qwen2.Qwen2SdpaAttention.forward = qwen2_sdpa_attn_forward_CircuitKV
+
+    if method not in ["fullkv"]:
+        transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_qwen2_new

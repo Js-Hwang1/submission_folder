@@ -36,7 +36,15 @@ model2maxlen = {
     "llama-2": 3950,
     "llama3": 7950,
     "llama-3": 7950,
-    "mistral": 31500
+    "llama-3.1": 127500,
+    "llama3.1": 127500,
+    "llama-3.3": 127500,
+    "llama3.3": 127500,
+    "mistral": 31500,
+    "qwen2.5": 127500,
+    "qwen-2.5": 127500,
+    "qwen2": 31500,
+    "qwen": 31500,
 }
 
 
@@ -50,9 +58,44 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-def build_chat(prompt):
-        prompt = f"[INST] {prompt} [/INST]"
-        return prompt
+def build_chat(prompt, model_path):
+    """Build chat template based on model family."""
+    model_path_lower = model_path.lower()
+
+    # Llama 2 format
+    if "llama-2" in model_path_lower or "llama2" in model_path_lower:
+        return f"[INST] {prompt} [/INST]"
+
+    # Llama 3.1/3.2/3.3 format (same chat template)
+    if any(x in model_path_lower for x in ["llama-3.1", "llama3.1", "llama-3.2", "llama3.2", "llama-3.3", "llama3.3"]):
+        return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    # Llama 3.0 format
+    if "llama-3" in model_path_lower or "llama3" in model_path_lower:
+        return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    # Qwen/Qwen2/Qwen2.5 format (ChatML)
+    if "qwen" in model_path_lower:
+        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+    # Mistral format
+    if "mistral" in model_path_lower:
+        return f"[INST] {prompt} [/INST]"
+
+    # Default: no chat template
+    return prompt
+
+
+def get_model_family(model_path: str) -> str:
+    """Detect model family from model path."""
+    model_path_lower = model_path.lower()
+    if "qwen" in model_path_lower:
+        return "qwen"
+    elif "mistral" in model_path_lower:
+        return "mistral"
+    elif "llama" in model_path_lower:
+        return "llama"
+    return "unknown"
 
 # def build_prompt(prompt, dataset):
     
@@ -91,8 +134,7 @@ def main(args):
                 input_max_len = length
 
             prompt = example["input"] #TODO tokenizer.apply_chat_template ?
-            if "llama2" in args.model_path.lower():
-                prompt = build_chat(prompt)
+            prompt = build_chat(prompt, args.model_path)
             example["prompt"] = prompt
                 
             test_data.append(example)
@@ -144,7 +186,7 @@ def main(args):
         
         
         if args.method != "FullKV":
-            if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm"]:
+            if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "circuitkv"]:
                 window_sizes = 8
             elif args.method.lower() in ["streamingllm"]:
                 window_sizes = max_capacity_prompts - 4
@@ -267,9 +309,21 @@ if __name__ == "__main__":
     )
 
 
-    from pyramidkv.monkeypatch import replace_llama,replace_mistral
-    replace_llama(args.method.lower())
-    replace_mistral(args.method.lower())
+    from pyramidkv.monkeypatch import replace_llama, replace_mistral, replace_qwen2
+
+    # Apply model-specific monkeypatch based on detected model family
+    model_family = get_model_family(args.model_path)
+    print(f"Detected model family: {model_family}")
+
+    if model_family == "llama":
+        replace_llama(args.method.lower())
+    elif model_family == "mistral":
+        replace_mistral(args.method.lower())
+    elif model_family == "qwen":
+        replace_qwen2(args.method.lower())
+    else:
+        print(f"Warning: Unknown model family '{model_family}', defaulting to llama")
+        replace_llama(args.method.lower())
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,

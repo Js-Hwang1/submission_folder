@@ -246,8 +246,8 @@ void CircuitGraph::allocate_memory() {
     CUDA_CHECK(cudaMalloc(&combined_scores_, spectral_v_size));
 
     // Landmark walker buffers
-    // Max walkers = (MAX_LANDMARKS + 1) * walkers_per_source (assume max 200 per source)
-    max_landmark_walkers_ = (MAX_LANDMARKS + 1) * 200;
+    // Max walkers = (MAX_LANDMARKS + 1) * walkers_per_source (assume max 500 per source)
+    max_landmark_walkers_ = (MAX_LANDMARKS + 1) * 500;
     size_t landmark_attention_size = MAX_LANDMARKS * max_seq_len_ * sizeof(float);
     size_t landmark_rng_size = max_landmark_walkers_ * 2 * sizeof(uint64_t);
 
