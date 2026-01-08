@@ -198,10 +198,55 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         Returns:
             Tensor of shape [seq_len] with normalized importance scores.
         )pbdoc"
+    )
+    .def("update_and_step_landmark_absorbing_walker", &CircuitGraph::update_and_step_landmark_absorbing_walker,
+        py::arg("attention_matrix"),
+        py::arg("current_idx"),
+        py::arg("num_landmarks") = 32,
+        py::arg("walkers_per_source") = 100,
+        py::arg("query_boost") = 2.0f,
+        py::arg("min_spacing") = 50,
+        py::arg("absorb_at_landmarks") = true,
+        R"pbdoc(
+        Landmark Absorbing Walker: Landmarks are BOTH sources AND sinks (v0.5.0).
+
+        NEW APPROACH:
+            Instead of all walkers flowing to tokens 0-3, walkers absorb at
+            ANY landmark (or sink). This creates a "mesh" of current flows
+            between landmarks, potentially capturing local bridge tokens better.
+
+        Physics Analogy:
+            - Old: Single battery (Query+ to Sink-)
+            - New: Mesh network where each landmark can source or sink current
+
+        Key Benefit:
+            Captures "local bridges" - tokens that connect ADJACENT landmarks.
+            A token between landmarks L1 and L2 gets visits from both directions.
+
+        Args:
+            attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
+            current_idx: Current token index (query position).
+            num_landmarks: Number of landmarks to select (default 32).
+            walkers_per_source: Walkers per source (default 100).
+            query_boost: Weight multiplier for query walkers (default 2.0).
+            min_spacing: Minimum segment size for stratified selection (default 50).
+            absorb_at_landmarks: If true (default), landmarks absorb walkers (NEW behavior).
+                                 If false, old behavior (only sink absorbs).
+        )pbdoc"
+    )
+    .def("get_landmark_absorbing_scores", &CircuitGraph::get_landmark_absorbing_scores,
+        R"pbdoc(
+        Get the landmark absorbing walker scores.
+
+        Synchronizes the sidecar stream before returning.
+
+        Returns:
+            Tensor of shape [seq_len] with normalized importance scores.
+        )pbdoc"
     );
 
     // Version info
-    m.attr("__version__") = "0.4.0";
+    m.attr("__version__") = "0.5.0";
 }
 
 }  // namespace circuit_kv

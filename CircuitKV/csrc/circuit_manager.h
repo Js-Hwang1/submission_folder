@@ -192,6 +192,47 @@ public:
      */
     torch::Tensor get_landmark_scores();
 
+    /**
+     * Landmark Absorbing Walker: Landmarks are BOTH sources AND sinks.
+     *
+     * NEW APPROACH (v0.5.0):
+     *   Instead of all walkers flowing to tokens 0-3, walkers absorb at
+     *   ANY landmark (or sink). This creates a "mesh" of current flows
+     *   between landmarks, capturing local bridge tokens better.
+     *
+     * Physics Analogy:
+     *   - Old: Single battery (Query+ to Sink-)
+     *   - New: Mesh network where each landmark can source or sink current
+     *
+     * Key Benefit:
+     *   Captures "local bridges" - tokens that connect ADJACENT landmarks.
+     *   A token between landmarks L1 and L2 gets visits from both directions.
+     *
+     * @param attention_matrix     Full attention matrix [seq_len, seq_len], FP32
+     * @param current_idx          Current token index (query position)
+     * @param num_landmarks        Number of landmarks to select (default 32)
+     * @param walkers_per_source   Walkers per source (default 100)
+     * @param query_boost          Weight multiplier for query walkers (default 2.0)
+     * @param min_spacing          Minimum segment size for stratified (default 50)
+     * @param absorb_at_landmarks  If true, landmarks absorb walkers (NEW); if false, old behavior
+     */
+    void update_and_step_landmark_absorbing_walker(
+        torch::Tensor attention_matrix,
+        int current_idx,
+        int num_landmarks = 32,
+        int walkers_per_source = 100,
+        float query_boost = 2.0f,
+        int min_spacing = 50,
+        bool absorb_at_landmarks = true
+    );
+
+    /**
+     * Get the landmark absorbing walker scores.
+     *
+     * @return Tensor of shape [seq_len] with normalized scores
+     */
+    torch::Tensor get_landmark_absorbing_scores();
+
 private:
     // Configuration
     int max_seq_len_;

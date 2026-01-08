@@ -895,4 +895,177 @@ torch::Tensor CircuitGraph::get_landmark_scores() {
     return scores;
 }
 
+// =============================================================================
+// Landmark Absorbing Walker Methods (v0.5.0 - Landmarks as Sources AND Sinks)
+// =============================================================================
+
+void CircuitGraph::update_and_step_landmark_absorbing_walker(
+    torch::Tensor attention_matrix,
+    int current_idx,
+    int num_landmarks,
+    int walkers_per_source,
+    float query_boost,
+    int min_spacing,
+    bool absorb_at_landmarks
+) {
+    CHECK_CUDA(attention_matrix);
+    CHECK_CONTIGUOUS(attention_matrix);
+    TORCH_CHECK(attention_matrix.dtype() == torch::kFloat32,
+                "attention_matrix must be float32");
+    TORCH_CHECK(attention_matrix.dim() == 2,
+                "attention_matrix must be 2D [seq_len, seq_len]");
+
+    int seq_len = attention_matrix.size(0);
+    TORCH_CHECK(attention_matrix.size(1) == seq_len,
+                "attention_matrix must be square");
+    TORCH_CHECK(current_idx >= 0 && current_idx < seq_len,
+                "current_idx out of bounds");
+    TORCH_CHECK(seq_len <= max_seq_len_,
+                "seq_len exceeds max_seq_len");
+    TORCH_CHECK(num_landmarks <= MAX_LANDMARKS,
+                "num_landmarks exceeds MAX_LANDMARKS");
+
+    // Update current sequence length
+    current_seq_len_ = seq_len;
+
+    // Get current CUDA stream from PyTorch
+    main_stream_ = at::cuda::getCurrentCUDAStream();
+    CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+    const float* attn_ptr = attention_matrix.data_ptr<float>();
+
+    // Initialize landmark RNG if needed
+    int total_walkers = (num_landmarks + 1) * walkers_per_source;
+    TORCH_CHECK(total_walkers <= max_landmark_walkers_,
+                "total_walkers exceeds max_landmark_walkers");
+
+    if (!landmark_rng_initialized_) {
+        auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
+        launch_init_rng_kernel(
+            landmark_rng_states_,
+            static_cast<uint64_t>(seed),
+            max_landmark_walkers_,
+            sidecar_stream_
+        );
+        landmark_rng_initialized_ = true;
+    }
+
+    // STEP 1: Compute H2O scores (column sums)
+    launch_compute_h2o_scores_kernel(
+        attn_ptr,
+        h2o_scores_,
+        seq_len,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 2: Select diverse landmarks (stratified)
+    int sink_buffer = 20;
+    int window_size = 64;
+
+    launch_select_landmarks_kernel(
+        h2o_scores_,
+        landmark_positions_,
+        num_landmarks_selected_,
+        seq_len,
+        num_landmarks,
+        min_spacing,
+        sink_buffer,
+        window_size,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // Synchronize to get actual landmark count
+    CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
+
+    int actual_landmarks;
+    CUDA_CHECK(cudaMemcpy(&actual_landmarks, num_landmarks_selected_,
+                          sizeof(int), cudaMemcpyDeviceToHost));
+
+    // STEP 3: Cache landmark attention rows
+    if (actual_landmarks > 0) {
+        launch_cache_landmark_attention_kernel(
+            attn_ptr,
+            landmark_attention_,
+            landmark_positions_,
+            actual_landmarks,
+            seq_len,
+            sidecar_stream_
+        );
+        CUDA_CHECK_LAST();
+    }
+
+    // STEP 4: Copy query's attention row
+    CUDA_CHECK(cudaMemcpyAsync(
+        query_attention_,
+        attn_ptr + current_idx * seq_len,
+        seq_len * sizeof(float),
+        cudaMemcpyDeviceToDevice,
+        sidecar_stream_
+    ));
+
+    // STEP 5: Clear visit counts
+    launch_reset_counts_kernel(
+        visit_counts_,
+        max_seq_len_,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 6: Launch landmark ABSORBING walker (NEW - landmarks can absorb)
+    launch_landmark_absorbing_walker_kernel(
+        landmark_attention_,
+        query_attention_,
+        h2o_scores_,
+        visit_counts_,
+        landmark_rng_states_,
+        landmark_positions_,
+        actual_landmarks,
+        walkers_per_source,
+        query_boost,
+        seq_len,
+        absorb_at_landmarks,  // NEW: whether landmarks absorb walkers
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 7: Apply reachability normalization
+    int sink_size = 4;
+    launch_landmark_reachability_normalize_kernel(
+        visit_counts_,
+        landmark_normalized_,
+        landmark_positions_,
+        actual_landmarks,
+        walkers_per_source,
+        query_boost,
+        seq_len,
+        sink_size,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+}
+
+torch::Tensor CircuitGraph::get_landmark_absorbing_scores() {
+    // Synchronize sidecar stream to ensure all operations complete
+    CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
+
+    // Create output tensor on GPU
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(torch::kCUDA);
+
+    torch::Tensor scores = torch::empty({current_seq_len_}, options);
+
+    // Copy normalized scores (reuses landmark_normalized_ buffer)
+    CUDA_CHECK(cudaMemcpy(
+        scores.data_ptr<float>(),
+        landmark_normalized_,
+        current_seq_len_ * sizeof(float),
+        cudaMemcpyDeviceToDevice
+    ));
+
+    return scores;
+}
+
 }  // namespace circuit_kv
