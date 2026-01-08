@@ -482,4 +482,76 @@ void launch_compute_h2o_scores_kernel(
     cudaStream_t stream
 );
 
+// =============================================================================
+// Kernel 5: Landmark Absorbing Walker (Landmarks as Sources AND Sinks)
+// =============================================================================
+
+/**
+ * Launch the landmark absorbing walker kernel.
+ *
+ * NEW APPROACH: Landmarks are both SOURCES and SINKS.
+ * Walkers absorb when reaching ANY landmark (not just tokens 0-3).
+ * This creates a "mesh" of current flows between landmarks.
+ *
+ * Physics Analogy:
+ *   - Old: Single battery (Query+ to Sink-)
+ *   - New: Mesh network where each landmark can source or sink current
+ *
+ * Key Benefit:
+ *   Captures "local bridges" - tokens that connect ADJACENT landmarks.
+ *   A token between landmarks L1 and L2 gets visits from both directions.
+ *
+ * @param landmark_attention   Cached attention rows [num_landmarks, seq_len]
+ * @param query_attention      Query's attention row [seq_len]
+ * @param h2o_scores           H2O scores for fallback transitions [seq_len]
+ * @param visit_counts         Output visit counts [seq_len]
+ * @param rng_states           PRNG states [total_walkers * 2]
+ * @param landmark_positions   Landmark positions [num_landmarks]
+ * @param num_landmarks        Number of landmarks (not including query)
+ * @param walkers_per_source   Walkers per source
+ * @param query_boost          Weight multiplier for query walkers
+ * @param seq_len              Current sequence length
+ * @param absorb_at_landmarks  If true, walkers absorb at landmarks (new behavior)
+ * @param stream               CUDA stream
+ */
+void launch_landmark_absorbing_walker_kernel(
+    const float* landmark_attention,
+    const float* query_attention,
+    const float* h2o_scores,
+    int32_t* visit_counts,
+    uint64_t* rng_states,
+    const int32_t* landmark_positions,
+    int num_landmarks,
+    int walkers_per_source,
+    float query_boost,
+    int seq_len,
+    bool absorb_at_landmarks,
+    cudaStream_t stream
+);
+
+/**
+ * Launch reachability normalization for landmark-absorbing walks.
+ *
+ * @param visit_counts        Raw visit counts [seq_len]
+ * @param normalized_scores   Output normalized scores [seq_len]
+ * @param landmark_positions  Landmark positions [num_landmarks]
+ * @param num_landmarks       Number of landmarks
+ * @param walkers_per_source  Walkers per source
+ * @param query_boost         Weight for query walkers
+ * @param seq_len             Sequence length
+ * @param sink_size           Sink region size (default 4)
+ * @param stream              CUDA stream
+ */
+void launch_landmark_reachability_normalize_kernel(
+    const int32_t* visit_counts,
+    float* normalized_scores,
+    const int32_t* landmark_positions,
+    int num_landmarks,
+    int walkers_per_source,
+    float query_boost,
+    int seq_len,
+    int sink_size,
+    cudaStream_t stream
+);
+
 }  // namespace circuit_kv
