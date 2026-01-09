@@ -1,28 +1,33 @@
 /**
- * Causal Influence Propagation Walker (v1.0.6)
+ * Causal Influence Propagation Walker (v1.0.7)
  *
  * ALGORITHM:
  *   1. MULTI-SOURCE: 50% walkers start at query, 50% start at random positions
- *   2. At each step, sample next from A[pos, sink_size:pos+1] (EXCLUDE SINK)
+ *   2. TEMPERATURE SAMPLING: Sample from A[pos,j]^(1/T) to encourage exploration
  *   3. Visit count = unweighted for ALL steps (count from step 0)
  *   4. Normalize by POSITIONAL OPPORTUNITY to counteract early-position bias
  *
- * KEY INSIGHT:
- *   Single-source walks (all from query) can't reach middle positions because
- *   attention paths don't go there. Multi-source walks ensure COVERAGE of all
- *   regions while staying purely attention-based.
+ * KEY INSIGHT - "Attention Concentration Problem":
+ *   LLM attention is highly concentrated: ~80-90% to BOS/early, ~10% to recent,
+ *   ~1-5% to middle. Walkers following raw attention converge to high-attention
+ *   positions regardless of starting point. This is the "rich get richer" effect.
  *
- * v1.0.6 FIX - "Multi-Source Walks":
- *   Problem: Walkers starting at query follow attention backward. The attention
- *   path goes: Query → Early (template) or Query → Very Late (local attention).
- *   Middle positions (few-shot examples) are UNREACHABLE - they get 0 visits
- *   regardless of positional normalization.
+ * v1.0.7 FIX - "Temperature-Based Exploration":
+ *   Problem: Even with multi-source walks, walkers follow high-attention paths
+ *   and converge to early/late positions. Middle positions (few-shot examples)
+ *   are starved because attention to them is LOW, not zero.
  *
- *   Solution: Start 50% of walkers at RANDOM positions throughout the sequence.
- *   This ensures coverage while staying attention-based (no hybrid with H2O).
+ *   Solution: Apply temperature scaling before sampling:
+ *     sampled_prob[j] ∝ attention[pos,j]^(1/temperature)
  *
- *   - Walker IDs 0 to num_walkers/2 - 1: Start at query (current_idx)
- *   - Walker IDs num_walkers/2 to num_walkers - 1: Start at random positions
+ *   With temperature > 1:
+ *     - High attention values are REDUCED (e.g., 0.8^0.5 = 0.89)
+ *     - Low attention values are BOOSTED (e.g., 0.05^0.5 = 0.22)
+ *     - Distribution becomes more uniform → walkers EXPLORE more
+ *
+ *   Example: attention = [0.8, 0.1, 0.05, 0.05]
+ *     - Raw: [0.80, 0.10, 0.05, 0.05] (walkers always go to first)
+ *     - T=2: [0.54, 0.19, 0.13, 0.13] (walkers explore all positions)
  *
  * DIRECTION:
  *   Walk ALONG A (not A^T). A[i,j] = how much position i attends to j.
@@ -39,16 +44,18 @@ namespace circuit_kv {
 constexpr int INFLUENCE_DEFAULT_WALKERS = 10000;
 constexpr int INFLUENCE_DEFAULT_MAX_STEPS = 10;
 constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
+constexpr float INFLUENCE_DEFAULT_TEMPERATURE = 2.0f;  // v1.0.7: Exploration temperature
 
 /**
- * Influence Walker Kernel (v1.0.6 - Multi-Source Walks)
+ * Influence Walker Kernel (v1.0.7 - Temperature-Based Exploration)
  *
  * Each thread runs one walker. 50% start at current_idx (query), 50% start at
  * random positions in [sink_size, current_idx]. All walk through attention
  * for max_steps, ONLY among non-sink positions.
  *
- * v1.0.6: Multi-source walks ensure coverage of ALL regions while staying
- * purely attention-based. Positional normalization counteracts early bias.
+ * v1.0.7: Temperature scaling flattens attention distribution to encourage
+ * exploration. With temperature > 1, low-attention positions get boosted,
+ * allowing walkers to discover important tokens that don't have high attention.
  *
  * @param attention      Full attention matrix [seq_len, seq_len], row-major
  * @param visits         Output: visit counts [seq_len] (all steps)
@@ -58,6 +65,7 @@ constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
  * @param num_walkers    Number of walkers
  * @param max_steps      Maximum steps per walker
  * @param sink_size      Sink region size (positions 0 to sink_size-1 excluded from sampling)
+ * @param inv_temperature  1/temperature for sampling (default 0.5 = temperature 2.0)
  */
 __global__ void influence_walker_kernel(
     const float* __restrict__ attention,
@@ -67,7 +75,8 @@ __global__ void influence_walker_kernel(
     int current_idx,
     int num_walkers,
     int max_steps,
-    int sink_size
+    int sink_size,
+    float inv_temperature
 ) {
     int walker_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (walker_id >= num_walkers) return;
@@ -109,17 +118,20 @@ __global__ void influence_walker_kernel(
 
         const float* attn_row = attention + pos * seq_len;
 
-        // v1.0.3: Sum attention only over NON-SINK positions for renormalization
+        // v1.0.7: Sum TEMPERATURE-SCALED attention over NON-SINK positions
+        // scaled_prob[j] = attn[j]^(1/temperature) = attn[j]^inv_temperature
         float non_sink_sum = 0.0f;
         for (int j = sink_size; j <= pos; j++) {
-            non_sink_sum += attn_row[j];
+            // Apply temperature scaling: higher temperature = more uniform
+            float scaled = powf(fmaxf(attn_row[j], 1e-10f), inv_temperature);
+            non_sink_sum += scaled;
         }
 
         // If all attention goes to sink (non_sink_sum ≈ 0), terminate walk
         // This walker's influence path ends at this point
         if (non_sink_sum < 1e-10f) break;
 
-        // Sample from renormalized distribution over non-sink positions
+        // Sample from temperature-scaled distribution over non-sink positions
         float r = pcg_uniform(&rng) * non_sink_sum;
 
         // Cumulative sum search for sampling (only over non-sink positions)
@@ -127,7 +139,9 @@ __global__ void influence_walker_kernel(
         int next_pos = sink_size;  // Default to first non-sink position
 
         for (int j = sink_size; j <= pos; j++) {
-            cumsum += attn_row[j];
+            // Same temperature scaling as above
+            float scaled = powf(fmaxf(attn_row[j], 1e-10f), inv_temperature);
+            cumsum += scaled;
             if (r < cumsum) {
                 next_pos = j;
                 break;
@@ -241,7 +255,8 @@ void launch_influence_walker_kernel(
     int num_walkers,
     int max_steps,
     int sink_size,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float temperature  // v1.0.7: Exploration temperature (default 2.0)
 ) {
     const int block_size = 256;
     const int num_blocks = (num_walkers + block_size - 1) / block_size;
@@ -249,9 +264,13 @@ void launch_influence_walker_kernel(
     // Cast to PCGState* (each PCGState is 2 uint64_t = 16 bytes)
     PCGState* pcg_states = reinterpret_cast<PCGState*>(rng_states);
 
+    // v1.0.7: Pass inverse temperature for efficient computation
+    // inv_temp = 1/T, so attn^(1/T) = attn^inv_temp
+    float inv_temperature = 1.0f / fmaxf(temperature, 0.1f);  // Clamp to avoid div by 0
+
     influence_walker_kernel<<<num_blocks, block_size, 0, stream>>>(
         attention, visits, pcg_states, seq_len, current_idx,
-        num_walkers, max_steps, sink_size
+        num_walkers, max_steps, sink_size, inv_temperature
     );
 }
 
@@ -315,7 +334,7 @@ __global__ void influence_positional_adjust_kernel(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < seq_len) {
-        // For sink positions, keep score at 0 (they're always kept anyway)
+        // Sink positions: Set to 0 temporarily, will be set to 1.0 in final normalization
         if (idx < sink_size) {
             adjusted[idx] = 0.0f;
         } else {
@@ -366,20 +385,27 @@ __global__ void influence_find_adjusted_max_kernel(
 /**
  * Normalize by max value kernel
  * Named with influence_ prefix to avoid collision with spectral_power.cu
+ * v1.0.7: Sink positions are set to 1.0 to ensure they're ALWAYS kept
  */
 __global__ void influence_normalize_by_max_kernel(
     const float* input,
     float* output,
     const float* max_val,
-    int seq_len
+    int seq_len,
+    int sink_size
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < seq_len) {
-        float m = max_val[0];
-        if (m > 1e-10f) {
-            output[idx] = input[idx] / m;
+        // v1.0.7: Sink positions get score 1.0 - ALWAYS KEEP first sink_size tokens
+        if (idx < sink_size) {
+            output[idx] = 1.0f;
         } else {
-            output[idx] = 0.0f;
+            float m = max_val[0];
+            if (m > 1e-10f) {
+                output[idx] = input[idx] / m;
+            } else {
+                output[idx] = 0.0f;
+            }
         }
     }
 }
@@ -414,9 +440,9 @@ void launch_find_max_and_normalize_kernel(
     );
 
     // Step 4: Normalize adjusted values by max
-    // This overwrites the adjusted values in 'normalized' with final normalized values
+    // v1.0.7: Also sets sink positions to 1.0 to ensure they're always kept
     influence_normalize_by_max_kernel<<<grid_blocks, block_size, 0, stream>>>(
-        normalized, normalized, partial_max, seq_len
+        normalized, normalized, partial_max, seq_len, sink_size
     );
 }
 

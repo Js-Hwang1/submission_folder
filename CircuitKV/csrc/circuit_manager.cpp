@@ -1191,7 +1191,8 @@ void CircuitGraph::update_and_step_influence_walker(
     int current_idx,
     int num_walkers,
     int max_steps,
-    int sink_size
+    int sink_size,
+    float temperature
 ) {
     CHECK_CUDA(attention_matrix);
     CHECK_CONTIGUOUS(attention_matrix);
@@ -1213,6 +1214,8 @@ void CircuitGraph::update_and_step_influence_walker(
                 "max_steps must be in (0, 100]");
     TORCH_CHECK(sink_size >= 0 && sink_size < seq_len,
                 "sink_size out of bounds");
+    TORCH_CHECK(temperature >= 0.1f && temperature <= 10.0f,
+                "temperature must be in [0.1, 10.0]");
 
     // Update current sequence length
     current_seq_len_ = seq_len;
@@ -1244,7 +1247,7 @@ void CircuitGraph::update_and_step_influence_walker(
     CUDA_CHECK_LAST();
 
     // STEP 2: Launch influence walker kernel
-    // All walkers start at current_idx and walk backward through attention
+    // v1.0.7: Multi-source walks with temperature-based exploration
     launch_influence_walker_kernel(
         attn_ptr,
         influence_visits_,
@@ -1254,7 +1257,8 @@ void CircuitGraph::update_and_step_influence_walker(
         num_walkers,
         max_steps,
         sink_size,
-        sidecar_stream_
+        sidecar_stream_,
+        temperature  // v1.0.7: Pass exploration temperature
     );
     CUDA_CHECK_LAST();
 

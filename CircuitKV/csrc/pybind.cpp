@@ -263,31 +263,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("num_walkers") = 10000,
         py::arg("max_steps") = 10,
         py::arg("sink_size") = 4,
+        py::arg("temperature") = 2.0f,
         R"pbdoc(
-        Causal Influence Walker: Single-source weighted random walks (v1.0.0).
-
-        VALIDATED BY PoC5:
-            - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
-            - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
-            - Walker approximates Influence Oracle: Spearman r = 0.94
+        Causal Influence Walker v1.0.7: Temperature-Based Exploration.
 
         ALGORITHM:
-            1. Start ALL walkers at current_idx (generation position)
-            2. At each step, walker at `pos` samples next from A[pos, :pos+1]
-            3. Visit weight = cumulative product of attention along path
-            4. Absorb at sink (first sink_size tokens)
+            1. MULTI-SOURCE: 50% walkers start at query, 50% at random positions
+            2. TEMPERATURE SAMPLING: Sample from A[pos,j]^(1/T) for exploration
+            3. Visit count = unweighted for ALL steps
+            4. Normalize by POSITIONAL OPPORTUNITY to counteract early bias
 
-        KEY INSIGHT:
-            Influence = "How much can token j reach the generation position through
-            multi-hop attention?" This correlates with actual generation attention
-            MUCH better than H2O (which just measures degree/popularity).
+        KEY INSIGHT - "Attention Concentration Problem":
+            LLM attention is highly concentrated: ~80-90% to BOS/early, ~10% to
+            recent, ~1-5% to middle. Without temperature scaling, walkers converge
+            to high-attention positions regardless of starting point.
+
+        Temperature Effect:
+            - T=1.0: Raw attention (concentrated, poor exploration)
+            - T=2.0: Moderate exploration (default, recommended)
+            - T=3.0+: High exploration (may lose attention signal)
 
         Args:
             attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
-            current_idx: Generation position (source for all walkers).
-            num_walkers: Number of walkers (default 10000, validated by PoC5).
-            max_steps: Max steps per walker (default 10, matches oracle computation).
+            current_idx: Generation position (source for query-start walkers).
+            num_walkers: Number of walkers (default 10000).
+            max_steps: Max steps per walker (default 10).
             sink_size: Absorbing boundary (default 4).
+            temperature: Exploration temperature (default 2.0, higher = more uniform).
         )pbdoc"
     )
     .def("get_influence_scores", &CircuitGraph::get_influence_scores,
@@ -310,7 +312,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "1.0.6";  // Fix: multi-source walks for coverage
+    m.attr("__version__") = "1.0.7";  // Fix: temperature-based exploration
 }
 
 }  // namespace circuit_kv

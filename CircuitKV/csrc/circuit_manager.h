@@ -275,13 +275,15 @@ public:
      * @param num_walkers       Number of walkers (default 10000, validated by PoC5)
      * @param max_steps         Max steps per walker (default 10, matches oracle)
      * @param sink_size         Absorbing boundary (default 4)
+     * @param temperature       Exploration temperature (default 2.0, higher = more uniform)
      */
     void update_and_step_influence_walker(
         torch::Tensor attention_matrix,
         int current_idx,
         int num_walkers = 10000,
         int max_steps = 10,
-        int sink_size = 4
+        int sink_size = 4,
+        float temperature = 2.0f
     );
 
     /**
