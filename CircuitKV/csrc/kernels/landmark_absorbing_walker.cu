@@ -180,7 +180,7 @@ __global__ void landmark_absorbing_walker_kernel(
                 if (smem_landmarks[lm] == current_pos && lm != source_landmark_idx) {
                     // SOFT ABSORPTION: 50% chance to absorb, 50% chance to continue
                     // This allows transitive flow: A→B→C→...→Sink
-                    float r = pcg32_random_float(&rng);
+                    float r = pcg_uniform(&rng);
                     if (r < 0.5f) {
                         absorbed = true;
                     }
