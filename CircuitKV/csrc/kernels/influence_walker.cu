@@ -42,7 +42,7 @@ constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
  *
  * @param attention      Full attention matrix [seq_len, seq_len], row-major
  * @param visits         Output: weighted visit counts [seq_len]
- * @param rng_states     RNG states [num_walkers * 2]
+ * @param rng_states     RNG states [num_walkers] as PCGState structs
  * @param seq_len        Sequence length
  * @param current_idx    Generation position (walker start)
  * @param num_walkers    Number of walkers
@@ -52,7 +52,7 @@ constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
 __global__ void influence_walker_kernel(
     const float* __restrict__ attention,
     float* __restrict__ visits,
-    uint64_t* __restrict__ rng_states,
+    PCGState* __restrict__ rng_states,
     int seq_len,
     int current_idx,
     int num_walkers,
@@ -62,9 +62,8 @@ __global__ void influence_walker_kernel(
     int walker_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (walker_id >= num_walkers) return;
 
-    // Initialize RNG for this walker
-    uint64_t state = rng_states[walker_id * 2];
-    uint64_t inc = rng_states[walker_id * 2 + 1];
+    // Load RNG state for this walker
+    PCGState rng = rng_states[walker_id];
 
     // Start at generation position
     int pos = current_idx;
@@ -78,7 +77,7 @@ __global__ void influence_walker_kernel(
         if (num_candidates <= 0) break;
 
         // Sample next position from attention[pos, 0:pos+1]
-        float r = pcg_uniform(&state, &inc);
+        float r = pcg_uniform(&rng);
 
         // Cumulative sum search for sampling
         float cumsum = 0.0f;
@@ -114,24 +113,22 @@ __global__ void influence_walker_kernel(
     }
 
     // Save RNG state for next call
-    rng_states[walker_id * 2] = state;
-    rng_states[walker_id * 2 + 1] = inc;
+    rng_states[walker_id] = rng;
 }
 
 /**
  * Initialize RNG states for influence walkers
  */
 __global__ void init_influence_rng_kernel(
-    uint64_t* rng_states,
+    PCGState* rng_states,
     int num_walkers,
     uint64_t seed
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_walkers) return;
 
-    // Each walker gets unique state based on index and seed
-    rng_states[idx * 2] = seed + idx * 12345ULL;
-    rng_states[idx * 2 + 1] = (idx * 2 + 1) | 1ULL;  // Inc must be odd
+    // Initialize PCG state for this walker
+    pcg_init(&rng_states[idx], seed + idx, idx);
 }
 
 /**
@@ -205,7 +202,7 @@ __global__ void find_max_kernel(
 void launch_influence_walker_kernel(
     const float* attention,
     float* visits,
-    uint64_t* rng_states,
+    uint64_t* rng_states,  // Actually PCGState*, but kept as uint64_t* for API compatibility
     int seq_len,
     int current_idx,
     int num_walkers,
@@ -216,8 +213,11 @@ void launch_influence_walker_kernel(
     const int block_size = 256;
     const int num_blocks = (num_walkers + block_size - 1) / block_size;
 
+    // Cast to PCGState* (each PCGState is 2 uint64_t = 16 bytes)
+    PCGState* pcg_states = reinterpret_cast<PCGState*>(rng_states);
+
     influence_walker_kernel<<<num_blocks, block_size, 0, stream>>>(
-        attention, visits, rng_states, seq_len, current_idx,
+        attention, visits, pcg_states, seq_len, current_idx,
         num_walkers, max_steps, sink_size
     );
 }
