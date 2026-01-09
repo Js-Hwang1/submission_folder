@@ -1692,9 +1692,11 @@ class CircuitKVCluster():
         mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
         attn_weights[:, :, :, -self.window_size:] += mask[None, None, :, :]
 
-        # Softmax and average across batch and heads
+        # Softmax and MAX-POOL across heads (preserves induction head signal)
+        # v1.0.9: Max-pooling keeps sharp attention patterns from specialized heads
+        # that get washed out by averaging (e.g., induction heads for few-shot)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
-        attn_avg = attn_weights.mean(dim=(0, 1))  # [window_size, seq_len]
+        attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
 
         # Build full attention matrix approximation
         # For positions outside the window, use uniform causal attention
