@@ -310,7 +310,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "1.0.3";  // Fix: exclude sink from sampling entirely
+    m.attr("__version__") = "1.0.4";  // Fix: skip first step (direct attention = H2O)
 }
 
 }  // namespace circuit_kv

@@ -66,7 +66,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="1.0.3",  # Fix: exclude sink from sampling entirely
+    version="1.0.4",  # Fix: skip first step (direct attention = H2O)
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",

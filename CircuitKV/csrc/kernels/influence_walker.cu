@@ -1,5 +1,5 @@
 /**
- * Causal Influence Propagation Walker (v1.0.3)
+ * Causal Influence Propagation Walker (v1.0.4)
  *
  * VALIDATED BY PoC5:
  *   - Influence vs Gen Attn: Spearman r = 0.4085 (H2O: -0.02)
@@ -9,28 +9,27 @@
  * ALGORITHM:
  *   1. Start all walkers at generation position (current_idx)
  *   2. At each step, sample next from A[pos, sink_size:pos+1] (EXCLUDE SINK)
- *   3. Visit count = unweighted for all sampled positions
+ *   3. Visit count = unweighted, but SKIP STEP 0 (direct attention = H2O)
  *   4. Walkers explore only among eviction candidates (positions >= sink_size)
  *
  * KEY INSIGHT:
  *   This measures "How much can each token INFLUENCE the generation position
- *   through multi-hop attention paths?" - which correlates with actual
- *   generation attention better than H2O (degree-based).
+ *   through MULTI-HOP attention paths?" - the key differentiator from H2O.
  *
- * v1.0.3 FIX - "Exclude Sink from Sampling":
- *   Problem: BOS tokens dominate attention (~99%). Even with "flow through",
- *   walkers spend most time bouncing at BOS (visits not counted) → few useful visits.
+ * v1.0.4 FIX - "Skip First Step":
+ *   Problem: Step 0 visits mirror direct attention (same as H2O). Position 4
+ *   gets 10,000 visits (100% of walkers) because it has highest direct attention.
  *
- *   Solution: Exclude sink from sampling entirely. Walkers only move among
- *   eviction candidates. The attention to sink is "lost" - if a token's influence
- *   goes mainly to BOS, it has low influence on other candidates.
+ *   Solution: Only count visits from step >= 1. Step 0 is the "jump" from query
+ *   to first hop - that's just direct attention. The MULTI-HOP influence starts
+ *   at step 1+.
  *
- *   This is principled: we're computing influence among EVICTION CANDIDATES.
- *   Sink tokens are always kept, so their influence doesn't matter for eviction.
+ *   This is principled: we want to capture what H2O MISSES (multi-hop paths),
+ *   not duplicate what H2O already captures (direct attention).
  *
  * DIRECTION:
  *   Walk ALONG A (not A^T). A[i,j] = how much position i attends to j.
- *   Walker moves: query → non-sink keys it attends to → ...
+ *   Walker moves: query → hop1 (not counted) → hop2+ (counted) → ...
  */
 
 #include <cuda_runtime.h>
@@ -46,18 +45,17 @@ constexpr int INFLUENCE_DEFAULT_MAX_STEPS = 10;
 constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
 
 /**
- * Influence Walker Kernel (v1.0.3 - Exclude Sink from Sampling)
+ * Influence Walker Kernel (v1.0.4 - Skip First Step)
  *
  * Each thread runs one walker. Walkers start at current_idx (generation position)
  * and walk through attention for max_steps, ONLY among non-sink positions.
  *
- * v1.0.3: Sink positions are completely excluded from sampling. When sampling
- * the next position, we only consider positions >= sink_size and renormalize
- * the attention over this subset. This ensures walkers explore the eviction
- * candidate space rather than getting trapped at BOS tokens.
+ * v1.0.4: Only count visits from step >= 1. Step 0 (query → first hop) is just
+ * direct attention, which H2O already captures. The value of influence walker
+ * is in MULTI-HOP paths (steps 1+).
  *
  * @param attention      Full attention matrix [seq_len, seq_len], row-major
- * @param visits         Output: visit counts [seq_len]
+ * @param visits         Output: visit counts [seq_len] (only from step 1+)
  * @param rng_states     RNG states [num_walkers] as PCGState structs
  * @param seq_len        Sequence length
  * @param current_idx    Generation position (walker start)
@@ -121,8 +119,12 @@ __global__ void influence_walker_kernel(
             next_pos = j;  // Handle numerical precision at end
         }
 
-        // v1.0.3: Count ALL visits (we're only visiting non-sink positions now)
-        atomicAdd(&visits[next_pos], 1.0f);
+        // v1.0.4: Only count visits from step >= 1 (skip first step)
+        // Step 0 is query → first hop (direct attention, same as H2O)
+        // Steps 1+ are multi-hop influence (what we want to capture)
+        if (step > 0) {
+            atomicAdd(&visits[next_pos], 1.0f);
+        }
 
         // Move to next position
         pos = next_pos;
