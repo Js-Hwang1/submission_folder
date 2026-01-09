@@ -172,14 +172,19 @@ __global__ void landmark_absorbing_walker_kernel(
             break;
         }
 
-        // 2. Landmark absorption (if enabled)
+        // 2. Landmark absorption (if enabled) - SOFT ABSORPTION (50% probability)
         if (absorb_at_landmarks && num_landmarks > 0) {
             bool absorbed = false;
             for (int lm = 0; lm < num_landmarks && lm < LAW_MAX_LANDMARKS; ++lm) {
-                // Absorb if we hit a DIFFERENT landmark than our source
+                // Check if we hit a DIFFERENT landmark than our source
                 if (smem_landmarks[lm] == current_pos && lm != source_landmark_idx) {
-                    absorbed = true;
-                    break;
+                    // SOFT ABSORPTION: 50% chance to absorb, 50% chance to continue
+                    // This allows transitive flow: A→B→C→...→Sink
+                    float r = pcg32_random_float(&rng);
+                    if (r < 0.5f) {
+                        absorbed = true;
+                    }
+                    break;  // Only check once per landmark hit
                 }
             }
             if (absorbed) {
@@ -266,21 +271,18 @@ __global__ void landmark_absorbing_walker_kernel(
 }
 
 // =============================================================================
-// Normalization Kernel: Segment-Aware (FIXED for Landmark Absorption)
+// Normalization Kernel: Segment-Aware with Soft Absorption (OPTIMIZED)
 // =============================================================================
 
 /**
- * Normalize visit counts by SEGMENT-AWARE reachable walker count.
+ * Normalize visit counts for SOFT ABSORPTION (50% pass-through).
  *
- * KEY INSIGHT: With landmark absorption, position p can only be reached by:
- *   1. The NEXT landmark after p (walkers from further landmarks absorb earlier)
- *   2. Query walkers (with probability of reaching based on distance)
+ * With 50% soft absorption at each landmark:
+ *   - Walker has 50% chance to pass through each landmark
+ *   - Expected reach probability decays as 0.5^(landmarks_between)
+ *   - This creates transitive flow while maintaining local emphasis
  *
- * For position p between landmarks L_i and L_{i+1}:
- *   - Only L_{i+1} walkers can reach p (L_{i+2}, L_{i+3}, ... absorb at L_{i+1})
- *   - Query contribution is reduced by number of landmarks between query and p
- *
- * This fixes the over-estimation bug where we counted ALL landmarks > p.
+ * OPTIMIZED: Single loop, fast bit-shift for power of 2 decay.
  */
 __global__ void landmark_reachability_normalize_kernel(
     const int32_t* __restrict__ visit_counts,
@@ -301,55 +303,52 @@ __global__ void landmark_reachability_normalize_kernel(
         return;
     }
 
-    // Find the NEXT landmark after this position (first landmark > idx)
-    int next_landmark_pos = seq_len;  // Default: query position
-    int next_landmark_idx = -1;
+    // Single pass: count landmarks after this position and find expected reachable
+    // With 50% soft absorption, each landmark contributes: walkers * 0.5^(distance_in_landmarks)
+    float total_reachable = 0.0f;
+    int landmarks_after = 0;
+
+    // Count landmarks after this position (sorted order not required)
     for (int lm = 0; lm < num_landmarks; ++lm) {
-        if (landmark_positions[lm] > idx && landmark_positions[lm] < next_landmark_pos) {
-            next_landmark_pos = landmark_positions[lm];
-            next_landmark_idx = lm;
+        if (landmark_positions[lm] > idx) {
+            landmarks_after++;
         }
     }
 
-    // Count reachable walkers (SEGMENT-AWARE)
-    float total_reachable = 0.0f;
-
-    // From the NEXT landmark only (others absorb before reaching us)
-    if (next_landmark_idx >= 0) {
-        total_reachable += (float)walkers_per_source;
+    // With soft absorption, expected contribution from all landmarks after position:
+    // Sum of geometric series: walkers * (0.5 + 0.25 + 0.125 + ...) ≈ walkers * 1.0
+    // But capped by actual number of landmarks
+    // Simplified: each landmark contributes walkers * 0.5 (on average)
+    if (landmarks_after > 0) {
+        // Expected walkers = walkers_per_source * landmarks_after * avg_reach_prob
+        // With 50% absorption, avg_reach_prob ≈ 0.5 for uniform distribution
+        total_reachable += (float)walkers_per_source * (float)landmarks_after * 0.5f;
     }
 
-    // From query: Query can reach if it's the next source OR if it passes through
-    // Query position is always seq_len - 1
+    // Query contribution (with decay through landmarks)
     int query_pos = seq_len - 1;
     if (query_pos > idx) {
-        if (next_landmark_idx < 0 || query_pos < next_landmark_pos) {
-            // Query is closer than any landmark - full contribution
-            total_reachable += (float)walkers_per_source * query_boost;
+        // Query passes through landmarks_after landmarks to reach idx
+        // Expected reach probability = 0.5^landmarks_after (but min 0.1)
+        float query_reach_prob;
+        if (landmarks_after == 0) {
+            query_reach_prob = 1.0f;
+        } else if (landmarks_after < 4) {
+            // Fast path: use lookup table for common cases
+            const float decay_table[4] = {1.0f, 0.5f, 0.25f, 0.125f};
+            query_reach_prob = decay_table[landmarks_after];
         } else {
-            // Query is farther than next landmark
-            // Query walkers have probability of reaching based on random walk
-            // Use a decay factor based on number of landmarks between query and position
-            int landmarks_between = 0;
-            for (int lm = 0; lm < num_landmarks; ++lm) {
-                if (landmark_positions[lm] > idx && landmark_positions[lm] < query_pos) {
-                    landmarks_between++;
-                }
-            }
-            // Each landmark has ~50% chance of absorbing, so decay by 0.5^n
-            // But clamp to reasonable minimum
-            float query_reach_prob = fmaxf(0.1f, powf(0.5f, (float)landmarks_between));
-            total_reachable += (float)walkers_per_source * query_boost * query_reach_prob;
+            // For many landmarks, use minimum floor
+            query_reach_prob = 0.1f;
         }
+        total_reachable += (float)walkers_per_source * query_boost * query_reach_prob;
     }
 
-    // Normalize with minimum floor to avoid division issues
+    // Normalize
     if (total_reachable > 1e-8f) {
         normalized_scores[idx] = (float)visit_counts[idx] / total_reachable;
     } else {
-        // Fallback: use raw visit count scaled by total walkers
-        float total_walkers = (float)(num_landmarks + 1) * walkers_per_source;
-        normalized_scores[idx] = (float)visit_counts[idx] / total_walkers;
+        normalized_scores[idx] = (float)visit_counts[idx] / ((float)(num_landmarks + 1) * walkers_per_source);
     }
 }
 

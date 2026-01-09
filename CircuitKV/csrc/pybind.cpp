@@ -262,7 +262,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "0.5.1";  // Bumped for debug methods
+    m.attr("__version__") = "0.5.2";  // Soft absorption (50%) + optimized normalization
 }
 
 }  // namespace circuit_kv
