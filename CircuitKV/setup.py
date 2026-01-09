@@ -66,7 +66,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="1.0.1",  # Fix: unweighted visits to avoid exponential decay bias
+    version="1.0.2",  # Fix: sink black hole problem (flow through, don't absorb)
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",

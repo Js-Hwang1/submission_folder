@@ -1,5 +1,5 @@
 /**
- * Causal Influence Propagation Walker (v1.0.1)
+ * Causal Influence Propagation Walker (v1.0.2)
  *
  * VALIDATED BY PoC5:
  *   - Influence vs Gen Attn: Spearman r = 0.4085 (H2O: -0.02)
@@ -9,17 +9,25 @@
  * ALGORITHM:
  *   1. Start all walkers at generation position (current_idx)
  *   2. At each step, walker at position `pos` samples next position from A[pos, :]
- *   3. Visit count = unweighted (each visit adds 1.0) - avoids exponential decay bias
- *   4. Absorb when reaching sink region (first SINK_SIZE tokens)
+ *   3. Visit count = unweighted, only for non-sink positions (sink always kept)
+ *   4. NO ABSORPTION: Walkers explore for full max_steps (v1.0.2 fix)
  *
  * KEY INSIGHT:
  *   This measures "How much can each token INFLUENCE the generation position
  *   through multi-hop attention paths?" - which correlates with actual
  *   generation attention better than H2O (degree-based).
  *
+ * v1.0.2 FIX - "Flow Through, Don't Absorb":
+ *   The sink black hole problem: BOS tokens dominate attention (~99%), causing
+ *   walkers to jump Query→BOS→Absorb in 1-2 steps, never exploring the sequence.
+ *
+ *   Solution: Remove sink absorption. Walkers "flow through" sink tokens and
+ *   continue exploring. Only count visits to non-sink positions (sink tokens
+ *   are always kept anyway, scoring them just skews the distribution).
+ *
  * DIRECTION:
  *   Walk ALONG A (not A^T). A[i,j] = how much position i attends to j.
- *   Walker moves: query → keys it attends to → keys those attend to → sink
+ *   Walker moves: query → keys it attends to → keys those attend to → ...
  */
 
 #include <cuda_runtime.h>
@@ -35,19 +43,23 @@ constexpr int INFLUENCE_DEFAULT_MAX_STEPS = 10;
 constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
 
 /**
- * Influence Walker Kernel
+ * Influence Walker Kernel (v1.0.2 - Flow Through, Don't Absorb)
  *
  * Each thread runs one walker. Walkers start at current_idx (generation position)
- * and walk backward through attention until absorbed at sink.
+ * and walk through attention for max_steps, counting visits to non-sink positions.
+ *
+ * v1.0.2: Walkers no longer absorb at sink. They "flow through" and continue
+ * exploring, which allows them to discover tokens in the middle of the sequence
+ * (e.g., few-shot examples) that would otherwise be missed.
  *
  * @param attention      Full attention matrix [seq_len, seq_len], row-major
- * @param visits         Output: weighted visit counts [seq_len]
+ * @param visits         Output: visit counts [seq_len] (only non-sink counted)
  * @param rng_states     RNG states [num_walkers] as PCGState structs
  * @param seq_len        Sequence length
  * @param current_idx    Generation position (walker start)
  * @param num_walkers    Number of walkers
  * @param max_steps      Maximum steps per walker
- * @param sink_size      Absorbing boundary (first sink_size tokens)
+ * @param sink_size      Sink region size (visits to positions < sink_size not counted)
  */
 __global__ void influence_walker_kernel(
     const float* __restrict__ attention,
@@ -92,18 +104,22 @@ __global__ void influence_walker_kernel(
             next_pos = j;  // Handle numerical precision at end
         }
 
-        // Record unweighted visit (v1.0.1 fix: avoid exponential decay bias)
-        // Each visit counts equally - this ensures distant tokens (like few-shot
-        // examples) aren't starved by path_weight decay
-        atomicAdd(&visits[next_pos], 1.0f);
+        // v1.0.2: Only count visits to NON-SINK positions
+        // Sink tokens (positions 0 to sink_size-1) are always kept, so scoring
+        // them just skews the distribution. By excluding them, the max normalization
+        // reflects the importance of eviction-candidate tokens.
+        if (next_pos >= sink_size) {
+            atomicAdd(&visits[next_pos], 1.0f);
+        }
 
         // Move to next position
         pos = next_pos;
 
-        // Absorb at sink (first sink_size tokens)
-        if (pos < sink_size) {
-            break;
-        }
+        // v1.0.2: NO ABSORPTION - "Flow Through, Don't Absorb"
+        // Walkers continue exploring even after visiting sink.
+        // This allows multi-hop paths to reach tokens in the middle of the
+        // sequence (e.g., few-shot examples) that would otherwise be missed
+        // because BOS tokens dominate direct attention.
     }
 
     // Save RNG state for next call
