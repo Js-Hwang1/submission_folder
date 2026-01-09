@@ -66,7 +66,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="1.0.2",  # Fix: sink black hole problem (flow through, don't absorb)
+    version="1.0.3",  # Fix: exclude sink from sampling entirely
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",

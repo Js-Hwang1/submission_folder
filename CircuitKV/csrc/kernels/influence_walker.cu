@@ -1,5 +1,5 @@
 /**
- * Causal Influence Propagation Walker (v1.0.2)
+ * Causal Influence Propagation Walker (v1.0.3)
  *
  * VALIDATED BY PoC5:
  *   - Influence vs Gen Attn: Spearman r = 0.4085 (H2O: -0.02)
@@ -8,26 +8,29 @@
  *
  * ALGORITHM:
  *   1. Start all walkers at generation position (current_idx)
- *   2. At each step, walker at position `pos` samples next position from A[pos, :]
- *   3. Visit count = unweighted, only for non-sink positions (sink always kept)
- *   4. NO ABSORPTION: Walkers explore for full max_steps (v1.0.2 fix)
+ *   2. At each step, sample next from A[pos, sink_size:pos+1] (EXCLUDE SINK)
+ *   3. Visit count = unweighted for all sampled positions
+ *   4. Walkers explore only among eviction candidates (positions >= sink_size)
  *
  * KEY INSIGHT:
  *   This measures "How much can each token INFLUENCE the generation position
  *   through multi-hop attention paths?" - which correlates with actual
  *   generation attention better than H2O (degree-based).
  *
- * v1.0.2 FIX - "Flow Through, Don't Absorb":
- *   The sink black hole problem: BOS tokens dominate attention (~99%), causing
- *   walkers to jump Query→BOS→Absorb in 1-2 steps, never exploring the sequence.
+ * v1.0.3 FIX - "Exclude Sink from Sampling":
+ *   Problem: BOS tokens dominate attention (~99%). Even with "flow through",
+ *   walkers spend most time bouncing at BOS (visits not counted) → few useful visits.
  *
- *   Solution: Remove sink absorption. Walkers "flow through" sink tokens and
- *   continue exploring. Only count visits to non-sink positions (sink tokens
- *   are always kept anyway, scoring them just skews the distribution).
+ *   Solution: Exclude sink from sampling entirely. Walkers only move among
+ *   eviction candidates. The attention to sink is "lost" - if a token's influence
+ *   goes mainly to BOS, it has low influence on other candidates.
+ *
+ *   This is principled: we're computing influence among EVICTION CANDIDATES.
+ *   Sink tokens are always kept, so their influence doesn't matter for eviction.
  *
  * DIRECTION:
  *   Walk ALONG A (not A^T). A[i,j] = how much position i attends to j.
- *   Walker moves: query → keys it attends to → keys those attend to → ...
+ *   Walker moves: query → non-sink keys it attends to → ...
  */
 
 #include <cuda_runtime.h>
@@ -43,23 +46,24 @@ constexpr int INFLUENCE_DEFAULT_MAX_STEPS = 10;
 constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
 
 /**
- * Influence Walker Kernel (v1.0.2 - Flow Through, Don't Absorb)
+ * Influence Walker Kernel (v1.0.3 - Exclude Sink from Sampling)
  *
  * Each thread runs one walker. Walkers start at current_idx (generation position)
- * and walk through attention for max_steps, counting visits to non-sink positions.
+ * and walk through attention for max_steps, ONLY among non-sink positions.
  *
- * v1.0.2: Walkers no longer absorb at sink. They "flow through" and continue
- * exploring, which allows them to discover tokens in the middle of the sequence
- * (e.g., few-shot examples) that would otherwise be missed.
+ * v1.0.3: Sink positions are completely excluded from sampling. When sampling
+ * the next position, we only consider positions >= sink_size and renormalize
+ * the attention over this subset. This ensures walkers explore the eviction
+ * candidate space rather than getting trapped at BOS tokens.
  *
  * @param attention      Full attention matrix [seq_len, seq_len], row-major
- * @param visits         Output: visit counts [seq_len] (only non-sink counted)
+ * @param visits         Output: visit counts [seq_len]
  * @param rng_states     RNG states [num_walkers] as PCGState structs
  * @param seq_len        Sequence length
  * @param current_idx    Generation position (walker start)
  * @param num_walkers    Number of walkers
  * @param max_steps      Maximum steps per walker
- * @param sink_size      Sink region size (visits to positions < sink_size not counted)
+ * @param sink_size      Sink region size (positions 0 to sink_size-1 excluded from sampling)
  */
 __global__ void influence_walker_kernel(
     const float* __restrict__ attention,
@@ -80,22 +84,35 @@ __global__ void influence_walker_kernel(
     // Start at generation position
     int pos = current_idx;
 
-    // Walk until absorption or max steps
+    // Walk for max_steps, sampling only among non-sink positions
     for (int step = 0; step < max_steps; step++) {
-        // Causal: can only attend to positions 0..pos (inclusive)
-        int num_candidates = pos + 1;
+        // Causal: can attend to positions 0..pos (inclusive)
+        // But we EXCLUDE sink positions (0 to sink_size-1)
+        // So valid candidates are: sink_size to pos (inclusive)
 
-        if (num_candidates <= 0) break;
+        // If current position is at or below sink, no valid candidates - terminate
+        if (pos < sink_size) break;
 
-        // Sample next position from attention[pos, 0:pos+1]
-        float r = pcg_uniform(&rng);
-
-        // Cumulative sum search for sampling
-        float cumsum = 0.0f;
-        int next_pos = 0;
         const float* attn_row = attention + pos * seq_len;
 
-        for (int j = 0; j < num_candidates; j++) {
+        // v1.0.3: Sum attention only over NON-SINK positions for renormalization
+        float non_sink_sum = 0.0f;
+        for (int j = sink_size; j <= pos; j++) {
+            non_sink_sum += attn_row[j];
+        }
+
+        // If all attention goes to sink (non_sink_sum ≈ 0), terminate walk
+        // This walker's influence path ends at this point
+        if (non_sink_sum < 1e-10f) break;
+
+        // Sample from renormalized distribution over non-sink positions
+        float r = pcg_uniform(&rng) * non_sink_sum;
+
+        // Cumulative sum search for sampling (only over non-sink positions)
+        float cumsum = 0.0f;
+        int next_pos = sink_size;  // Default to first non-sink position
+
+        for (int j = sink_size; j <= pos; j++) {
             cumsum += attn_row[j];
             if (r < cumsum) {
                 next_pos = j;
@@ -104,22 +121,11 @@ __global__ void influence_walker_kernel(
             next_pos = j;  // Handle numerical precision at end
         }
 
-        // v1.0.2: Only count visits to NON-SINK positions
-        // Sink tokens (positions 0 to sink_size-1) are always kept, so scoring
-        // them just skews the distribution. By excluding them, the max normalization
-        // reflects the importance of eviction-candidate tokens.
-        if (next_pos >= sink_size) {
-            atomicAdd(&visits[next_pos], 1.0f);
-        }
+        // v1.0.3: Count ALL visits (we're only visiting non-sink positions now)
+        atomicAdd(&visits[next_pos], 1.0f);
 
         // Move to next position
         pos = next_pos;
-
-        // v1.0.2: NO ABSORPTION - "Flow Through, Don't Absorb"
-        // Walkers continue exploring even after visiting sink.
-        // This allows multi-hop paths to reach tokens in the middle of the
-        // sequence (e.g., few-shot examples) that would otherwise be missed
-        // because BOS tokens dominate direct attention.
     }
 
     // Save RNG state for next call

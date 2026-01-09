@@ -310,7 +310,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "1.0.2";  // Fix: sink black hole (flow through, don't absorb)
+    m.attr("__version__") = "1.0.3";  // Fix: exclude sink from sampling entirely
 }
 
 }  // namespace circuit_kv
