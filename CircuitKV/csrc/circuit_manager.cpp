@@ -1263,14 +1263,15 @@ void CircuitGraph::update_and_step_influence_walker(
     int num_reduce_blocks = (seq_len + 255) / 256;
     if (num_reduce_blocks > 256) num_reduce_blocks = 256;
 
-    // Use the max reduction and normalization
+    // Use the max reduction and normalization (v1.0.5: with positional adjustment)
     launch_find_max_and_normalize_kernel(
         influence_visits_,
         influence_normalized_,
         influence_partial_max_,
         seq_len,
         num_reduce_blocks,
-        sidecar_stream_
+        sidecar_stream_,
+        sink_size  // v1.0.5: Pass sink_size for positional normalization
     );
     CUDA_CHECK_LAST();
 }

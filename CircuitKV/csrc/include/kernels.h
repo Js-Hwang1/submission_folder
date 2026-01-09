@@ -622,7 +622,8 @@ void launch_clear_influence_visits_kernel(
  *
  * Two-pass operation:
  *   1. Find max value across all visits
- *   2. Divide all values by max
+ *   2. Apply positional opportunity normalization (v1.0.5)
+ *   3. Divide all values by max
  *
  * @param visits          Input visit counts [seq_len]
  * @param normalized      Output normalized scores [seq_len]
@@ -630,6 +631,7 @@ void launch_clear_influence_visits_kernel(
  * @param seq_len         Sequence length
  * @param num_blocks      Number of reduction blocks
  * @param stream          CUDA stream
+ * @param sink_size       Size of sink region for positional adjustment (v1.0.5)
  */
 void launch_find_max_and_normalize_kernel(
     float* visits,
@@ -637,7 +639,8 @@ void launch_find_max_and_normalize_kernel(
     float* partial_max,
     int seq_len,
     int num_blocks,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int sink_size = 4  // v1.0.5: Default to 4 for backwards compatibility
 );
 
 }  // namespace circuit_kv

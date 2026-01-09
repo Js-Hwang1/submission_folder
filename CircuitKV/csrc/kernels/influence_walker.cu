@@ -1,5 +1,5 @@
 /**
- * Causal Influence Propagation Walker (v1.0.4)
+ * Causal Influence Propagation Walker (v1.0.5)
  *
  * VALIDATED BY PoC5:
  *   - Influence vs Gen Attn: Spearman r = 0.4085 (H2O: -0.02)
@@ -10,22 +10,24 @@
  *   1. Start all walkers at generation position (current_idx)
  *   2. At each step, sample next from A[pos, sink_size:pos+1] (EXCLUDE SINK)
  *   3. Visit count = unweighted, but SKIP STEP 0 (direct attention = H2O)
- *   4. Walkers explore only among eviction candidates (positions >= sink_size)
+ *   4. Normalize by POSITIONAL OPPORTUNITY to counteract early-position bias
  *
  * KEY INSIGHT:
  *   This measures "How much can each token INFLUENCE the generation position
  *   through MULTI-HOP attention paths?" - the key differentiator from H2O.
  *
- * v1.0.4 FIX - "Skip First Step":
- *   Problem: Step 0 visits mirror direct attention (same as H2O). Position 4
- *   gets 10,000 visits (100% of walkers) because it has highest direct attention.
+ * v1.0.5 FIX - "Positional Opportunity Normalization":
+ *   Problem: Early positions have inherent advantage - they can be visited from
+ *   MORE later positions. Position 4 can be reached from 4962 positions, while
+ *   position 4000 can only be reached from 966 positions.
  *
- *   Solution: Only count visits from step >= 1. Step 0 is the "jump" from query
- *   to first hop - that's just direct attention. The MULTI-HOP influence starts
- *   at step 1+.
+ *   This causes TREC to fail: few-shot examples (middle positions) get evicted
+ *   because they have fewer visit OPPORTUNITIES, not because they're unimportant.
  *
- *   This is principled: we want to capture what H2O MISSES (multi-hop paths),
- *   not duplicate what H2O already captures (direct attention).
+ *   Solution: Normalize visits by positional opportunity:
+ *     adjusted_score[p] = visits[p] / sqrt(seq_len - p)
+ *
+ *   Using sqrt() for gentler correction (full linear would over-correct).
  *
  * DIRECTION:
  *   Walk ALONG A (not A^T). A[i,j] = how much position i attends to j.
@@ -45,14 +47,13 @@ constexpr int INFLUENCE_DEFAULT_MAX_STEPS = 10;
 constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
 
 /**
- * Influence Walker Kernel (v1.0.4 - Skip First Step)
+ * Influence Walker Kernel (v1.0.5 - Positional Opportunity Normalization)
  *
  * Each thread runs one walker. Walkers start at current_idx (generation position)
  * and walk through attention for max_steps, ONLY among non-sink positions.
  *
- * v1.0.4: Only count visits from step >= 1. Step 0 (query → first hop) is just
- * direct attention, which H2O already captures. The value of influence walker
- * is in MULTI-HOP paths (steps 1+).
+ * v1.0.5: Visits are later normalized by positional opportunity to counteract
+ * the inherent advantage of early positions in random walks.
  *
  * @param attention      Full attention matrix [seq_len, seq_len], row-major
  * @param visits         Output: visit counts [seq_len] (only from step 1+)
@@ -285,6 +286,71 @@ __global__ void influence_final_max_kernel(
 }
 
 /**
+ * v1.0.5: Apply positional opportunity adjustment to visits
+ *
+ * adjusted[p] = visits[p] / sqrt(seq_len - p + 1)
+ *
+ * This counteracts the early-position bias in random walks.
+ * Early positions have more "opportunities" to be visited, which
+ * inflates their visit counts regardless of actual importance.
+ */
+__global__ void influence_positional_adjust_kernel(
+    const float* visits,
+    float* adjusted,
+    int seq_len,
+    int sink_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < seq_len) {
+        // For sink positions, keep score at 0 (they're always kept anyway)
+        if (idx < sink_size) {
+            adjusted[idx] = 0.0f;
+        } else {
+            // Opportunity = (seq_len - idx) roughly
+            // Use sqrt for gentler correction
+            float opportunity = sqrtf((float)(seq_len - idx + 1));
+            adjusted[idx] = visits[idx] / opportunity;
+        }
+    }
+}
+
+/**
+ * Find max of positionally-adjusted visits
+ */
+__global__ void influence_find_adjusted_max_kernel(
+    const float* adjusted,
+    float* partial_max,
+    int seq_len,
+    int sink_size
+) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load and find local max (skip sink positions)
+    float val = 0.0f;
+    if (idx < seq_len && idx >= sink_size) {
+        val = adjusted[idx];
+    }
+    sdata[tid] = val;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Write block result
+    if (tid == 0) {
+        partial_max[blockIdx.x] = sdata[0];
+    }
+}
+
+/**
  * Normalize by max value kernel
  * Named with influence_ prefix to avoid collision with spectral_power.cu
  */
@@ -311,25 +377,33 @@ void launch_find_max_and_normalize_kernel(
     float* partial_max,
     int seq_len,
     int num_blocks,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int sink_size  // v1.0.5: Added for positional normalization
 ) {
     const int block_size = 256;
+    int grid_blocks = (seq_len + block_size - 1) / block_size;
 
-    // Step 1: Find partial maxes
-    influence_find_max_kernel<<<num_blocks, block_size, block_size * sizeof(float), stream>>>(
-        visits, partial_max, seq_len
+    // v1.0.5: Step 1 - Apply positional opportunity adjustment
+    // adjusted[p] = visits[p] / sqrt(seq_len - p + 1)
+    // Use 'normalized' as temporary buffer for adjusted values
+    influence_positional_adjust_kernel<<<grid_blocks, block_size, 0, stream>>>(
+        visits, normalized, seq_len, sink_size
     );
 
-    // Step 2: Final max reduction (single block)
-    // Use partial_max[0] to store final max
+    // Step 2: Find partial maxes of adjusted values
+    influence_find_adjusted_max_kernel<<<num_blocks, block_size, block_size * sizeof(float), stream>>>(
+        normalized, partial_max, seq_len, sink_size
+    );
+
+    // Step 3: Final max reduction (single block)
     influence_final_max_kernel<<<1, 256, 256 * sizeof(float), stream>>>(
         partial_max, partial_max, num_blocks
     );
 
-    // Step 3: Normalize
-    int norm_blocks = (seq_len + block_size - 1) / block_size;
-    influence_normalize_by_max_kernel<<<norm_blocks, block_size, 0, stream>>>(
-        visits, normalized, partial_max, seq_len
+    // Step 4: Normalize adjusted values by max
+    // This overwrites the adjusted values in 'normalized' with final normalized values
+    influence_normalize_by_max_kernel<<<grid_blocks, block_size, 0, stream>>>(
+        normalized, normalized, partial_max, seq_len
     );
 }
 
