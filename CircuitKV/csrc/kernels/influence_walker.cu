@@ -166,8 +166,9 @@ __global__ void normalize_influence_scores_kernel(
 
 /**
  * Find max value in visits array (reduction)
+ * Named with influence_ prefix to avoid collision with spectral_power.cu
  */
-__global__ void find_max_kernel(
+__global__ void influence_find_max_kernel(
     const float* visits,
     float* partial_max,
     int seq_len
@@ -238,8 +239,9 @@ void launch_clear_influence_visits_kernel(
 /**
  * Final max reduction kernel (single block)
  * Takes partial maxes and produces final max
+ * Named with influence_ prefix to avoid collision with spectral_power.cu
  */
-__global__ void final_max_kernel(
+__global__ void influence_final_max_kernel(
     const float* partial_max,
     float* max_out,
     int num_partials
@@ -266,8 +268,9 @@ __global__ void final_max_kernel(
 
 /**
  * Normalize by max value kernel
+ * Named with influence_ prefix to avoid collision with spectral_power.cu
  */
-__global__ void normalize_by_max_kernel(
+__global__ void influence_normalize_by_max_kernel(
     const float* input,
     float* output,
     const float* max_val,
@@ -295,19 +298,19 @@ void launch_find_max_and_normalize_kernel(
     const int block_size = 256;
 
     // Step 1: Find partial maxes
-    find_max_kernel<<<num_blocks, block_size, block_size * sizeof(float), stream>>>(
+    influence_find_max_kernel<<<num_blocks, block_size, block_size * sizeof(float), stream>>>(
         visits, partial_max, seq_len
     );
 
     // Step 2: Final max reduction (single block)
     // Use partial_max[0] to store final max
-    final_max_kernel<<<1, 256, 256 * sizeof(float), stream>>>(
+    influence_final_max_kernel<<<1, 256, 256 * sizeof(float), stream>>>(
         partial_max, partial_max, num_blocks
     );
 
     // Step 3: Normalize
     int norm_blocks = (seq_len + block_size - 1) / block_size;
-    normalize_by_max_kernel<<<norm_blocks, block_size, 0, stream>>>(
+    influence_normalize_by_max_kernel<<<norm_blocks, block_size, 0, stream>>>(
         visits, normalized, partial_max, seq_len
     );
 }
