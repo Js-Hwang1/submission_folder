@@ -66,7 +66,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="1.0.0",  # Causal Influence Propagation - VALIDATED BY PoC5
+    version="1.0.1",  # Fix: unweighted visits to avoid exponential decay bias
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",

@@ -1,5 +1,5 @@
 /**
- * Causal Influence Propagation Walker (v1.0.0)
+ * Causal Influence Propagation Walker (v1.0.1)
  *
  * VALIDATED BY PoC5:
  *   - Influence vs Gen Attn: Spearman r = 0.4085 (H2O: -0.02)
@@ -9,7 +9,7 @@
  * ALGORITHM:
  *   1. Start all walkers at generation position (current_idx)
  *   2. At each step, walker at position `pos` samples next position from A[pos, :]
- *   3. Visit weight = cumulative product of attention weights along path
+ *   3. Visit count = unweighted (each visit adds 1.0) - avoids exponential decay bias
  *   4. Absorb when reaching sink region (first SINK_SIZE tokens)
  *
  * KEY INSIGHT:
@@ -67,7 +67,6 @@ __global__ void influence_walker_kernel(
 
     // Start at generation position
     int pos = current_idx;
-    float path_weight = 1.0f;
 
     // Walk until absorption or max steps
     for (int step = 0; step < max_steps; step++) {
@@ -93,15 +92,10 @@ __global__ void influence_walker_kernel(
             next_pos = j;  // Handle numerical precision at end
         }
 
-        // Update path weight by the attention value of this step
-        float step_attn = attn_row[next_pos];
-        path_weight *= step_attn;
-
-        // Record weighted visit
-        // This is the key: visit weight reflects "influence strength" along path
-        if (path_weight > 1e-10f) {  // Skip negligible weights
-            atomicAdd(&visits[next_pos], path_weight);
-        }
+        // Record unweighted visit (v1.0.1 fix: avoid exponential decay bias)
+        // Each visit counts equally - this ensures distant tokens (like few-shot
+        // examples) aren't starved by path_weight decay
+        atomicAdd(&visits[next_pos], 1.0f);
 
         // Move to next position
         pos = next_pos;
