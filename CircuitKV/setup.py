@@ -24,6 +24,7 @@ def get_extensions():
         "csrc/kernels/spectral_power.cu",
         "csrc/kernels/landmark_walker.cu",
         "csrc/kernels/landmark_absorbing_walker.cu",  # v0.5.0: Landmark Absorbing
+        "csrc/kernels/influence_walker.cu",  # v1.0.0: Causal Influence (VALIDATED BY PoC5)
     ]
 
     # Include directories (absolute paths required for compiler)
@@ -65,7 +66,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="0.5.0",
+    version="1.0.0",  # Causal Influence Propagation - VALIDATED BY PoC5
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",

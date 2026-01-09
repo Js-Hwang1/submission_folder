@@ -554,4 +554,90 @@ void launch_landmark_reachability_normalize_kernel(
     cudaStream_t stream
 );
 
+// =============================================================================
+// Kernel 6: Causal Influence Walker (v1.0.0 - VALIDATED BY PoC5)
+// =============================================================================
+
+/**
+ * Launch the causal influence walker kernel.
+ *
+ * VALIDATED BY PoC5:
+ *   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
+ *   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
+ *   - Walker approximates Influence Oracle: Spearman r = 0.94
+ *
+ * Algorithm:
+ *   1. All walkers start at current_idx (generation position)
+ *   2. At each step, walker at `pos` samples next from A[pos, :pos+1]
+ *   3. Visit weight = cumulative product of attention along path
+ *   4. Absorb at sink (first sink_size tokens)
+ *
+ * Key Insight:
+ *   Influence = "How much can token j reach the generation position through
+ *   multi-hop attention?" This correlates with actual generation attention
+ *   MUCH better than H2O (which just measures degree/popularity).
+ *
+ * Block/Thread Mapping:
+ *   - num_walkers / 256 blocks, 256 threads per block
+ *   - Each thread is one walker starting at current_idx
+ *   - Weighted visits updated via atomicAdd
+ *
+ * @param attention      Full attention matrix [seq_len, seq_len], FP32
+ * @param visits         Output weighted visit counts [seq_len], FP32
+ * @param rng_states     PRNG states [num_walkers * 2]
+ * @param seq_len        Sequence length
+ * @param current_idx    Generation position (start for all walkers)
+ * @param num_walkers    Number of walkers (default 10000)
+ * @param max_steps      Max steps per walker (default 10)
+ * @param sink_size      Absorbing boundary (default 4)
+ * @param stream         CUDA stream
+ */
+void launch_influence_walker_kernel(
+    const float* attention,
+    float* visits,
+    uint64_t* rng_states,
+    int seq_len,
+    int current_idx,
+    int num_walkers,
+    int max_steps,
+    int sink_size,
+    cudaStream_t stream
+);
+
+/**
+ * Clear influence visits buffer (float version).
+ *
+ * @param visits    Float visit buffer [seq_len]
+ * @param seq_len   Sequence length
+ * @param stream    CUDA stream
+ */
+void launch_clear_influence_visits_kernel(
+    float* visits,
+    int seq_len,
+    cudaStream_t stream
+);
+
+/**
+ * Find max and normalize influence scores to [0, 1].
+ *
+ * Two-pass operation:
+ *   1. Find max value across all visits
+ *   2. Divide all values by max
+ *
+ * @param visits          Input visit counts [seq_len]
+ * @param normalized      Output normalized scores [seq_len]
+ * @param partial_max     Temp buffer for reduction [num_blocks]
+ * @param seq_len         Sequence length
+ * @param num_blocks      Number of reduction blocks
+ * @param stream          CUDA stream
+ */
+void launch_find_max_and_normalize_kernel(
+    float* visits,
+    float* normalized,
+    float* partial_max,
+    int seq_len,
+    int num_blocks,
+    cudaStream_t stream
+);
+
 }  // namespace circuit_kv

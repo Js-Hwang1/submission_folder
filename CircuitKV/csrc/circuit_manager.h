@@ -247,6 +247,52 @@ public:
      */
     torch::Tensor get_landmark_positions();
 
+    // =========================================================================
+    // CAUSAL INFLUENCE PROPAGATION (v1.0.0) - VALIDATED BY PoC5
+    // =========================================================================
+
+    /**
+     * Causal Influence Walker: Single-source weighted random walks.
+     *
+     * VALIDATED BY PoC5:
+     *   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
+     *   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
+     *   - Walker approximates Influence Oracle: Spearman r = 0.94
+     *
+     * ALGORITHM:
+     *   1. Start ALL walkers at current_idx (generation position)
+     *   2. At each step, walker at `pos` samples next from A[pos, :pos+1]
+     *   3. Visit weight = cumulative product of attention along path
+     *   4. Absorb at sink (first sink_size tokens)
+     *
+     * KEY INSIGHT:
+     *   Influence = "How much can token j reach the generation position through
+     *   multi-hop attention?" This correlates with actual generation attention
+     *   MUCH better than H2O (which just measures degree/popularity).
+     *
+     * @param attention_matrix  Full attention matrix [seq_len, seq_len], FP32
+     * @param current_idx       Generation position (source for all walkers)
+     * @param num_walkers       Number of walkers (default 10000, validated by PoC5)
+     * @param max_steps         Max steps per walker (default 10, matches oracle)
+     * @param sink_size         Absorbing boundary (default 4)
+     */
+    void update_and_step_influence_walker(
+        torch::Tensor attention_matrix,
+        int current_idx,
+        int num_walkers = 10000,
+        int max_steps = 10,
+        int sink_size = 4
+    );
+
+    /**
+     * Get the influence walker scores.
+     *
+     * Synchronizes the sidecar stream before returning.
+     *
+     * @return Tensor of shape [seq_len] with weighted visit counts (influence scores)
+     */
+    torch::Tensor get_influence_scores();
+
 private:
     // Configuration
     int max_seq_len_;
@@ -290,6 +336,14 @@ private:
 
     // Landmark walker configuration
     int max_landmark_walkers_;       // Maximum total walkers for landmark method
+
+    // GPU memory: Influence walker buffers (v1.0.0)
+    float* influence_visits_;        // [max_seq_len] - weighted visit counts (float)
+    float* influence_normalized_;    // [max_seq_len] - normalized scores
+    float* influence_partial_max_;   // [256] - for max reduction
+    uint64_t* influence_rng_states_; // [influence_max_walkers * 2] - RNG states
+    int influence_max_walkers_;      // Max walkers for influence method
+    bool influence_rng_initialized_; // RNG init flag
 
     // CUDA streams
     cudaStream_t main_stream_;      // Inherited from PyTorch

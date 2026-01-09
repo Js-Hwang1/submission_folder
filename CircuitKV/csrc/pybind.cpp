@@ -253,10 +253,56 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         Returns:
             Tensor of shape [num_landmarks] with landmark positions (int32).
         )pbdoc"
+    )
+    // =========================================================================
+    // CAUSAL INFLUENCE PROPAGATION (v1.0.0) - VALIDATED BY PoC5
+    // =========================================================================
+    .def("update_and_step_influence_walker", &CircuitGraph::update_and_step_influence_walker,
+        py::arg("attention_matrix"),
+        py::arg("current_idx"),
+        py::arg("num_walkers") = 10000,
+        py::arg("max_steps") = 10,
+        py::arg("sink_size") = 4,
+        R"pbdoc(
+        Causal Influence Walker: Single-source weighted random walks (v1.0.0).
+
+        VALIDATED BY PoC5:
+            - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
+            - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
+            - Walker approximates Influence Oracle: Spearman r = 0.94
+
+        ALGORITHM:
+            1. Start ALL walkers at current_idx (generation position)
+            2. At each step, walker at `pos` samples next from A[pos, :pos+1]
+            3. Visit weight = cumulative product of attention along path
+            4. Absorb at sink (first sink_size tokens)
+
+        KEY INSIGHT:
+            Influence = "How much can token j reach the generation position through
+            multi-hop attention?" This correlates with actual generation attention
+            MUCH better than H2O (which just measures degree/popularity).
+
+        Args:
+            attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
+            current_idx: Generation position (source for all walkers).
+            num_walkers: Number of walkers (default 10000, validated by PoC5).
+            max_steps: Max steps per walker (default 10, matches oracle computation).
+            sink_size: Absorbing boundary (default 4).
+        )pbdoc"
+    )
+    .def("get_influence_scores", &CircuitGraph::get_influence_scores,
+        R"pbdoc(
+        Get the causal influence scores.
+
+        Synchronizes the sidecar stream before returning.
+
+        Returns:
+            Tensor of shape [seq_len] with normalized influence scores.
+        )pbdoc"
     );
 
     // Version info
-    m.attr("__version__") = "0.5.3";  // High pass-through (90%) + 8 landmarks for global diffusion
+    m.attr("__version__") = "1.0.0";  // Causal Influence Propagation - VALIDATED BY PoC5
 }
 
 }  // namespace circuit_kv

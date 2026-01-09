@@ -57,6 +57,12 @@ CircuitGraph::CircuitGraph(
     , landmark_partial_max_(nullptr)
     , landmark_rng_states_(nullptr)
     , max_landmark_walkers_(0)
+    , influence_visits_(nullptr)
+    , influence_normalized_(nullptr)
+    , influence_partial_max_(nullptr)
+    , influence_rng_states_(nullptr)
+    , influence_max_walkers_(10000)  // Default validated by PoC5
+    , influence_rng_initialized_(false)
     , main_stream_(nullptr)
     , sidecar_stream_(nullptr)
     , rng_initialized_(false)
@@ -117,6 +123,12 @@ CircuitGraph::CircuitGraph(CircuitGraph&& other) noexcept
     , landmark_partial_max_(other.landmark_partial_max_)
     , landmark_rng_states_(other.landmark_rng_states_)
     , max_landmark_walkers_(other.max_landmark_walkers_)
+    , influence_visits_(other.influence_visits_)
+    , influence_normalized_(other.influence_normalized_)
+    , influence_partial_max_(other.influence_partial_max_)
+    , influence_rng_states_(other.influence_rng_states_)
+    , influence_max_walkers_(other.influence_max_walkers_)
+    , influence_rng_initialized_(other.influence_rng_initialized_)
     , main_stream_(other.main_stream_)
     , sidecar_stream_(other.sidecar_stream_)
     , rng_initialized_(other.rng_initialized_)
@@ -142,6 +154,10 @@ CircuitGraph::CircuitGraph(CircuitGraph&& other) noexcept
     other.landmark_normalized_ = nullptr;
     other.landmark_partial_max_ = nullptr;
     other.landmark_rng_states_ = nullptr;
+    other.influence_visits_ = nullptr;
+    other.influence_normalized_ = nullptr;
+    other.influence_partial_max_ = nullptr;
+    other.influence_rng_states_ = nullptr;
     other.sidecar_stream_ = nullptr;
 }
 
@@ -182,6 +198,12 @@ CircuitGraph& CircuitGraph::operator=(CircuitGraph&& other) noexcept {
         landmark_partial_max_ = other.landmark_partial_max_;
         landmark_rng_states_ = other.landmark_rng_states_;
         max_landmark_walkers_ = other.max_landmark_walkers_;
+        influence_visits_ = other.influence_visits_;
+        influence_normalized_ = other.influence_normalized_;
+        influence_partial_max_ = other.influence_partial_max_;
+        influence_rng_states_ = other.influence_rng_states_;
+        influence_max_walkers_ = other.influence_max_walkers_;
+        influence_rng_initialized_ = other.influence_rng_initialized_;
         main_stream_ = other.main_stream_;
         sidecar_stream_ = other.sidecar_stream_;
         rng_initialized_ = other.rng_initialized_;
@@ -207,6 +229,10 @@ CircuitGraph& CircuitGraph::operator=(CircuitGraph&& other) noexcept {
         other.landmark_normalized_ = nullptr;
         other.landmark_partial_max_ = nullptr;
         other.landmark_rng_states_ = nullptr;
+        other.influence_visits_ = nullptr;
+        other.influence_normalized_ = nullptr;
+        other.influence_partial_max_ = nullptr;
+        other.influence_rng_states_ = nullptr;
         other.sidecar_stream_ = nullptr;
     }
     return *this;
@@ -276,6 +302,19 @@ void CircuitGraph::allocate_memory() {
     CUDA_CHECK(cudaMemset(landmark_positions_, 0, MAX_LANDMARKS * sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(num_landmarks_selected_, 0, sizeof(int)));
     CUDA_CHECK(cudaMemset(landmark_normalized_, 0, spectral_v_size));
+
+    // Influence walker buffers (v1.0.0 - validated by PoC5)
+    influence_max_walkers_ = 10000;  // PoC5 validated default
+    size_t influence_rng_size = influence_max_walkers_ * 2 * sizeof(uint64_t);
+
+    CUDA_CHECK(cudaMalloc(&influence_visits_, spectral_v_size));  // Float visits
+    CUDA_CHECK(cudaMalloc(&influence_normalized_, spectral_v_size));
+    CUDA_CHECK(cudaMalloc(&influence_partial_max_, spectral_partial_size));
+    CUDA_CHECK(cudaMalloc(&influence_rng_states_, influence_rng_size));
+
+    // Initialize influence buffers
+    CUDA_CHECK(cudaMemset(influence_visits_, 0, spectral_v_size));
+    CUDA_CHECK(cudaMemset(influence_normalized_, 0, spectral_v_size));
 }
 
 void CircuitGraph::free_memory() {
@@ -352,6 +391,24 @@ void CircuitGraph::free_memory() {
     if (landmark_rng_states_) {
         cudaFree(landmark_rng_states_);
         landmark_rng_states_ = nullptr;
+    }
+
+    // Free influence walker buffers
+    if (influence_visits_) {
+        cudaFree(influence_visits_);
+        influence_visits_ = nullptr;
+    }
+    if (influence_normalized_) {
+        cudaFree(influence_normalized_);
+        influence_normalized_ = nullptr;
+    }
+    if (influence_partial_max_) {
+        cudaFree(influence_partial_max_);
+        influence_partial_max_ = nullptr;
+    }
+    if (influence_rng_states_) {
+        cudaFree(influence_rng_states_);
+        influence_rng_states_ = nullptr;
     }
 }
 
@@ -1123,6 +1180,121 @@ torch::Tensor CircuitGraph::get_landmark_positions() {
     ));
 
     return positions;
+}
+
+// =============================================================================
+// Causal Influence Propagation Walker (v1.0.0 - VALIDATED BY PoC5)
+// =============================================================================
+
+void CircuitGraph::update_and_step_influence_walker(
+    torch::Tensor attention_matrix,
+    int current_idx,
+    int num_walkers,
+    int max_steps,
+    int sink_size
+) {
+    CHECK_CUDA(attention_matrix);
+    CHECK_CONTIGUOUS(attention_matrix);
+    TORCH_CHECK(attention_matrix.dtype() == torch::kFloat32,
+                "attention_matrix must be float32");
+    TORCH_CHECK(attention_matrix.dim() == 2,
+                "attention_matrix must be 2D [seq_len, seq_len]");
+
+    int seq_len = attention_matrix.size(0);
+    TORCH_CHECK(attention_matrix.size(1) == seq_len,
+                "attention_matrix must be square");
+    TORCH_CHECK(current_idx >= 0 && current_idx < seq_len,
+                "current_idx out of bounds");
+    TORCH_CHECK(seq_len <= max_seq_len_,
+                "seq_len exceeds max_seq_len");
+    TORCH_CHECK(num_walkers <= influence_max_walkers_,
+                "num_walkers exceeds influence_max_walkers");
+    TORCH_CHECK(max_steps > 0 && max_steps <= 100,
+                "max_steps must be in (0, 100]");
+    TORCH_CHECK(sink_size >= 0 && sink_size < seq_len,
+                "sink_size out of bounds");
+
+    // Update current sequence length
+    current_seq_len_ = seq_len;
+
+    // Get current CUDA stream from PyTorch
+    main_stream_ = at::cuda::getCurrentCUDAStream();
+    CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+    const float* attn_ptr = attention_matrix.data_ptr<float>();
+
+    // Initialize influence RNG if needed
+    if (!influence_rng_initialized_) {
+        auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
+        launch_init_rng_kernel(
+            influence_rng_states_,
+            static_cast<uint64_t>(seed),
+            influence_max_walkers_,
+            sidecar_stream_
+        );
+        influence_rng_initialized_ = true;
+    }
+
+    // STEP 1: Clear visit counts (float buffer)
+    launch_clear_influence_visits_kernel(
+        influence_visits_,
+        seq_len,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 2: Launch influence walker kernel
+    // All walkers start at current_idx and walk backward through attention
+    launch_influence_walker_kernel(
+        attn_ptr,
+        influence_visits_,
+        influence_rng_states_,
+        seq_len,
+        current_idx,
+        num_walkers,
+        max_steps,
+        sink_size,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+
+    // STEP 3: Normalize scores (optional, for numerical stability)
+    // Find max and normalize to [0, 1] - this preserves rankings
+    int num_reduce_blocks = (seq_len + 255) / 256;
+    if (num_reduce_blocks > 256) num_reduce_blocks = 256;
+
+    // Use the max reduction and normalization
+    launch_find_max_and_normalize_kernel(
+        influence_visits_,
+        influence_normalized_,
+        influence_partial_max_,
+        seq_len,
+        num_reduce_blocks,
+        sidecar_stream_
+    );
+    CUDA_CHECK_LAST();
+}
+
+torch::Tensor CircuitGraph::get_influence_scores() {
+    // Synchronize sidecar stream to ensure all operations complete
+    CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
+
+    // Create output tensor on GPU
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(torch::kCUDA);
+
+    torch::Tensor scores = torch::empty({current_seq_len_}, options);
+
+    // Copy normalized scores (or raw visits if normalization not used)
+    CUDA_CHECK(cudaMemcpy(
+        scores.data_ptr<float>(),
+        influence_normalized_,
+        current_seq_len_ * sizeof(float),
+        cudaMemcpyDeviceToDevice
+    ));
+
+    return scores;
 }
 
 }  // namespace circuit_kv

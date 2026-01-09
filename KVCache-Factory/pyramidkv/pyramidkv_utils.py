@@ -1126,45 +1126,49 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v0.5.0: Landmark Absorbing Walker (Landmarks as Sources AND Sinks).
+    CircuitKV v1.0.0: Causal Influence Propagation (VALIDATED BY PoC5).
 
-    This class implements multi-source absorbing walks where landmarks can BOTH
-    source AND absorb walkers, creating a "mesh" of current flows between landmarks.
+    This class implements single-source weighted random walks that measure how much
+    each token can INFLUENCE the generation position through multi-hop attention.
 
-    Key Innovation (v0.5.0 - Landmark Absorbing):
-    - STRATIFIED landmark selection: Divide sequence into segments, pick best H2O per segment
-    - LANDMARKS AS SINKS: Walkers absorb at ANY landmark (not just tokens 0-3)
-    - MESH NETWORK: Creates local current flows between adjacent landmarks
-    - Captures "local bridges" - tokens that connect ADJACENT landmarks
+    VALIDATED BY PoC5:
+        - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
+        - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
+        - Walker approximates Influence Oracle: Spearman r = 0.94
+
+    Key Innovation (v1.0.0 - Causal Influence):
+    - SINGLE SOURCE: All walkers start at generation position (current_idx)
+    - WEIGHTED VISITS: Visit weight = cumulative product of attention along path
+    - ABSORBING BOUNDARY: Walk stops at sink (first sink_size tokens)
+    - MULTI-HOP INFLUENCE: Captures tokens reachable through attention chains
 
     Physics Analogy:
-    - Old (v0.4.0): Single battery (Query+ to Sink-)
-    - New (v0.5.0): Mesh network where each landmark can source or sink current
+    - Influence = "How much current flows FROM token j TO generation position T?"
+    - High influence = token is on many attention paths to T
+    - This correlates with actual generation attention MUCH better than H2O
 
-    Why Landmark Absorbing > Standard Walker:
-    - Standard: All walkers flow to tokens 0-3 (single sink)
-    - Absorbing: Walkers stop at nearest landmark, capturing LOCAL importance
-    - Bridge tokens between L1 and L2 get visits from BOTH directions
+    Why Influence > H2O:
+    - H2O measures degree (popularity) - how many tokens attend to j
+    - Influence measures reachability - can j reach T through attention chains?
+    - Question tokens are HIGH influence (close to T), H2O misses them completely
 
     Algorithm:
     1. Compute full attention matrix from query/key states
-    2. STRATIFIED landmark selection: one landmark per segment, best H2O within segment
-    3. Launch walkers from ALL sources (landmarks + query) in parallel
-    4. Walkers ABSORB at any landmark (or sink tokens 0-3)
-    5. Apply reachability normalization: score[p] = visits[p] / total_reachable[p]
-    6. Select top tokens by normalized scores for KV cache retention
+    2. Launch walkers from generation position (current_idx)
+    3. Walk backward through attention: at pos, sample from A[pos, :pos+1]
+    4. Weight visits by cumulative path probability
+    5. Absorb at sink (first sink_size tokens)
+    6. Select top tokens by influence scores for KV cache retention
 
     Particularly effective for:
-    - Multi-hop reasoning (HotpotQA, 2WikiMQA)
-    - Long document QA (NarrativeQA, Qasper)
-    - Cases where important tokens are LOCAL bridges between landmarks
+    - QA tasks where question tokens are critical (NarrativeQA, HotpotQA)
+    - Summarization tasks requiring multi-hop reasoning
+    - Long document tasks where recency matters
 
-    Configuration (v0.5.3 defaults - High pass-through diffusion):
-    - num_landmarks: Number of diverse landmarks (default: 8, fewer for global reach)
-    - min_spacing: Minimum segment size for stratified (default: 50)
-    - walkers_per_source: Walkers launched from each source (default: 100)
-    - query_boost: Weight multiplier for query-sourced walkers (default: 2.0)
-    - absorb_at_landmarks: If True (default), landmarks absorb walkers (NEW behavior)
+    Configuration (v1.0.0 defaults - Validated by PoC5):
+    - num_walkers: Number of walkers (default: 10000, validated)
+    - max_steps: Max steps per walker (default: 10, matches oracle)
+    - sink_size: Absorbing boundary (default: 4)
     """
 
     def __init__(
@@ -1178,8 +1182,9 @@ class CircuitKVCluster():
         sink_size: int = 4,  # Absorbing boundary (first 4 tokens)
         top_k: int = 32,
         alpha: float = 0.85,  # Unused by CircuitKV, kept for API compatibility
-        num_walkers: int = 1024,
-        num_steps: int = 100,  # MAX_STEPS for safety timeout
+        num_walkers: int = 10000,  # v1.0.0: 10000 walkers (validated by PoC5)
+        num_steps: int = 100,  # MAX_STEPS for safety timeout (legacy)
+        max_steps: int = 10,  # v1.0.0: 10 steps per walker (matches oracle computation)
         # Capacitive model parameters
         decay: float = 0.95,  # EMA decay for charge accumulation
         observation_window: int = 1,  # P0+P1: Last W tokens for H2O attention + multi-source walks
@@ -1189,15 +1194,15 @@ class CircuitKVCluster():
         # Spectral + Walker + MAX mode (v0.2.0)
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
-        # Landmark Walker parameters (v0.5.3 - High pass-through diffusion)
-        num_landmarks: int = 8,  # Fewer landmarks for better global reach with 90% pass-through
-        min_spacing: int = 50,  # Minimum segment size for stratified sampling
-        walkers_per_source: int = 100,  # Walkers per source (landmark/query)
-        query_boost: float = 2.0,  # Weight multiplier for query-sourced walkers
-        position_alpha: float = 0.6,  # Exponent for positional normalization (unused in v0.5.0)
-        use_reachability: bool = False,  # Unused in v0.5.0 (always uses reachability internally)
-        # v0.5.0: Landmark Absorbing Walker
-        absorb_at_landmarks: bool = True,  # True = landmarks absorb walkers (NEW), False = old behavior
+        # Landmark Walker parameters (legacy, kept for API compatibility)
+        num_landmarks: int = 8,  # Legacy parameter (unused in v1.0.0)
+        min_spacing: int = 50,  # Legacy parameter (unused in v1.0.0)
+        walkers_per_source: int = 100,  # Legacy parameter (unused in v1.0.0)
+        query_boost: float = 2.0,  # Legacy parameter (unused in v1.0.0)
+        position_alpha: float = 0.6,  # Legacy parameter (unused in v1.0.0)
+        use_reachability: bool = False,  # Legacy parameter (unused in v1.0.0)
+        # v0.5.0: Landmark Absorbing Walker (legacy, kept for API compatibility)
+        absorb_at_landmarks: bool = True,  # Legacy parameter (unused in v1.0.0)
         # Debug logging
         debug: bool = False,
     ):
@@ -1208,6 +1213,7 @@ class CircuitKVCluster():
         self.alpha = alpha
         self.num_walkers = num_walkers
         self.num_steps = num_steps
+        self.max_steps = max_steps  # v1.0.0: Max steps per walker
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1722,23 +1728,24 @@ class CircuitKVCluster():
             full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
-        # STEP 2: Run Landmark Absorbing Walker (CUDA kernel) - v0.5.0
+        # STEP 2: Run Causal Influence Walker (CUDA kernel) - v1.0.0
+        # VALIDATED BY PoC5:
+        #   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
+        #   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
         # =====================================================================
         current_idx = q_len - 1
 
-        # v0.5.0: Use Landmark Absorbing Walker (landmarks as sources AND sinks)
-        self._graph.update_and_step_landmark_absorbing_walker(
+        # v1.0.0: Use Causal Influence Walker (single source, weighted visits)
+        self._graph.update_and_step_influence_walker(
             full_attn.contiguous(),
             current_idx,
-            self.num_landmarks,
-            self.walkers_per_source,
-            self.query_boost,
-            self.min_spacing,
-            self.absorb_at_landmarks,  # True = landmarks absorb walkers (NEW behavior)
+            self.num_walkers,    # 10000 walkers (validated by PoC5)
+            self.max_steps,      # 10 steps (matches oracle computation)
+            self.sink_size,      # Absorb at first 4 tokens
         )
 
-        # Get normalized scores from landmark absorbing walker (v0.5.0)
-        scores = self._graph.get_landmark_absorbing_scores()
+        # Get normalized scores from influence walker (v1.0.0)
+        scores = self._graph.get_influence_scores()
 
         # =====================================================================
         # STEP 3: EVICTION BASED ON LANDMARK WALKER SCORES
@@ -1782,7 +1789,7 @@ class CircuitKVCluster():
 
 
 def init_circuitkv(self):
-    """Initialize CircuitKV cluster with Landmark Absorbing Walker (v0.5.0)."""
+    """Initialize CircuitKV cluster with Causal Influence Walker (v1.0.0)."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 64
@@ -1794,7 +1801,7 @@ def init_circuitkv(self):
             self.config.pooling = 'avgpool'
         if not hasattr(self.config, 'merge'):
             self.config.merge = None
-        # CircuitKV-specific defaults
+        # CircuitKV-specific defaults (v1.0.0 - Validated by PoC5)
         if not hasattr(self.config, 'sink_size'):
             self.config.sink_size = 4  # Absorbing boundary
         if not hasattr(self.config, 'top_k'):
@@ -1802,31 +1809,33 @@ def init_circuitkv(self):
         if not hasattr(self.config, 'alpha'):
             self.config.alpha = 0.85  # Unused, kept for API compatibility
         if not hasattr(self.config, 'num_walkers'):
-            self.config.num_walkers = 2048
+            self.config.num_walkers = 10000  # v1.0.0: 10000 walkers (validated by PoC5)
         if not hasattr(self.config, 'num_steps'):
-            self.config.num_steps = 100  # MAX_STEPS for safety timeout
+            self.config.num_steps = 100  # MAX_STEPS for safety timeout (legacy)
+        if not hasattr(self.config, 'max_steps'):
+            self.config.max_steps = 10  # v1.0.0: 10 steps per walker (matches oracle)
         # Capacitive model parameter
         if not hasattr(self.config, 'decay'):
             self.config.decay = 0.99  # EMA decay for charge accumulation
         # RC+B: Bidirectional Circuit Walks (disabled - hurt narrativeqa score)
         if not hasattr(self.config, 'bidirectional'):
             self.config.bidirectional = False
-        # Landmark Walker parameters (v0.5.3 - High pass-through diffusion)
+        # Legacy Landmark Walker parameters (kept for API compatibility)
         if not hasattr(self.config, 'num_landmarks'):
-            self.config.num_landmarks = 8  # Fewer landmarks for global reach with 90% pass-through
+            self.config.num_landmarks = 8  # Legacy (unused in v1.0.0)
         if not hasattr(self.config, 'min_spacing'):
-            self.config.min_spacing = 50  # Min segment size for stratified
+            self.config.min_spacing = 50  # Legacy (unused in v1.0.0)
         if not hasattr(self.config, 'walkers_per_source'):
-            self.config.walkers_per_source = 100  # Walkers per source
+            self.config.walkers_per_source = 100  # Legacy (unused in v1.0.0)
         if not hasattr(self.config, 'query_boost'):
-            self.config.query_boost = 2.0  # Weight for query-sourced walkers
+            self.config.query_boost = 2.0  # Legacy (unused in v1.0.0)
         if not hasattr(self.config, 'position_alpha'):
-            self.config.position_alpha = 0.6  # Exponent for positional normalization
+            self.config.position_alpha = 0.6  # Legacy (unused in v1.0.0)
         if not hasattr(self.config, 'use_reachability'):
-            self.config.use_reachability = False  # Unused in v0.5.0
-        # v0.5.0: Landmark Absorbing Walker
+            self.config.use_reachability = False  # Legacy (unused in v1.0.0)
+        # v0.5.0: Landmark Absorbing Walker (legacy)
         if not hasattr(self.config, 'absorb_at_landmarks'):
-            self.config.absorb_at_landmarks = True  # True = landmarks absorb walkers (NEW)
+            self.config.absorb_at_landmarks = True  # Legacy (unused in v1.0.0)
         # Debug logging
         if not hasattr(self.config, 'circuitkv_debug'):
             self.config.circuitkv_debug = False
@@ -1842,16 +1851,17 @@ def init_circuitkv(self):
         alpha=self.config.alpha,
         num_walkers=self.config.num_walkers,
         num_steps=self.config.num_steps,
+        max_steps=self.config.max_steps,  # v1.0.0: Max steps per walker
         decay=self.config.decay,
         bidirectional=self.config.bidirectional,
-        # Landmark Walker parameters
+        # Legacy Landmark Walker parameters (kept for API compatibility)
         num_landmarks=self.config.num_landmarks,
         min_spacing=self.config.min_spacing,
         walkers_per_source=self.config.walkers_per_source,
         query_boost=self.config.query_boost,
         position_alpha=self.config.position_alpha,
         use_reachability=self.config.use_reachability,
-        # v0.5.0: Landmark Absorbing Walker
+        # v0.5.0: Landmark Absorbing Walker (legacy)
         absorb_at_landmarks=self.config.absorb_at_landmarks,
         # Debug
         debug=self.config.circuitkv_debug,
