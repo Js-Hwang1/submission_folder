@@ -255,7 +255,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         )pbdoc"
     )
     // =========================================================================
-    // CAUSAL INFLUENCE PROPAGATION (v1.0.0) - VALIDATED BY PoC5
+    // CAUSAL INFLUENCE PROPAGATION (v1.0.8) - DUAL-TEMPERATURE WALKERS
     // =========================================================================
     .def("update_and_step_influence_walker", &CircuitGraph::update_and_step_influence_walker,
         py::arg("attention_matrix"),
@@ -264,24 +264,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("max_steps") = 10,
         py::arg("sink_size") = 4,
         py::arg("temperature") = 2.0f,
+        py::arg("explore_temp") = 10.0f,
+        py::arg("explore_ratio") = 0.3f,
         R"pbdoc(
-        Causal Influence Walker v1.0.7: Temperature-Based Exploration.
+        Causal Influence Walker v1.0.8: Dual-Temperature Exploration.
 
         ALGORITHM:
             1. MULTI-SOURCE: 50% walkers start at query, 50% at random positions
-            2. TEMPERATURE SAMPLING: Sample from A[pos,j]^(1/T) for exploration
+            2. DUAL-TEMPERATURE: 70% logical (T=base), 30% exploratory (T=high)
             3. Visit count = unweighted for ALL steps
             4. Normalize by POSITIONAL OPPORTUNITY to counteract early bias
 
-        KEY INSIGHT - "Attention Concentration Problem":
-            LLM attention is highly concentrated: ~80-90% to BOS/early, ~10% to
-            recent, ~1-5% to middle. Without temperature scaling, walkers converge
-            to high-attention positions regardless of starting point.
+        v1.0.8 DUAL-TEMPERATURE APPROACH:
+            Problem: Single temperature is a trade-off. Low T misses middle positions,
+            high T loses attention signal. No single temperature works for all tasks.
 
-        Temperature Effect:
-            - T=1.0: Raw attention (concentrated, poor exploration)
-            - T=2.0: Moderate exploration (default, recommended)
-            - T=3.0+: High exploration (may lose attention signal)
+            Solution: Use TWO temperature regimes simultaneously:
+            - LOGICAL walkers (70%): T = temperature (default 2.0)
+              → Follow attention closely, find "hard evidence" (Qasper, Code)
+            - EXPLORATORY walkers (30%): T = explore_temp (default 10.0)
+              → Sample nearly uniformly, find "context & atmosphere" (NarrativeQA)
 
         Args:
             attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
@@ -289,7 +291,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             num_walkers: Number of walkers (default 10000).
             max_steps: Max steps per walker (default 10).
             sink_size: Absorbing boundary (default 4).
-            temperature: Exploration temperature (default 2.0, higher = more uniform).
+            temperature: Base temperature for logical walkers (default 2.0).
+            explore_temp: Temperature for exploratory walkers (default 10.0).
+            explore_ratio: Fraction of exploratory walkers (default 0.3 = 30%).
         )pbdoc"
     )
     .def("get_influence_scores", &CircuitGraph::get_influence_scores,
@@ -312,7 +316,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "1.0.7";  // Fix: temperature-based exploration
+    m.attr("__version__") = "1.0.8";  // Dual-temperature walkers
 }
 
 }  // namespace circuit_kv

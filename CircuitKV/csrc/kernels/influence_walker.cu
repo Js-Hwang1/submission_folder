@@ -1,33 +1,25 @@
 /**
- * Causal Influence Propagation Walker (v1.0.7)
+ * Causal Influence Propagation Walker (v1.0.8)
  *
  * ALGORITHM:
  *   1. MULTI-SOURCE: 50% walkers start at query, 50% start at random positions
- *   2. TEMPERATURE SAMPLING: Sample from A[pos,j]^(1/T) to encourage exploration
+ *   2. DUAL-TEMPERATURE: 70% logical (T=base), 30% exploratory (T=high/uniform)
  *   3. Visit count = unweighted for ALL steps (count from step 0)
  *   4. Normalize by POSITIONAL OPPORTUNITY to counteract early-position bias
  *
- * KEY INSIGHT - "Attention Concentration Problem":
- *   LLM attention is highly concentrated: ~80-90% to BOS/early, ~10% to recent,
- *   ~1-5% to middle. Walkers following raw attention converge to high-attention
- *   positions regardless of starting point. This is the "rich get richer" effect.
+ * v1.0.8 FIX - "Dual-Temperature Walkers":
+ *   Problem: Single temperature is a trade-off. Low T misses middle positions,
+ *   high T loses attention signal. No single temperature works for all tasks.
  *
- * v1.0.7 FIX - "Temperature-Based Exploration":
- *   Problem: Even with multi-source walks, walkers follow high-attention paths
- *   and converge to early/late positions. Middle positions (few-shot examples)
- *   are starved because attention to them is LOW, not zero.
+ *   Solution: Use TWO temperature regimes simultaneously:
+ *     - LOGICAL walkers (70%): T = base_temperature (default 2.0)
+ *       → Follow attention closely, find "hard evidence" (Qasper, Code)
+ *     - EXPLORATORY walkers (30%): T = explore_temperature (default 10.0)
+ *       → Sample nearly uniformly, find "context & atmosphere" (NarrativeQA)
  *
- *   Solution: Apply temperature scaling before sampling:
- *     sampled_prob[j] ∝ attention[pos,j]^(1/temperature)
- *
- *   With temperature > 1:
- *     - High attention values are REDUCED (e.g., 0.8^0.5 = 0.89)
- *     - Low attention values are BOOSTED (e.g., 0.05^0.5 = 0.22)
- *     - Distribution becomes more uniform → walkers EXPLORE more
- *
- *   Example: attention = [0.8, 0.1, 0.05, 0.05]
- *     - Raw: [0.80, 0.10, 0.05, 0.05] (walkers always go to first)
- *     - T=2: [0.54, 0.19, 0.13, 0.13] (walkers explore all positions)
+ *   This captures BOTH types of important tokens:
+ *     - Logical: Tokens the model actually attends to
+ *     - Exploratory: Tokens that provide context but aren't directly attended
  *
  * DIRECTION:
  *   Walk ALONG A (not A^T). A[i,j] = how much position i attends to j.
@@ -44,28 +36,32 @@ namespace circuit_kv {
 constexpr int INFLUENCE_DEFAULT_WALKERS = 10000;
 constexpr int INFLUENCE_DEFAULT_MAX_STEPS = 10;
 constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
-constexpr float INFLUENCE_DEFAULT_TEMPERATURE = 2.0f;  // v1.0.7: Exploration temperature
+constexpr float INFLUENCE_DEFAULT_TEMPERATURE = 2.0f;       // v1.0.7: Base temperature
+constexpr float INFLUENCE_DEFAULT_EXPLORE_TEMP = 10.0f;     // v1.0.8: Exploratory temperature
+constexpr float INFLUENCE_DEFAULT_EXPLORE_RATIO = 0.3f;     // v1.0.8: 30% exploratory walkers
 
 /**
- * Influence Walker Kernel (v1.0.7 - Temperature-Based Exploration)
+ * Influence Walker Kernel (v1.0.8 - Dual-Temperature Exploration)
  *
  * Each thread runs one walker. 50% start at current_idx (query), 50% start at
  * random positions in [sink_size, current_idx]. All walk through attention
  * for max_steps, ONLY among non-sink positions.
  *
- * v1.0.7: Temperature scaling flattens attention distribution to encourage
- * exploration. With temperature > 1, low-attention positions get boosted,
- * allowing walkers to discover important tokens that don't have high attention.
+ * v1.0.8: Dual temperature regime:
+ *   - First (1-explore_ratio) walkers use base temperature (logical)
+ *   - Last explore_ratio walkers use high temperature (exploratory)
  *
- * @param attention      Full attention matrix [seq_len, seq_len], row-major
- * @param visits         Output: visit counts [seq_len] (all steps)
- * @param rng_states     RNG states [num_walkers] as PCGState structs
- * @param seq_len        Sequence length
- * @param current_idx    Generation position (walker start)
- * @param num_walkers    Number of walkers
- * @param max_steps      Maximum steps per walker
- * @param sink_size      Sink region size (positions 0 to sink_size-1 excluded from sampling)
- * @param inv_temperature  1/temperature for sampling (default 0.5 = temperature 2.0)
+ * @param attention        Full attention matrix [seq_len, seq_len], row-major
+ * @param visits           Output: visit counts [seq_len] (all steps)
+ * @param rng_states       RNG states [num_walkers] as PCGState structs
+ * @param seq_len          Sequence length
+ * @param current_idx      Generation position (walker start)
+ * @param num_walkers      Number of walkers
+ * @param max_steps        Maximum steps per walker
+ * @param sink_size        Sink region size (positions 0 to sink_size-1 excluded)
+ * @param inv_temperature  1/base_temperature for logical walkers
+ * @param inv_explore_temp 1/explore_temperature for exploratory walkers
+ * @param explore_ratio    Fraction of walkers that use exploratory temperature
  */
 __global__ void influence_walker_kernel(
     const float* __restrict__ attention,
@@ -76,13 +72,21 @@ __global__ void influence_walker_kernel(
     int num_walkers,
     int max_steps,
     int sink_size,
-    float inv_temperature
+    float inv_temperature,
+    float inv_explore_temp,
+    float explore_ratio
 ) {
     int walker_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (walker_id >= num_walkers) return;
 
     // Load RNG state for this walker
     PCGState rng = rng_states[walker_id];
+
+    // v1.0.8: Dual-Temperature Selection
+    // First (1-explore_ratio) walkers are LOGICAL (base temperature)
+    // Last explore_ratio walkers are EXPLORATORY (high temperature)
+    int explore_start = (int)((1.0f - explore_ratio) * num_walkers);
+    float my_inv_temp = (walker_id >= explore_start) ? inv_explore_temp : inv_temperature;
 
     // v1.0.6: Multi-Source Walks
     // - Walker IDs 0 to num_walkers/2 - 1: Start at query (current_idx)
@@ -118,12 +122,13 @@ __global__ void influence_walker_kernel(
 
         const float* attn_row = attention + pos * seq_len;
 
-        // v1.0.7: Sum TEMPERATURE-SCALED attention over NON-SINK positions
-        // scaled_prob[j] = attn[j]^(1/temperature) = attn[j]^inv_temperature
+        // v1.0.8: Sum TEMPERATURE-SCALED attention over NON-SINK positions
+        // Uses my_inv_temp which is either base or exploratory temperature
+        // scaled_prob[j] = attn[j]^(1/temperature) = attn[j]^my_inv_temp
         float non_sink_sum = 0.0f;
         for (int j = sink_size; j <= pos; j++) {
             // Apply temperature scaling: higher temperature = more uniform
-            float scaled = powf(fmaxf(attn_row[j], 1e-10f), inv_temperature);
+            float scaled = powf(fmaxf(attn_row[j], 1e-10f), my_inv_temp);
             non_sink_sum += scaled;
         }
 
@@ -140,7 +145,7 @@ __global__ void influence_walker_kernel(
 
         for (int j = sink_size; j <= pos; j++) {
             // Same temperature scaling as above
-            float scaled = powf(fmaxf(attn_row[j], 1e-10f), inv_temperature);
+            float scaled = powf(fmaxf(attn_row[j], 1e-10f), my_inv_temp);
             cumsum += scaled;
             if (r < cumsum) {
                 next_pos = j;
@@ -256,7 +261,9 @@ void launch_influence_walker_kernel(
     int max_steps,
     int sink_size,
     cudaStream_t stream,
-    float temperature  // v1.0.7: Exploration temperature (default 2.0)
+    float temperature,       // v1.0.7: Base temperature (default 2.0)
+    float explore_temp,      // v1.0.8: Exploratory temperature (default 10.0)
+    float explore_ratio      // v1.0.8: Ratio of exploratory walkers (default 0.3)
 ) {
     const int block_size = 256;
     const int num_blocks = (num_walkers + block_size - 1) / block_size;
@@ -264,13 +271,15 @@ void launch_influence_walker_kernel(
     // Cast to PCGState* (each PCGState is 2 uint64_t = 16 bytes)
     PCGState* pcg_states = reinterpret_cast<PCGState*>(rng_states);
 
-    // v1.0.7: Pass inverse temperature for efficient computation
+    // v1.0.8: Compute inverse temperatures for both regimes
     // inv_temp = 1/T, so attn^(1/T) = attn^inv_temp
-    float inv_temperature = 1.0f / fmaxf(temperature, 0.1f);  // Clamp to avoid div by 0
+    float inv_temperature = 1.0f / fmaxf(temperature, 0.1f);
+    float inv_explore_temp = 1.0f / fmaxf(explore_temp, 0.1f);
 
     influence_walker_kernel<<<num_blocks, block_size, 0, stream>>>(
         attention, visits, pcg_states, seq_len, current_idx,
-        num_walkers, max_steps, sink_size, inv_temperature
+        num_walkers, max_steps, sink_size,
+        inv_temperature, inv_explore_temp, explore_ratio
     );
 }
 

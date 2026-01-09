@@ -1192,7 +1192,9 @@ void CircuitGraph::update_and_step_influence_walker(
     int num_walkers,
     int max_steps,
     int sink_size,
-    float temperature
+    float temperature,
+    float explore_temp,
+    float explore_ratio
 ) {
     CHECK_CUDA(attention_matrix);
     CHECK_CONTIGUOUS(attention_matrix);
@@ -1214,8 +1216,12 @@ void CircuitGraph::update_and_step_influence_walker(
                 "max_steps must be in (0, 100]");
     TORCH_CHECK(sink_size >= 0 && sink_size < seq_len,
                 "sink_size out of bounds");
-    TORCH_CHECK(temperature >= 0.1f && temperature <= 10.0f,
-                "temperature must be in [0.1, 10.0]");
+    TORCH_CHECK(temperature >= 0.1f && temperature <= 100.0f,
+                "temperature must be in [0.1, 100.0]");
+    TORCH_CHECK(explore_temp >= 0.1f && explore_temp <= 100.0f,
+                "explore_temp must be in [0.1, 100.0]");
+    TORCH_CHECK(explore_ratio >= 0.0f && explore_ratio <= 1.0f,
+                "explore_ratio must be in [0.0, 1.0]");
 
     // Update current sequence length
     current_seq_len_ = seq_len;
@@ -1247,7 +1253,7 @@ void CircuitGraph::update_and_step_influence_walker(
     CUDA_CHECK_LAST();
 
     // STEP 2: Launch influence walker kernel
-    // v1.0.7: Multi-source walks with temperature-based exploration
+    // v1.0.8: Dual-temperature walkers for balanced exploration
     launch_influence_walker_kernel(
         attn_ptr,
         influence_visits_,
@@ -1258,7 +1264,9 @@ void CircuitGraph::update_and_step_influence_walker(
         max_steps,
         sink_size,
         sidecar_stream_,
-        temperature  // v1.0.7: Pass exploration temperature
+        temperature,     // v1.0.8: Base temperature for logical walkers (70%)
+        explore_temp,    // v1.0.8: High temperature for exploratory walkers (30%)
+        explore_ratio    // v1.0.8: Ratio of exploratory walkers
     );
     CUDA_CHECK_LAST();
 

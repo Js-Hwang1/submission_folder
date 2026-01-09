@@ -252,7 +252,7 @@ public:
     // =========================================================================
 
     /**
-     * Causal Influence Walker: Single-source weighted random walks.
+     * Causal Influence Walker v1.0.8: Dual-Temperature Exploration.
      *
      * VALIDATED BY PoC5:
      *   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
@@ -260,22 +260,25 @@ public:
      *   - Walker approximates Influence Oracle: Spearman r = 0.94
      *
      * ALGORITHM:
-     *   1. Start ALL walkers at current_idx (generation position)
-     *   2. At each step, walker at `pos` samples next from A[pos, :pos+1]
-     *   3. Visit weight = cumulative product of attention along path
-     *   4. Absorb at sink (first sink_size tokens)
+     *   1. MULTI-SOURCE: 50% walkers start at query, 50% at random positions
+     *   2. DUAL-TEMPERATURE: 70% logical (T=base), 30% exploratory (T=high)
+     *   3. Visit count = unweighted for ALL steps
+     *   4. Normalize by POSITIONAL OPPORTUNITY to counteract early bias
      *
-     * KEY INSIGHT:
-     *   Influence = "How much can token j reach the generation position through
-     *   multi-hop attention?" This correlates with actual generation attention
-     *   MUCH better than H2O (which just measures degree/popularity).
+     * v1.0.8 DUAL-TEMPERATURE APPROACH:
+     *   - LOGICAL walkers (70%): T = temperature (default 2.0)
+     *     → Follow attention closely, find "hard evidence" (Qasper, Code)
+     *   - EXPLORATORY walkers (30%): T = explore_temp (default 10.0)
+     *     → Sample nearly uniformly, find "context & atmosphere" (NarrativeQA)
      *
      * @param attention_matrix  Full attention matrix [seq_len, seq_len], FP32
-     * @param current_idx       Generation position (source for all walkers)
+     * @param current_idx       Generation position (source for query-start walkers)
      * @param num_walkers       Number of walkers (default 10000, validated by PoC5)
      * @param max_steps         Max steps per walker (default 10, matches oracle)
      * @param sink_size         Absorbing boundary (default 4)
-     * @param temperature       Exploration temperature (default 2.0, higher = more uniform)
+     * @param temperature       Base temperature for logical walkers (default 2.0)
+     * @param explore_temp      Temperature for exploratory walkers (default 10.0)
+     * @param explore_ratio     Fraction of exploratory walkers (default 0.3)
      */
     void update_and_step_influence_walker(
         torch::Tensor attention_matrix,
@@ -283,7 +286,9 @@ public:
         int num_walkers = 10000,
         int max_steps = 10,
         int sink_size = 4,
-        float temperature = 2.0f
+        float temperature = 2.0f,
+        float explore_temp = 10.0f,
+        float explore_ratio = 0.3f
     );
 
     /**

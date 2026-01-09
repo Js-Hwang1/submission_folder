@@ -582,7 +582,7 @@ void launch_landmark_reachability_normalize_kernel(
  *   - Each thread is one walker starting at current_idx
  *   - Weighted visits updated via atomicAdd
  *
- * v1.0.7: Added temperature parameter for exploration control.
+ * v1.0.8: Dual-temperature walkers for balanced exploration.
  *
  * @param attention      Full attention matrix [seq_len, seq_len], FP32
  * @param visits         Output weighted visit counts [seq_len], FP32
@@ -593,7 +593,9 @@ void launch_landmark_reachability_normalize_kernel(
  * @param max_steps      Max steps per walker (default 10)
  * @param sink_size      Absorbing boundary (default 4)
  * @param stream         CUDA stream
- * @param temperature    Exploration temperature (default 2.0, higher = more uniform sampling)
+ * @param temperature    Base temperature for logical walkers (default 2.0)
+ * @param explore_temp   Exploratory temperature for context walkers (default 10.0)
+ * @param explore_ratio  Fraction of walkers using exploratory temperature (default 0.3)
  */
 void launch_influence_walker_kernel(
     const float* attention,
@@ -605,7 +607,9 @@ void launch_influence_walker_kernel(
     int max_steps,
     int sink_size,
     cudaStream_t stream,
-    float temperature = 2.0f  // v1.0.7: Default exploration temperature
+    float temperature = 2.0f,     // v1.0.8: Base temperature for logical walkers
+    float explore_temp = 10.0f,   // v1.0.8: High temperature for exploratory walkers
+    float explore_ratio = 0.3f    // v1.0.8: 30% exploratory walkers
 );
 
 /**

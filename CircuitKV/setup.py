@@ -66,7 +66,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="1.0.7",  # Fix: temperature-based exploration
+    version="1.0.8",  # Dual-temperature walkers
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",
