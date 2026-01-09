@@ -233,6 +233,20 @@ public:
      */
     torch::Tensor get_landmark_absorbing_scores();
 
+    /**
+     * DEBUG: Get raw visit counts before normalization.
+     *
+     * @return Tensor of shape [seq_len] with raw visit counts (int32)
+     */
+    torch::Tensor get_landmark_absorbing_raw_visits();
+
+    /**
+     * DEBUG: Get selected landmark positions.
+     *
+     * @return Tensor of shape [num_landmarks] with landmark positions (int32)
+     */
+    torch::Tensor get_landmark_positions();
+
 private:
     // Configuration
     int max_seq_len_;

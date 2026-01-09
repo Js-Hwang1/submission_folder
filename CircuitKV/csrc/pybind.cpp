@@ -243,10 +243,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         Returns:
             Tensor of shape [seq_len] with normalized importance scores.
         )pbdoc"
+    )
+    .def("get_landmark_absorbing_raw_visits", &CircuitGraph::get_landmark_absorbing_raw_visits,
+        R"pbdoc(
+        DEBUG: Get raw visit counts before normalization.
+
+        Returns:
+            Tensor of shape [seq_len] with raw visit counts (int32).
+        )pbdoc"
+    )
+    .def("get_landmark_positions", &CircuitGraph::get_landmark_positions,
+        R"pbdoc(
+        DEBUG: Get selected landmark positions.
+
+        Returns:
+            Tensor of shape [num_landmarks] with landmark positions (int32).
+        )pbdoc"
     );
 
     // Version info
-    m.attr("__version__") = "0.5.0";
+    m.attr("__version__") = "0.5.1";  // Bumped for debug methods
 }
 
 }  // namespace circuit_kv

@@ -1068,4 +1068,61 @@ torch::Tensor CircuitGraph::get_landmark_absorbing_scores() {
     return scores;
 }
 
+torch::Tensor CircuitGraph::get_landmark_absorbing_raw_visits() {
+    // Synchronize sidecar stream
+    CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
+
+    // Create output tensor on GPU (int32)
+    auto options = torch::TensorOptions()
+        .dtype(torch::kInt32)
+        .device(torch::kCUDA);
+
+    torch::Tensor visits = torch::empty({current_seq_len_}, options);
+
+    // Copy raw visit counts
+    CUDA_CHECK(cudaMemcpy(
+        visits.data_ptr<int32_t>(),
+        visit_counts_,
+        current_seq_len_ * sizeof(int32_t),
+        cudaMemcpyDeviceToDevice
+    ));
+
+    return visits;
+}
+
+torch::Tensor CircuitGraph::get_landmark_positions() {
+    // Synchronize sidecar stream
+    CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
+
+    // Get number of landmarks selected
+    int num_landmarks = 0;
+    CUDA_CHECK(cudaMemcpy(
+        &num_landmarks,
+        num_landmarks_selected_,
+        sizeof(int),
+        cudaMemcpyDeviceToHost
+    ));
+
+    if (num_landmarks <= 0) {
+        return torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    }
+
+    // Create output tensor on GPU (int32)
+    auto options = torch::TensorOptions()
+        .dtype(torch::kInt32)
+        .device(torch::kCUDA);
+
+    torch::Tensor positions = torch::empty({num_landmarks}, options);
+
+    // Copy landmark positions
+    CUDA_CHECK(cudaMemcpy(
+        positions.data_ptr<int32_t>(),
+        landmark_positions_,
+        num_landmarks * sizeof(int32_t),
+        cudaMemcpyDeviceToDevice
+    ));
+
+    return positions;
+}
+
 }  // namespace circuit_kv

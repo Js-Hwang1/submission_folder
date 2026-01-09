@@ -1316,7 +1316,38 @@ class CircuitKVCluster():
                 log.write(f"    {i+1:2d}. pos={pos:5d}  h2o={val:.4f}\n")
             log.write(f"  H2O stats: min={h2o_cpu.min():.4f}, max={h2o_cpu.max():.4f}, mean={h2o_cpu.mean():.4f}\n\n")
 
-            # 2. Landmark Walker Scores Analysis
+            # 2. Landmark Positions (NEW DEBUG)
+            try:
+                landmark_pos = self._graph.get_landmark_positions().cpu().tolist()
+                log.write(f"LANDMARK POSITIONS ({len(landmark_pos)} landmarks):\n")
+                log.write(f"  Positions: {landmark_pos}\n")
+                if len(landmark_pos) >= 2:
+                    spacings = [landmark_pos[i+1] - landmark_pos[i] for i in range(len(landmark_pos)-1)]
+                    log.write(f"  Spacings: min={min(spacings)}, max={max(spacings)}, avg={sum(spacings)/len(spacings):.1f}\n")
+                log.write("\n")
+            except Exception as e:
+                log.write(f"LANDMARK POSITIONS: Failed to get ({e})\n\n")
+
+            # 3. Raw Visit Counts (NEW DEBUG)
+            try:
+                raw_visits = self._graph.get_landmark_absorbing_raw_visits()[:q_len].cpu()
+                n_zero = (raw_visits == 0).sum().item()
+                n_nonzero = (raw_visits > 0).sum().item()
+                log.write(f"RAW VISIT COUNTS (before normalization):\n")
+                log.write(f"  Tokens with ZERO visits: {n_zero} ({100*n_zero/q_len:.1f}%)\n")
+                log.write(f"  Tokens with non-zero visits: {n_nonzero} ({100*n_nonzero/q_len:.1f}%)\n")
+                log.write(f"  Total visits: {raw_visits.sum().item()}\n")
+                log.write(f"  Visit stats: min={raw_visits.min().item()}, max={raw_visits.max().item()}, mean={raw_visits.float().mean().item():.2f}\n")
+                # Top 10 by raw visits
+                raw_topk_vals, raw_topk_idx = torch.topk(raw_visits.float(), min(10, q_len))
+                log.write(f"  Top 10 by raw visits:\n")
+                for i, (pos, val) in enumerate(zip(raw_topk_idx.tolist(), raw_topk_vals.tolist())):
+                    log.write(f"    {i+1:2d}. pos={pos:5d}  raw_visits={int(val)}\n")
+                log.write("\n")
+            except Exception as e:
+                log.write(f"RAW VISIT COUNTS: Failed to get ({e})\n\n")
+
+            # 4. Landmark Walker Scores Analysis (normalized)
             lw_cpu = landmark_scores[:q_len].cpu()
             lw_top_k = 30
             lw_topk_vals, lw_topk_idx = torch.topk(lw_cpu, min(lw_top_k, q_len))
@@ -1325,7 +1356,9 @@ class CircuitKVCluster():
             for i, (pos, val) in enumerate(zip(lw_topk_idx.tolist(), lw_topk_vals.tolist())):
                 h2o_val = h2o_cpu[pos].item() if pos < len(h2o_cpu) else 0
                 log.write(f"    {i+1:2d}. pos={pos:5d}  lw={val:.4f}  h2o={h2o_val:.4f}\n")
-            log.write(f"  LW stats: min={lw_cpu.min():.4f}, max={lw_cpu.max():.4f}, mean={lw_cpu.mean():.4f}\n\n")
+            n_zero_lw = (lw_cpu == 0).sum().item()
+            log.write(f"  LW stats: min={lw_cpu.min():.4f}, max={lw_cpu.max():.4f}, mean={lw_cpu.mean():.4f}\n")
+            log.write(f"  Tokens with ZERO normalized score: {n_zero_lw} ({100*n_zero_lw/q_len:.1f}%)\n\n")
 
             # 3. Compare H2O vs LW rankings
             log.write(f"H2O vs LANDMARK WALKER COMPARISON:\n")

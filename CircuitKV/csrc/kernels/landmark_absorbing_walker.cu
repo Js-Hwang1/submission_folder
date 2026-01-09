@@ -266,18 +266,21 @@ __global__ void landmark_absorbing_walker_kernel(
 }
 
 // =============================================================================
-// Normalization Kernel: Reachability-Based (Updated for Landmark Absorption)
+// Normalization Kernel: Segment-Aware (FIXED for Landmark Absorption)
 // =============================================================================
 
 /**
- * Normalize visit counts by reachable walker count.
+ * Normalize visit counts by SEGMENT-AWARE reachable walker count.
  *
- * With landmark absorption, a position p can only be visited by walkers from
- * sources that are:
- *   1. Later than p (source_pos > p)
- *   2. Not blocked by an intervening landmark
+ * KEY INSIGHT: With landmark absorption, position p can only be reached by:
+ *   1. The NEXT landmark after p (walkers from further landmarks absorb earlier)
+ *   2. Query walkers (with probability of reaching based on distance)
  *
- * Simplified version: Just count sources > p (ignoring blocking for now)
+ * For position p between landmarks L_i and L_{i+1}:
+ *   - Only L_{i+1} walkers can reach p (L_{i+2}, L_{i+3}, ... absorb at L_{i+1})
+ *   - Query contribution is reduced by number of landmarks between query and p
+ *
+ * This fixes the over-estimation bug where we counted ALL landmarks > p.
  */
 __global__ void landmark_reachability_normalize_kernel(
     const int32_t* __restrict__ visit_counts,
@@ -298,26 +301,55 @@ __global__ void landmark_reachability_normalize_kernel(
         return;
     }
 
-    // Count walkers that could potentially reach this position
-    float total_reachable = 0.0f;
-
-    // From landmarks
+    // Find the NEXT landmark after this position (first landmark > idx)
+    int next_landmark_pos = seq_len;  // Default: query position
+    int next_landmark_idx = -1;
     for (int lm = 0; lm < num_landmarks; ++lm) {
-        if (landmark_positions[lm] > idx) {
-            total_reachable += (float)walkers_per_source;
+        if (landmark_positions[lm] > idx && landmark_positions[lm] < next_landmark_pos) {
+            next_landmark_pos = landmark_positions[lm];
+            next_landmark_idx = lm;
         }
     }
 
-    // From query (always at seq_len - 1)
-    if (seq_len - 1 > idx) {
-        total_reachable += (float)walkers_per_source * query_boost;
+    // Count reachable walkers (SEGMENT-AWARE)
+    float total_reachable = 0.0f;
+
+    // From the NEXT landmark only (others absorb before reaching us)
+    if (next_landmark_idx >= 0) {
+        total_reachable += (float)walkers_per_source;
     }
 
-    // Normalize
+    // From query: Query can reach if it's the next source OR if it passes through
+    // Query position is always seq_len - 1
+    int query_pos = seq_len - 1;
+    if (query_pos > idx) {
+        if (next_landmark_idx < 0 || query_pos < next_landmark_pos) {
+            // Query is closer than any landmark - full contribution
+            total_reachable += (float)walkers_per_source * query_boost;
+        } else {
+            // Query is farther than next landmark
+            // Query walkers have probability of reaching based on random walk
+            // Use a decay factor based on number of landmarks between query and position
+            int landmarks_between = 0;
+            for (int lm = 0; lm < num_landmarks; ++lm) {
+                if (landmark_positions[lm] > idx && landmark_positions[lm] < query_pos) {
+                    landmarks_between++;
+                }
+            }
+            // Each landmark has ~50% chance of absorbing, so decay by 0.5^n
+            // But clamp to reasonable minimum
+            float query_reach_prob = fmaxf(0.1f, powf(0.5f, (float)landmarks_between));
+            total_reachable += (float)walkers_per_source * query_boost * query_reach_prob;
+        }
+    }
+
+    // Normalize with minimum floor to avoid division issues
     if (total_reachable > 1e-8f) {
         normalized_scores[idx] = (float)visit_counts[idx] / total_reachable;
     } else {
-        normalized_scores[idx] = 0.0f;
+        // Fallback: use raw visit count scaled by total walkers
+        float total_walkers = (float)(num_landmarks + 1) * walkers_per_source;
+        normalized_scores[idx] = (float)visit_counts[idx] / total_walkers;
     }
 }
 
