@@ -293,6 +293,13 @@ public:
      */
     torch::Tensor get_influence_scores();
 
+    /**
+     * DEBUG: Get raw influence visits before normalization.
+     *
+     * @return Tensor of shape [seq_len] with raw visit counts (float32)
+     */
+    torch::Tensor get_influence_raw_visits();
+
 private:
     // Configuration
     int max_seq_len_;

@@ -1322,42 +1322,51 @@ class CircuitKVCluster():
                 log.write(f"    {i+1:2d}. pos={pos:5d}  h2o={val:.4f}\n")
             log.write(f"  H2O stats: min={h2o_cpu.min():.4f}, max={h2o_cpu.max():.4f}, mean={h2o_cpu.mean():.4f}\n\n")
 
-            # 2. Landmark Positions (NEW DEBUG)
+            # 2. Influence Walker Raw Visits (v1.0.1 DEBUG)
             try:
-                landmark_pos = self._graph.get_landmark_positions().cpu().tolist()
-                log.write(f"LANDMARK POSITIONS ({len(landmark_pos)} landmarks):\n")
-                log.write(f"  Positions: {landmark_pos}\n")
-                if len(landmark_pos) >= 2:
-                    spacings = [landmark_pos[i+1] - landmark_pos[i] for i in range(len(landmark_pos)-1)]
-                    log.write(f"  Spacings: min={min(spacings)}, max={max(spacings)}, avg={sum(spacings)/len(spacings):.1f}\n")
-                log.write("\n")
-            except Exception as e:
-                log.write(f"LANDMARK POSITIONS: Failed to get ({e})\n\n")
-
-            # 3. Raw Visit Counts (NEW DEBUG)
-            try:
-                raw_visits = self._graph.get_landmark_absorbing_raw_visits()[:q_len].cpu()
+                raw_visits = self._graph.get_influence_raw_visits()[:q_len].cpu()
                 n_zero = (raw_visits == 0).sum().item()
                 n_nonzero = (raw_visits > 0).sum().item()
-                log.write(f"RAW VISIT COUNTS (before normalization):\n")
+                log.write(f"INFLUENCE WALKER RAW VISITS (v1.0.1 - unweighted):\n")
                 log.write(f"  Tokens with ZERO visits: {n_zero} ({100*n_zero/q_len:.1f}%)\n")
                 log.write(f"  Tokens with non-zero visits: {n_nonzero} ({100*n_nonzero/q_len:.1f}%)\n")
-                log.write(f"  Total visits: {raw_visits.sum().item()}\n")
-                log.write(f"  Visit stats: min={raw_visits.min().item()}, max={raw_visits.max().item()}, mean={raw_visits.float().mean().item():.2f}\n")
+                log.write(f"  Total visits: {raw_visits.sum().item():.0f}\n")
+                log.write(f"  Visit stats: min={raw_visits.min().item():.0f}, max={raw_visits.max().item():.0f}, mean={raw_visits.mean().item():.2f}\n")
+
                 # Top 10 by raw visits
-                raw_topk_vals, raw_topk_idx = torch.topk(raw_visits.float(), min(10, q_len))
+                raw_topk_vals, raw_topk_idx = torch.topk(raw_visits, min(10, q_len))
                 log.write(f"  Top 10 by raw visits:\n")
                 for i, (pos, val) in enumerate(zip(raw_topk_idx.tolist(), raw_topk_vals.tolist())):
-                    log.write(f"    {i+1:2d}. pos={pos:5d}  raw_visits={int(val)}\n")
+                    log.write(f"    {i+1:2d}. pos={pos:5d}  raw_visits={val:.0f}\n")
+
+                # Bottom 10 by raw visits (to see if early positions are reached)
+                raw_bottomk_vals, raw_bottomk_idx = torch.topk(raw_visits, min(10, q_len), largest=False)
+                log.write(f"  Bottom 10 by raw visits:\n")
+                for i, (pos, val) in enumerate(zip(raw_bottomk_idx.tolist(), raw_bottomk_vals.tolist())):
+                    log.write(f"    {i+1:2d}. pos={pos:5d}  raw_visits={val:.0f}\n")
+
+                # Distribution by position (early vs late)
+                early_visits = raw_visits[:q_len//4].sum().item()
+                mid_visits = raw_visits[q_len//4:q_len//2].sum().item()
+                late_mid_visits = raw_visits[q_len//2:3*q_len//4].sum().item()
+                late_visits = raw_visits[3*q_len//4:].sum().item()
+                total_v = raw_visits.sum().item()
+                log.write(f"  Visit distribution by position quartile:\n")
+                log.write(f"    Q1 (0-{q_len//4}): {early_visits:.0f} ({100*early_visits/max(total_v,1):.1f}%)\n")
+                log.write(f"    Q2 ({q_len//4}-{q_len//2}): {mid_visits:.0f} ({100*mid_visits/max(total_v,1):.1f}%)\n")
+                log.write(f"    Q3 ({q_len//2}-{3*q_len//4}): {late_mid_visits:.0f} ({100*late_mid_visits/max(total_v,1):.1f}%)\n")
+                log.write(f"    Q4 ({3*q_len//4}-{q_len}): {late_visits:.0f} ({100*late_visits/max(total_v,1):.1f}%)\n")
                 log.write("\n")
             except Exception as e:
-                log.write(f"RAW VISIT COUNTS: Failed to get ({e})\n\n")
+                import traceback
+                log.write(f"INFLUENCE RAW VISITS: Failed to get ({e})\n")
+                log.write(f"  Traceback: {traceback.format_exc()}\n\n")
 
-            # 4. Landmark Walker Scores Analysis (normalized)
+            # 4. Influence Walker Scores Analysis (normalized)
             lw_cpu = landmark_scores[:q_len].cpu()
             lw_top_k = 30
             lw_topk_vals, lw_topk_idx = torch.topk(lw_cpu, min(lw_top_k, q_len))
-            log.write(f"LANDMARK WALKER SCORES (reachability normalized):\n")
+            log.write(f"INFLUENCE WALKER SCORES (max normalized):\n")
             log.write(f"  Top {lw_top_k} positions by LW score:\n")
             for i, (pos, val) in enumerate(zip(lw_topk_idx.tolist(), lw_topk_vals.tolist())):
                 h2o_val = h2o_cpu[pos].item() if pos < len(h2o_cpu) else 0
@@ -1366,8 +1375,8 @@ class CircuitKVCluster():
             log.write(f"  LW stats: min={lw_cpu.min():.4f}, max={lw_cpu.max():.4f}, mean={lw_cpu.mean():.4f}\n")
             log.write(f"  Tokens with ZERO normalized score: {n_zero_lw} ({100*n_zero_lw/q_len:.1f}%)\n\n")
 
-            # 3. Compare H2O vs LW rankings
-            log.write(f"H2O vs LANDMARK WALKER COMPARISON:\n")
+            # 3. Compare H2O vs Influence Walker rankings
+            log.write(f"H2O vs INFLUENCE WALKER COMPARISON:\n")
             h2o_rank = torch.argsort(h2o_cpu, descending=True)
             lw_rank = torch.argsort(lw_cpu, descending=True)
 
@@ -1813,7 +1822,7 @@ def init_circuitkv(self):
         if not hasattr(self.config, 'num_steps'):
             self.config.num_steps = 100  # MAX_STEPS for safety timeout (legacy)
         if not hasattr(self.config, 'max_steps'):
-            self.config.max_steps = 10  # v1.0.0: 10 steps per walker (matches oracle)
+            self.config.max_steps = 50  # v1.0.1: increased from 10 to reach distant tokens
         # Capacitive model parameter
         if not hasattr(self.config, 'decay'):
             self.config.decay = 0.99  # EMA decay for charge accumulation

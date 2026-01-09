@@ -1297,4 +1297,26 @@ torch::Tensor CircuitGraph::get_influence_scores() {
     return scores;
 }
 
+torch::Tensor CircuitGraph::get_influence_raw_visits() {
+    // Synchronize sidecar stream to ensure all operations complete
+    CUDA_CHECK(cudaStreamSynchronize(sidecar_stream_));
+
+    // Create output tensor on GPU
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(torch::kCUDA);
+
+    torch::Tensor visits = torch::empty({current_seq_len_}, options);
+
+    // Copy raw visits (before normalization)
+    CUDA_CHECK(cudaMemcpy(
+        visits.data_ptr<float>(),
+        influence_visits_,
+        current_seq_len_ * sizeof(float),
+        cudaMemcpyDeviceToDevice
+    ));
+
+    return visits;
+}
+
 }  // namespace circuit_kv

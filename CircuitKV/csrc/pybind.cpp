@@ -299,10 +299,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         Returns:
             Tensor of shape [seq_len] with normalized influence scores.
         )pbdoc"
+    )
+    .def("get_influence_raw_visits", &CircuitGraph::get_influence_raw_visits,
+        R"pbdoc(
+        DEBUG: Get raw influence visit counts before normalization.
+
+        Returns:
+            Tensor of shape [seq_len] with raw visit counts (float32).
+        )pbdoc"
     );
 
     // Version info
-    m.attr("__version__") = "1.0.0";  // Causal Influence Propagation - VALIDATED BY PoC5
+    m.attr("__version__") = "1.0.1";  // Fix: unweighted visits
 }
 
 }  // namespace circuit_kv
