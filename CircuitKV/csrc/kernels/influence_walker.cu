@@ -1,37 +1,31 @@
 /**
- * Causal Influence Propagation Walker (v1.0.5)
- *
- * VALIDATED BY PoC5:
- *   - Influence vs Gen Attn: Spearman r = 0.4085 (H2O: -0.02)
- *   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
- *   - Walker approximates Influence Oracle: Spearman r = 0.94
+ * Causal Influence Propagation Walker (v1.0.6)
  *
  * ALGORITHM:
- *   1. Start all walkers at generation position (current_idx)
+ *   1. MULTI-SOURCE: 50% walkers start at query, 50% start at random positions
  *   2. At each step, sample next from A[pos, sink_size:pos+1] (EXCLUDE SINK)
- *   3. Visit count = unweighted, but SKIP STEP 0 (direct attention = H2O)
+ *   3. Visit count = unweighted for ALL steps (count from step 0)
  *   4. Normalize by POSITIONAL OPPORTUNITY to counteract early-position bias
  *
  * KEY INSIGHT:
- *   This measures "How much can each token INFLUENCE the generation position
- *   through MULTI-HOP attention paths?" - the key differentiator from H2O.
+ *   Single-source walks (all from query) can't reach middle positions because
+ *   attention paths don't go there. Multi-source walks ensure COVERAGE of all
+ *   regions while staying purely attention-based.
  *
- * v1.0.5 FIX - "Positional Opportunity Normalization":
- *   Problem: Early positions have inherent advantage - they can be visited from
- *   MORE later positions. Position 4 can be reached from 4962 positions, while
- *   position 4000 can only be reached from 966 positions.
+ * v1.0.6 FIX - "Multi-Source Walks":
+ *   Problem: Walkers starting at query follow attention backward. The attention
+ *   path goes: Query → Early (template) or Query → Very Late (local attention).
+ *   Middle positions (few-shot examples) are UNREACHABLE - they get 0 visits
+ *   regardless of positional normalization.
  *
- *   This causes TREC to fail: few-shot examples (middle positions) get evicted
- *   because they have fewer visit OPPORTUNITIES, not because they're unimportant.
+ *   Solution: Start 50% of walkers at RANDOM positions throughout the sequence.
+ *   This ensures coverage while staying attention-based (no hybrid with H2O).
  *
- *   Solution: Normalize visits by positional opportunity:
- *     adjusted_score[p] = visits[p] / sqrt(seq_len - p)
- *
- *   Using sqrt() for gentler correction (full linear would over-correct).
+ *   - Walker IDs 0 to num_walkers/2 - 1: Start at query (current_idx)
+ *   - Walker IDs num_walkers/2 to num_walkers - 1: Start at random positions
  *
  * DIRECTION:
  *   Walk ALONG A (not A^T). A[i,j] = how much position i attends to j.
- *   Walker moves: query → hop1 (not counted) → hop2+ (counted) → ...
  */
 
 #include <cuda_runtime.h>
@@ -47,16 +41,17 @@ constexpr int INFLUENCE_DEFAULT_MAX_STEPS = 10;
 constexpr int INFLUENCE_DEFAULT_SINK_SIZE = 4;
 
 /**
- * Influence Walker Kernel (v1.0.5 - Positional Opportunity Normalization)
+ * Influence Walker Kernel (v1.0.6 - Multi-Source Walks)
  *
- * Each thread runs one walker. Walkers start at current_idx (generation position)
- * and walk through attention for max_steps, ONLY among non-sink positions.
+ * Each thread runs one walker. 50% start at current_idx (query), 50% start at
+ * random positions in [sink_size, current_idx]. All walk through attention
+ * for max_steps, ONLY among non-sink positions.
  *
- * v1.0.5: Visits are later normalized by positional opportunity to counteract
- * the inherent advantage of early positions in random walks.
+ * v1.0.6: Multi-source walks ensure coverage of ALL regions while staying
+ * purely attention-based. Positional normalization counteracts early bias.
  *
  * @param attention      Full attention matrix [seq_len, seq_len], row-major
- * @param visits         Output: visit counts [seq_len] (only from step 1+)
+ * @param visits         Output: visit counts [seq_len] (all steps)
  * @param rng_states     RNG states [num_walkers] as PCGState structs
  * @param seq_len        Sequence length
  * @param current_idx    Generation position (walker start)
@@ -80,8 +75,28 @@ __global__ void influence_walker_kernel(
     // Load RNG state for this walker
     PCGState rng = rng_states[walker_id];
 
-    // Start at generation position
-    int pos = current_idx;
+    // v1.0.6: Multi-Source Walks
+    // - Walker IDs 0 to num_walkers/2 - 1: Start at query (current_idx)
+    // - Walker IDs num_walkers/2 to num_walkers - 1: Start at random positions
+    int pos;
+    int half_walkers = num_walkers / 2;
+
+    if (walker_id < half_walkers) {
+        // Query-start walker
+        pos = current_idx;
+    } else {
+        // Random-start walker: sample from [sink_size, current_idx] inclusive
+        int num_valid_starts = current_idx - sink_size + 1;
+        if (num_valid_starts <= 0) {
+            // Edge case: if current_idx <= sink_size, no valid random starts
+            pos = current_idx;
+        } else {
+            int rand_offset = (int)(pcg_uniform(&rng) * num_valid_starts);
+            // Clamp to avoid edge case where rand = 1.0
+            if (rand_offset >= num_valid_starts) rand_offset = num_valid_starts - 1;
+            pos = sink_size + rand_offset;
+        }
+    }
 
     // Walk for max_steps, sampling only among non-sink positions
     for (int step = 0; step < max_steps; step++) {
@@ -120,12 +135,10 @@ __global__ void influence_walker_kernel(
             next_pos = j;  // Handle numerical precision at end
         }
 
-        // v1.0.4: Only count visits from step >= 1 (skip first step)
-        // Step 0 is query → first hop (direct attention, same as H2O)
-        // Steps 1+ are multi-hop influence (what we want to capture)
-        if (step > 0) {
-            atomicAdd(&visits[next_pos], 1.0f);
-        }
+        // v1.0.6: Count visits from ALL steps (including step 0)
+        // With multi-source walks, step 0 is meaningful for random-start walkers
+        // and query-start walkers benefit from the combined signal
+        atomicAdd(&visits[next_pos], 1.0f);
 
         // Move to next position
         pos = next_pos;

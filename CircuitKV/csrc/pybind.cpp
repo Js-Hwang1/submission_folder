@@ -310,7 +310,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "1.0.5";  // Fix: positional opportunity normalization
+    m.attr("__version__") = "1.0.6";  // Fix: multi-source walks for coverage
 }
 
 }  // namespace circuit_kv
