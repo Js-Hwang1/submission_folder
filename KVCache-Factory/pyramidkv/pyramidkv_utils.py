@@ -1126,39 +1126,45 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v0.4.0: Stratified Landmarks + Reachability Normalization.
+    CircuitKV v0.5.0: Landmark Absorbing Walker (Landmarks as Sources AND Sinks).
 
-    This class implements multi-source absorbing walks from geographically-diverse
-    landmarks to discover "bridge tokens" that connect the query to important context.
+    This class implements multi-source absorbing walks where landmarks can BOTH
+    source AND absorb walkers, creating a "mesh" of current flows between landmarks.
 
-    Key Innovation (v0.4.0 - Stratified + Reachability):
+    Key Innovation (v0.5.0 - Landmark Absorbing):
     - STRATIFIED landmark selection: Divide sequence into segments, pick best H2O per segment
-    - REACHABILITY normalization: normalized[p] = visits[p] / total_walkers_that_could_reach[p]
-    - 32 landmarks for comprehensive coverage across long sequences
+    - LANDMARKS AS SINKS: Walkers absorb at ANY landmark (not just tokens 0-3)
+    - MESH NETWORK: Creates local current flows between adjacent landmarks
+    - Captures "local bridges" - tokens that connect ADJACENT landmarks
 
-    Why Reachability > Positional:
-    - Positional: normalized[p] = visits[p] / (1/distance^alpha) - assumes uniform walker distribution
-    - Reachability: accounts for actual walker distribution (which sources can reach p)
-    - Bridge tokens between landmarks get proper credit with reachability
+    Physics Analogy:
+    - Old (v0.4.0): Single battery (Query+ to Sink-)
+    - New (v0.5.0): Mesh network where each landmark can source or sink current
+
+    Why Landmark Absorbing > Standard Walker:
+    - Standard: All walkers flow to tokens 0-3 (single sink)
+    - Absorbing: Walkers stop at nearest landmark, capturing LOCAL importance
+    - Bridge tokens between L1 and L2 get visits from BOTH directions
 
     Algorithm:
     1. Compute full attention matrix from query/key states
     2. STRATIFIED landmark selection: one landmark per segment, best H2O within segment
     3. Launch walkers from ALL sources (landmarks + query) in parallel
-    4. Apply REACHABILITY normalization: score[p] = visits[p] / total_reachable[p]
-    5. Select top tokens by normalized scores for KV cache retention
+    4. Walkers ABSORB at any landmark (or sink tokens 0-3)
+    5. Apply reachability normalization: score[p] = visits[p] / total_reachable[p]
+    6. Select top tokens by normalized scores for KV cache retention
 
     Particularly effective for:
     - Multi-hop reasoning (HotpotQA, 2WikiMQA)
     - Long document QA (NarrativeQA, Qasper)
-    - Cases where important tokens are not directly attended by the query
+    - Cases where important tokens are LOCAL bridges between landmarks
 
-    Configuration (v0.4.0 defaults - WINNING from PoC ablation):
+    Configuration (v0.5.0 defaults):
     - num_landmarks: Number of diverse landmarks (default: 32)
     - min_spacing: Minimum segment size for stratified (default: 50)
     - walkers_per_source: Walkers launched from each source (default: 100)
     - query_boost: Weight multiplier for query-sourced walkers (default: 2.0)
-    - use_reachability: Use reachability normalization (default: False, positional norm)
+    - absorb_at_landmarks: If True (default), landmarks absorb walkers (NEW behavior)
     """
 
     def __init__(
@@ -1188,8 +1194,10 @@ class CircuitKVCluster():
         min_spacing: int = 50,  # Minimum segment size for stratified sampling
         walkers_per_source: int = 100,  # Walkers per source (landmark/query)
         query_boost: float = 2.0,  # Weight multiplier for query-sourced walkers
-        position_alpha: float = 0.6,  # Exponent for positional normalization
-        use_reachability: bool = False,  # False = positional norm (default), True = reachability norm
+        position_alpha: float = 0.6,  # Exponent for positional normalization (unused in v0.5.0)
+        use_reachability: bool = False,  # Unused in v0.5.0 (always uses reachability internally)
+        # v0.5.0: Landmark Absorbing Walker
+        absorb_at_landmarks: bool = True,  # True = landmarks absorb walkers (NEW), False = old behavior
         # Debug logging
         debug: bool = False,
     ):
@@ -1215,6 +1223,8 @@ class CircuitKVCluster():
         self.query_boost = query_boost
         self.position_alpha = position_alpha
         self.use_reachability = use_reachability
+        # v0.5.0: Landmark Absorbing
+        self.absorb_at_landmarks = absorb_at_landmarks
         # Debug
         self.debug = debug
         self._debug_log = None
@@ -1679,23 +1689,23 @@ class CircuitKVCluster():
             full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
-        # STEP 2: Run Landmark Walker (CUDA kernel)
+        # STEP 2: Run Landmark Absorbing Walker (CUDA kernel) - v0.5.0
         # =====================================================================
         current_idx = q_len - 1
 
-        self._graph.update_and_step_landmark_walker(
+        # v0.5.0: Use Landmark Absorbing Walker (landmarks as sources AND sinks)
+        self._graph.update_and_step_landmark_absorbing_walker(
             full_attn.contiguous(),
             current_idx,
             self.num_landmarks,
             self.walkers_per_source,
             self.query_boost,
             self.min_spacing,
-            self.position_alpha,
-            self.use_reachability,
+            self.absorb_at_landmarks,  # True = landmarks absorb walkers (NEW behavior)
         )
 
-        # Get normalized scores from landmark walker
-        scores = self._graph.get_landmark_scores()
+        # Get normalized scores from landmark absorbing walker (v0.5.0)
+        scores = self._graph.get_landmark_absorbing_scores()
 
         # =====================================================================
         # STEP 3: EVICTION BASED ON LANDMARK WALKER SCORES
@@ -1739,7 +1749,7 @@ class CircuitKVCluster():
 
 
 def init_circuitkv(self):
-    """Initialize CircuitKV cluster with Stratified + Reachability (v0.4.0)."""
+    """Initialize CircuitKV cluster with Landmark Absorbing Walker (v0.5.0)."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 64
@@ -1780,7 +1790,10 @@ def init_circuitkv(self):
         if not hasattr(self.config, 'position_alpha'):
             self.config.position_alpha = 0.6  # Exponent for positional normalization
         if not hasattr(self.config, 'use_reachability'):
-            self.config.use_reachability = False  # Positional norm (default)
+            self.config.use_reachability = False  # Unused in v0.5.0
+        # v0.5.0: Landmark Absorbing Walker
+        if not hasattr(self.config, 'absorb_at_landmarks'):
+            self.config.absorb_at_landmarks = True  # True = landmarks absorb walkers (NEW)
         # Debug logging
         if not hasattr(self.config, 'circuitkv_debug'):
             self.config.circuitkv_debug = False
@@ -1805,6 +1818,8 @@ def init_circuitkv(self):
         query_boost=self.config.query_boost,
         position_alpha=self.config.position_alpha,
         use_reachability=self.config.use_reachability,
+        # v0.5.0: Landmark Absorbing Walker
+        absorb_at_landmarks=self.config.absorb_at_landmarks,
         # Debug
         debug=self.config.circuitkv_debug,
     )
