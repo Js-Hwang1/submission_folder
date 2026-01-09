@@ -1159,8 +1159,8 @@ class CircuitKVCluster():
     - Long document QA (NarrativeQA, Qasper)
     - Cases where important tokens are LOCAL bridges between landmarks
 
-    Configuration (v0.5.0 defaults):
-    - num_landmarks: Number of diverse landmarks (default: 32)
+    Configuration (v0.5.3 defaults - High pass-through diffusion):
+    - num_landmarks: Number of diverse landmarks (default: 8, fewer for global reach)
     - min_spacing: Minimum segment size for stratified (default: 50)
     - walkers_per_source: Walkers launched from each source (default: 100)
     - query_boost: Weight multiplier for query-sourced walkers (default: 2.0)
@@ -1189,8 +1189,8 @@ class CircuitKVCluster():
         # Spectral + Walker + MAX mode (v0.2.0)
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
-        # Landmark Walker parameters (v0.4.0 - Stratified + Reachability)
-        num_landmarks: int = 32,  # Number of diverse landmarks (32 for comprehensive coverage)
+        # Landmark Walker parameters (v0.5.3 - High pass-through diffusion)
+        num_landmarks: int = 8,  # Fewer landmarks for better global reach with 90% pass-through
         min_spacing: int = 50,  # Minimum segment size for stratified sampling
         walkers_per_source: int = 100,  # Walkers per source (landmark/query)
         query_boost: float = 2.0,  # Weight multiplier for query-sourced walkers
@@ -1811,9 +1811,9 @@ def init_circuitkv(self):
         # RC+B: Bidirectional Circuit Walks (disabled - hurt narrativeqa score)
         if not hasattr(self.config, 'bidirectional'):
             self.config.bidirectional = False
-        # Landmark Walker parameters (v0.4.0 - Stratified + Reachability)
+        # Landmark Walker parameters (v0.5.3 - High pass-through diffusion)
         if not hasattr(self.config, 'num_landmarks'):
-            self.config.num_landmarks = 32  # 32 for comprehensive coverage
+            self.config.num_landmarks = 8  # Fewer landmarks for global reach with 90% pass-through
         if not hasattr(self.config, 'min_spacing'):
             self.config.min_spacing = 50  # Min segment size for stratified
         if not hasattr(self.config, 'walkers_per_source'):

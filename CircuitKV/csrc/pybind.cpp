@@ -202,36 +202,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("update_and_step_landmark_absorbing_walker", &CircuitGraph::update_and_step_landmark_absorbing_walker,
         py::arg("attention_matrix"),
         py::arg("current_idx"),
-        py::arg("num_landmarks") = 32,
+        py::arg("num_landmarks") = 8,
         py::arg("walkers_per_source") = 100,
         py::arg("query_boost") = 2.0f,
         py::arg("min_spacing") = 50,
         py::arg("absorb_at_landmarks") = true,
         R"pbdoc(
-        Landmark Absorbing Walker: Landmarks are BOTH sources AND sinks (v0.5.0).
+        Landmark Absorbing Walker v0.5.3: High pass-through diffusion.
 
-        NEW APPROACH:
-            Instead of all walkers flowing to tokens 0-3, walkers absorb at
-            ANY landmark (or sink). This creates a "mesh" of current flows
-            between landmarks, potentially capturing local bridge tokens better.
+        APPROACH:
+            - 8 landmarks (fewer for global reach)
+            - 90% pass-through (only 10% absorb at landmarks)
+            - Enables true transitive flow: A→B→C→...→Sink
 
-        Physics Analogy:
-            - Old: Single battery (Query+ to Sink-)
-            - New: Mesh network where each landmark can source or sink current
-
-        Key Benefit:
-            Captures "local bridges" - tokens that connect ADJACENT landmarks.
-            A token between landmarks L1 and L2 gets visits from both directions.
+        With 0.9^8 ≈ 0.43, walkers from query can reach ~43% of all positions,
+        enabling genuine "diffusion" across the sequence.
 
         Args:
             attention_matrix: Full attention matrix [seq_len, seq_len], FP32.
             current_idx: Current token index (query position).
-            num_landmarks: Number of landmarks to select (default 32).
+            num_landmarks: Number of landmarks to select (default 8).
             walkers_per_source: Walkers per source (default 100).
             query_boost: Weight multiplier for query walkers (default 2.0).
             min_spacing: Minimum segment size for stratified selection (default 50).
-            absorb_at_landmarks: If true (default), landmarks absorb walkers (NEW behavior).
-                                 If false, old behavior (only sink absorbs).
+            absorb_at_landmarks: If true (default), landmarks have 10% absorb chance.
         )pbdoc"
     )
     .def("get_landmark_absorbing_scores", &CircuitGraph::get_landmark_absorbing_scores,
@@ -262,7 +256,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "0.5.2";  // Soft absorption (50%) + optimized normalization
+    m.attr("__version__") = "0.5.3";  // High pass-through (90%) + 8 landmarks for global diffusion
 }
 
 }  // namespace circuit_kv
