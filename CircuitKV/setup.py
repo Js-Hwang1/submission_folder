@@ -23,6 +23,7 @@ def get_extensions():
         "csrc/kernels/circuit_walker.cu",
         "csrc/kernels/spectral_power.cu",
         "csrc/kernels/landmark_walker.cu",
+        "csrc/kernels/landmark_absorbing_walker.cu",  # v0.5.0: Landmark Absorbing
     ]
 
     # Include directories (absolute paths required for compiler)
@@ -64,7 +65,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="0.2.0",
+    version="0.5.0",
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",
