@@ -4,7 +4,7 @@ results/
 Poc/
 LANDMARK_WALKER_DESIGN.md
 longbench_CKV_dbg.log
-
+stash.py
 # =============================================================================
 # CircuitKV Build Artifacts - MUST be excluded for fresh builds on clone
 # =============================================================================

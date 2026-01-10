@@ -198,11 +198,16 @@ def main(args):
             prompt = template.format(**example)
 
             # Apply chat template for instruct models
-            if "instruct" in args.model_path.lower() or "chat" in args.model_path.lower():
-                prompt = build_chat(prompt, args.model_path)
-            # Legacy: also apply for llama2 without explicit instruct tag
-            elif "llama2" in args.model_path.lower() or "llama-2" in args.model_path.lower():
-                prompt = build_chat(prompt, args.model_path)
+            # EXCEPTION: Few-shot classification tasks (trec, lsht) work better WITHOUT
+            # chat template as they rely on pattern completion, not conversational response
+            few_shot_classification = args.dataset in ["trec", "lsht"]
+
+            if not few_shot_classification:
+                if "instruct" in args.model_path.lower() or "chat" in args.model_path.lower():
+                    prompt = build_chat(prompt, args.model_path)
+                # Legacy: also apply for llama2 without explicit instruct tag
+                elif "llama2" in args.model_path.lower() or "llama-2" in args.model_path.lower():
+                    prompt = build_chat(prompt, args.model_path)
 
             example["prompt"] = prompt
                 
