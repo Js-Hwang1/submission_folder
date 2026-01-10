@@ -1126,48 +1126,38 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v1.0.0: Causal Influence Propagation (VALIDATED BY PoC5).
+    CircuitKV v2.0.0: MAX(H2O, Influence) with Rank Normalization.
 
-    This class implements single-source weighted random walks that measure how much
-    each token can INFLUENCE the generation position through multi-hop attention.
+    This class implements a hedging strategy that combines:
+    - H2O: Column sums of attention matrix (good for simple retrieval tasks)
+    - Influence: Absorbing random walks (good for multi-hop reasoning tasks)
 
-    VALIDATED BY PoC5:
-        - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
-        - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
-        - Walker approximates Influence Oracle: Spearman r = 0.94
+    Key Innovation (v2.0.0 - MAX Combination):
+    - RANK NORMALIZATION: Both H2O and Influence scores are rank-normalized to [0,1]
+    - MAX COMBINATION: score[j] = max(h2o_rank[j], influence_rank[j])
+    - HEDGING: Token is kept if EITHER force wants it (robust across task types)
 
-    Key Innovation (v1.0.0 - Causal Influence):
-    - SINGLE SOURCE: All walkers start at generation position (current_idx)
-    - WEIGHTED VISITS: Visit weight = cumulative product of attention along path
-    - ABSORBING BOUNDARY: Walk stops at sink (first sink_size tokens)
-    - MULTI-HOP INFLUENCE: Captures tokens reachable through attention chains
+    Why MAX > Individual Methods:
+    - H2O excels at NarrativeQA-style simple retrieval (popularity matters)
+    - Influence excels at HotpotQA-style multi-hop reasoning (path matters)
+    - MAX captures the union of both - works well on BOTH task types
 
     Physics Analogy:
-    - Influence = "How much current flows FROM token j TO generation position T?"
-    - High influence = token is on many attention paths to T
-    - This correlates with actual generation attention MUCH better than H2O
-
-    Why Influence > H2O:
-    - H2O measures degree (popularity) - how many tokens attend to j
-    - Influence measures reachability - can j reach T through attention chains?
-    - Question tokens are HIGH influence (close to T), H2O misses them completely
+    - H2O = Mass (how popular is this token?)
+    - Influence = Path (can this token reach the query through attention chains?)
+    - MAX = Gravity Walker (keep token if it has high mass OR is on the path)
 
     Algorithm:
     1. Compute full attention matrix from query/key states
-    2. Launch walkers from generation position (current_idx)
-    3. Walk backward through attention: at pos, sample from A[pos, :pos+1]
-    4. Weight visits by cumulative path probability
-    5. Absorb at sink (first sink_size tokens)
-    6. Select top tokens by influence scores for KV cache retention
+    2. Compute H2O scores (column sums)
+    3. Run Influence Walker (absorbing random walks from query to sink)
+    4. Rank normalize both scores to [0, 1]
+    5. Combined score = max(h2o_rank, influence_rank)
+    6. Select top tokens by combined scores for KV cache retention
 
-    Particularly effective for:
-    - QA tasks where question tokens are critical (NarrativeQA, HotpotQA)
-    - Summarization tasks requiring multi-hop reasoning
-    - Long document tasks where recency matters
-
-    Configuration (v1.0.0 defaults - Validated by PoC5):
-    - num_walkers: Number of walkers (default: 10000, validated)
-    - max_steps: Max steps per walker (default: 10, matches oracle)
+    Configuration:
+    - num_walkers: Number of walkers for influence (default: 10000)
+    - max_steps: Max steps per walker (default: 10)
     - sink_size: Absorbing boundary (default: 4)
     """
 
@@ -1447,6 +1437,25 @@ class CircuitKVCluster():
                     "Install with: pip install -e ./CircuitKV"
                 )
 
+    def _rank_normalize(self, scores: torch.Tensor) -> torch.Tensor:
+        """
+        Rank-based normalization to [0, 1].
+
+        Converts raw scores to uniform distribution based on ranking.
+        This ensures H2O and Influence are on equal footing regardless of scale.
+
+        Args:
+            scores: Raw scores [seq_len]
+
+        Returns:
+            Rank-normalized scores in [0, 1]
+        """
+        ranks = torch.argsort(torch.argsort(scores)).float()
+        n = len(scores)
+        if n <= 1:
+            return torch.ones_like(ranks)
+        return ranks / (n - 1)
+
     def _get_keep_mask(self, scores: torch.Tensor, budget: int, seq_len: int) -> torch.Tensor:
         """
         Get a boolean mask indicating which tokens to keep.
@@ -1664,7 +1673,7 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        print(f"CircuitKV (LandmarkWalker) max_capacity_prompt {self.max_capacity_prompt}")
+        print(f"CircuitKV (MAX: H2O + Influence) max_capacity_prompt {self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -1756,10 +1765,30 @@ class CircuitKVCluster():
         )
 
         # Get normalized scores from influence walker (v1.0.0)
-        scores = self._graph.get_influence_scores()
+        influence_scores = self._graph.get_influence_scores()
 
         # =====================================================================
-        # STEP 3: EVICTION BASED ON LANDMARK WALKER SCORES
+        # STEP 2b: MAX(H2O, Influence) with Rank Normalization
+        # - H2O = column sums (good for NarrativeQA-style simple retrieval)
+        # - Influence = walker scores (good for HotpotQA-style multi-hop)
+        # - MAX = hedging strategy that works for both
+        # =====================================================================
+        # Compute H2O scores (column sums)
+        h2o_scores = full_attn.sum(dim=0)  # [seq_len]
+
+        # Rank normalize both to [0, 1] (puts them on equal footing)
+        h2o_rank = self._rank_normalize(h2o_scores[:q_len])
+        influence_rank = self._rank_normalize(influence_scores[:q_len])
+
+        # MAX combination: keeps token if EITHER force wants it
+        combined_scores = torch.maximum(h2o_rank, influence_rank)
+
+        # Expand to full buffer size
+        scores = torch.zeros_like(influence_scores)
+        scores[:q_len] = combined_scores
+
+        # =====================================================================
+        # STEP 3: EVICTION BASED ON MAX(H2O, Influence) SCORES
         # =====================================================================
         # Compute keep mask using static budgeting
         keep_mask = self._get_keep_mask(
@@ -1797,6 +1826,313 @@ class CircuitKVCluster():
         value_states = torch.cat([v_past_compress, v_cur], dim=2)
 
         return key_states, value_states
+
+
+class MaxKVCluster():
+    """
+    MaxKV v1.0.0: MAX(H2O, Influence) with Rank Normalization.
+
+    This class implements the "hedging" strategy discovered in PoC ablation:
+    - H2O captures "Heavy Hitters" (popular tokens, good for NarrativeQA)
+    - Influence captures "Reasoning Bridges" (path-critical tokens, good for HotpotQA)
+    - MAX combination is robust across BOTH task types
+
+    Key Innovation:
+    - Rank normalization ensures both signals are on equal footing
+    - MAX(rank_h2o, rank_influence) keeps tokens important to EITHER method
+    - No tuning needed: works across all LongBench tasks
+
+    Algorithm:
+    1. Compute H2O scores (column sums of attention)
+    2. Compute Influence scores (absorbing random walk from query)
+    3. Rank-normalize both to [0, 1]
+    4. Score[j] = max(rank_h2o[j], rank_influence[j])
+    5. Keep top-K by combined score
+
+    Why MAX > Multiplicative Gravity:
+    - Gravity: Score = H2O * Influence - fails when signals conflict
+    - MAX: Score = max(H2O, Influence) - hedges by keeping either signal
+    """
+
+    def __init__(
+        self,
+        window_size: int = 32,
+        max_capacity_prompt: int = 2048,
+        kernel_size: int = 5,
+        pooling: str = 'avgpool',
+        merge=None,
+        # CircuitKV-specific parameters
+        sink_size: int = 4,
+        top_k: int = 32,
+        alpha: float = 0.85,
+        num_walkers: int = 10000,
+        num_steps: int = 100,
+        max_steps: int = 10,
+        # Debug logging
+        debug: bool = False,
+    ):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        self.sink_size = sink_size
+        self.top_k = top_k
+        self.alpha = alpha
+        self.num_walkers = num_walkers
+        self.num_steps = num_steps
+        self.max_steps = max_steps
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+        self.debug = debug
+
+        # Lazy initialization of CUDA graph
+        self._graph = None
+        self._device = None
+        self._max_seq_len = 8192
+
+    def reset(
+        self,
+        window_size: int = 64,
+        max_capacity_prompt: int = 2048,
+        kernel_size: int = 5,
+        pooling: str = 'avgpool',
+        merge=None,
+    ):
+        self.window_size = window_size
+        self.max_capacity_prompt = max_capacity_prompt
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+        self.merge = merge
+        if self._graph is not None:
+            self._graph.reset()
+
+    def _lazy_init(self, device, seq_len: int):
+        """Initialize CUDA graph on first use."""
+        if self._graph is None or self._device != device:
+            try:
+                from circuit_kv import _C as circuit_kv_cuda
+                self._max_seq_len = max(seq_len * 2, 8192)
+                self._graph = circuit_kv_cuda.CircuitGraph(
+                    self._max_seq_len,
+                    self.top_k,
+                    self.alpha,
+                    self.num_walkers,
+                    self.num_steps,
+                )
+                self._device = device
+            except ImportError:
+                raise ImportError(
+                    "CircuitKV CUDA extension not found. "
+                    "Install with: pip install -e ./CircuitKV"
+                )
+
+    def _rank_normalize(self, scores: torch.Tensor) -> torch.Tensor:
+        """Rank-based normalization to [0, 1]."""
+        ranks = torch.argsort(torch.argsort(scores)).float()
+        return ranks / (len(scores) - 1 + 1e-10)
+
+    def _get_keep_mask(self, scores: torch.Tensor, budget: int, seq_len: int) -> torch.Tensor:
+        """Get boolean mask indicating which tokens to keep."""
+        if isinstance(budget, float) and budget <= 1.0:
+            target_count = int(seq_len * budget)
+        else:
+            target_count = int(budget)
+
+        min_required = self.sink_size + self.window_size
+        if target_count < min_required:
+            target_count = min_required
+
+        device = scores.device
+        mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        mask[:self.sink_size] = True
+
+        local_start = max(self.sink_size, seq_len - self.window_size)
+        mask[local_start:] = True
+
+        current_kept = mask.sum().item()
+        remaining_slots = max(0, target_count - current_kept)
+
+        if remaining_slots > 0:
+            scores_masked = scores[:seq_len].clone()
+            scores_masked[mask] = float('-inf')
+
+            k = min(remaining_slots, (~mask).sum().item())
+            if k > 0:
+                _, topk_indices = torch.topk(scores_masked, k)
+                mask[topk_indices] = True
+
+        return mask
+
+    def update_kv(
+        self,
+        key_states: torch.Tensor,
+        query_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask,
+        num_key_value_groups: int,
+    ):
+        """
+        Update KV cache using MAX(H2O, Influence) with rank normalization.
+
+        Algorithm:
+        1. Compute full attention matrix from window queries
+        2. Compute H2O scores (column sums)
+        3. Run Influence walker (CUDA kernel)
+        4. Rank-normalize both scores
+        5. Combined score = MAX(rank_h2o, rank_influence)
+        6. Keep top-K by combined score
+        """
+        assert key_states.shape[-2] == query_states.shape[-2]
+        bsz, num_heads, q_len, head_dim = query_states.shape
+
+        print(f"MaxKV (MAX combination) max_capacity_prompt {self.max_capacity_prompt}")
+
+        if q_len < self.max_capacity_prompt:
+            return key_states, value_states
+
+        self._lazy_init(key_states.device, q_len)
+
+        # =====================================================================
+        # STEP 1: Compute attention matrix
+        # =====================================================================
+        attn_weights = torch.matmul(
+            query_states[..., -self.window_size:, :],
+            key_states.transpose(2, 3)
+        ) / math.sqrt(head_dim)
+
+        mask = torch.full(
+            (self.window_size, self.window_size),
+            torch.finfo(attn_weights.dtype).min,
+            device=attn_weights.device
+        )
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        attn_weights[:, :, :, -self.window_size:] += mask[None, None, :, :]
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        attn_avg = attn_weights.max(dim=1).values.mean(dim=0)
+
+        # Build full attention matrix
+        full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
+        full_attn[-self.window_size:, :] = attn_avg
+
+        n_prefix = q_len - self.window_size
+        if n_prefix > 1:
+            h2o_scores_window = attn_avg.sum(dim=0)
+            h2o_prefix = h2o_scores_window[:n_prefix].clone().clamp(min=1e-6)
+            cumsum = h2o_prefix.cumsum(dim=0)
+            denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
+            denom[1:] = cumsum[:-1]
+            denom[0] = 1.0
+            h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
+            denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
+            h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
+            mask_causal = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
+            full_attn[:n_prefix, :n_prefix] = h2o_trans * mask_causal
+
+        # =====================================================================
+        # STEP 2: Compute H2O scores (column sums)
+        # =====================================================================
+        h2o_scores = full_attn.sum(dim=0)
+
+        # =====================================================================
+        # STEP 3: Run Influence Walker (CUDA kernel)
+        # =====================================================================
+        current_idx = q_len - 1
+        self._graph.update_and_step_influence_walker(
+            full_attn.contiguous(),
+            current_idx,
+            self.num_walkers,
+            self.max_steps,
+            self.sink_size,
+        )
+        influence_scores = self._graph.get_influence_scores()
+
+        # =====================================================================
+        # STEP 4: Rank normalize both and take MAX
+        # =====================================================================
+        h2o_rank = self._rank_normalize(h2o_scores[:q_len])
+        influence_rank = self._rank_normalize(influence_scores[:q_len])
+
+        # MAX combination: robust hedging
+        combined_scores = torch.maximum(h2o_rank, influence_rank)
+
+        # Debug: show contribution breakdown
+        if self.debug:
+            h2o_wins = (h2o_rank >= influence_rank).sum().item()
+            inf_wins = (influence_rank > h2o_rank).sum().item()
+            print(f"  MaxKV: H2O contributes {h2o_wins}/{q_len} ({100*h2o_wins/q_len:.1f}%), "
+                  f"Influence contributes {inf_wins}/{q_len} ({100*inf_wins/q_len:.1f}%)")
+
+        # =====================================================================
+        # STEP 5: Eviction based on MAX scores
+        # =====================================================================
+        keep_mask = self._get_keep_mask(
+            combined_scores,
+            self.max_capacity_prompt,
+            q_len
+        )
+
+        non_local_mask = keep_mask.clone()
+        non_local_mask[-self.window_size:] = False
+        keep_indices = non_local_mask.nonzero(as_tuple=True)[0]
+        num_keep = keep_indices.shape[0]
+
+        indices_expanded = keep_indices.view(1, 1, -1, 1).expand(bsz, num_heads, -1, head_dim)
+
+        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
+        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
+
+        k_cur = key_states[:, :, -self.window_size:, :]
+        v_cur = value_states[:, :, -self.window_size:, :]
+
+        key_states = torch.cat([k_past_compress, k_cur], dim=2)
+        value_states = torch.cat([v_past_compress, v_cur], dim=2)
+
+        return key_states, value_states
+
+
+def init_maxkv(self):
+    """Initialize MaxKV cluster with MAX(H2O, Influence) combination."""
+    if not hasattr(self, "kv_cluster"):
+        if not hasattr(self.config, 'window_size'):
+            self.config.window_size = 64
+        if not hasattr(self.config, 'max_capacity_prompt'):
+            self.config.max_capacity_prompt = 2048
+        if not hasattr(self.config, 'kernel_size'):
+            self.config.kernel_size = 5
+        if not hasattr(self.config, 'pooling'):
+            self.config.pooling = 'avgpool'
+        if not hasattr(self.config, 'merge'):
+            self.config.merge = None
+        if not hasattr(self.config, 'sink_size'):
+            self.config.sink_size = 4
+        if not hasattr(self.config, 'top_k'):
+            self.config.top_k = 32
+        if not hasattr(self.config, 'alpha'):
+            self.config.alpha = 0.85
+        if not hasattr(self.config, 'num_walkers'):
+            self.config.num_walkers = 10000
+        if not hasattr(self.config, 'num_steps'):
+            self.config.num_steps = 100
+        if not hasattr(self.config, 'max_steps'):
+            self.config.max_steps = 10
+        if not hasattr(self.config, 'maxkv_debug'):
+            self.config.maxkv_debug = False
+
+    self.kv_cluster = MaxKVCluster(
+        window_size=self.config.window_size,
+        max_capacity_prompt=self.config.max_capacity_prompt,
+        kernel_size=self.config.kernel_size,
+        pooling=self.config.pooling,
+        merge=self.config.merge,
+        sink_size=self.config.sink_size,
+        top_k=self.config.top_k,
+        alpha=self.config.alpha,
+        num_walkers=self.config.num_walkers,
+        num_steps=self.config.num_steps,
+        max_steps=self.config.max_steps,
+        debug=self.config.maxkv_debug,
+    )
 
 
 def init_circuitkv(self):
