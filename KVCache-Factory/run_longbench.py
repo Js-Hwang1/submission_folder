@@ -114,32 +114,9 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-def build_chat(prompt, model_path):
-    """Build chat template based on model type."""
-    model_path_lower = model_path.lower()
-
-    # Llama 2 format
-    if "llama-2" in model_path_lower or "llama2" in model_path_lower:
-        return f"[INST] {prompt} [/INST]"
-
-    # Llama 3.1/3.2/3.3 format (uses same template as Llama 3)
-    # These models use the tokenizer's chat template, but for raw prompts:
-    if any(x in model_path_lower for x in ["llama-3.1", "llama3.1", "llama-3.2", "llama3.2", "llama-3.3", "llama3.3"]):
-        return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-    # Llama 3 format
-    if "llama-3" in model_path_lower or "llama3" in model_path_lower:
-        return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-    # Qwen 2/2.5 format
-    if "qwen" in model_path_lower:
-        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-
-    # Mistral format (similar to Llama 2)
-    if "mistral" in model_path_lower:
-        return f"[INST] {prompt} [/INST]"
-
-    # Default: return prompt as-is
+def build_chat(prompt):
+    """Build chat template for Llama 2 models only (matches stable LongBench evaluation)."""
+    prompt = f"[INST] {prompt} [/INST]"
     return prompt
 
 
@@ -197,17 +174,10 @@ def main(args):
             template = model2prompt[args.dataset]
             prompt = template.format(**example)
 
-            # Apply chat template for instruct models
-            # EXCEPTION: Few-shot classification tasks (trec, lsht) work better WITHOUT
-            # chat template as they rely on pattern completion, not conversational response
-            few_shot_classification = args.dataset in ["trec", "lsht"]
-
-            if not few_shot_classification:
-                if "instruct" in args.model_path.lower() or "chat" in args.model_path.lower():
-                    prompt = build_chat(prompt, args.model_path)
-                # Legacy: also apply for llama2 without explicit instruct tag
-                elif "llama2" in args.model_path.lower() or "llama-2" in args.model_path.lower():
-                    prompt = build_chat(prompt, args.model_path)
+            # Apply chat template for Llama 2 models only (matches stable LongBench evaluation)
+            # Note: Llama 3 and other models do NOT get chat template wrapping
+            if "llama2" in args.model_path.lower():
+                prompt = build_chat(prompt)
 
             example["prompt"] = prompt
                 
