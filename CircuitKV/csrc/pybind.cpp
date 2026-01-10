@@ -316,7 +316,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "1.0.8";  // Dual-temperature walkers
+    m.attr("__version__") = "2.0.0";  // MAX(H2O, Influence) with rank normalization
 }
 
 }  // namespace circuit_kv

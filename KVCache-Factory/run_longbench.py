@@ -507,9 +507,17 @@ if __name__ == "__main__":
     for idx, dataset in enumerate(selected_datasets):
 
         print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(selected_datasets)}")
-        
+
         args.dataset = dataset
-        
+
+        # Set dataset name for CircuitKV debug logging
+        if args.debug and args.method.lower() == "circuitkv":
+            try:
+                from pyramidkv.pyramidkv_utils import _set_circuitkv_dataset
+                _set_circuitkv_dataset(dataset)
+            except ImportError:
+                pass
+
         args.data_file = f"data/LongBench/{args.dataset}.jsonl"
-        
+
         main(args)

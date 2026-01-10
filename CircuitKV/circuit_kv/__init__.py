@@ -19,7 +19,7 @@ from circuit_kv.engine import (
 )
 from circuit_kv.utils import set_seed
 
-__version__ = "0.2.0"
+__version__ = "2.0.0"
 __all__ = [
     "CircuitKVMonitor",
     "CircuitKVConfig",

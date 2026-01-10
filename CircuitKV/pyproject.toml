@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "circuit_kv"
-version = "0.2.0"
+version = "2.0.0"
 description = "Current-Flow Betweenness for KV Cache Eviction in LLMs"
 readme = "README.md"
 requires-python = ">=3.8"
