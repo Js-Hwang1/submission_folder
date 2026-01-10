@@ -99,6 +99,12 @@ def classification_score(prediction, ground_truth, **kwargs):
         score = (1.0 / len(em_match_list))
     else:
         score = 0.0
+
+    # DEBUG: Log TREC predictions to diagnose 0.0 scores
+    if score == 0.0:
+        pred_preview = prediction[:200].replace('\n', '\\n') if prediction else "<EMPTY>"
+        print(f"  [TREC DEBUG] Score=0 | GT='{ground_truth}' | Pred='{pred_preview}...'")
+
     return score
     
 def rouge_score(prediction, ground_truth, **kwargs):

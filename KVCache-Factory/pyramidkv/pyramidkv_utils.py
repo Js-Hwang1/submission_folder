@@ -1638,35 +1638,44 @@ class CircuitKVCluster():
 
         device = attention_matrix.device
 
-        # Compute self-attention (diagonal)
+        # Signal 1: H2O scores (column sums) - tokens frequently attended to
+        h2o = attention_matrix.sum(dim=0)
+        if h2o.max() > 0:
+            h2o_norm = h2o / h2o.max()
+        else:
+            h2o_norm = h2o
+
+        # Signal 2: Self-attention (diagonal) - tokens that stand out
         self_attn = torch.diagonal(attention_matrix)
-
-        # Compute local attention concentration
-        # How much does each position receive from its neighbors?
-        window = 10
-        local_incoming = torch.zeros(seq_len, device=device)
-        for i in range(seq_len):
-            start = max(0, i - window)
-            end = min(seq_len, i + window)
-            local_incoming[i] = attention_matrix[start:end, i].sum()
-
-        # Normalize both signals
         if self_attn.max() > 0:
             self_attn_norm = self_attn / self_attn.max()
         else:
             self_attn_norm = self_attn
 
-        if local_incoming.max() > 0:
-            local_norm = local_incoming / local_incoming.max()
+        # Signal 3: Local H2O peaks - tokens with high attention relative to neighbors
+        # This captures instruction tokens that are local "sinks"
+        window = 20
+        local_peak_score = torch.zeros(seq_len, device=device)
+        for i in range(seq_len):
+            start = max(0, i - window)
+            end = min(seq_len, i + window)
+            local_mean = h2o[start:end].mean()
+            if local_mean > 0:
+                # How much higher is this position vs local average?
+                local_peak_score[i] = h2o[i] / local_mean
+
+        if local_peak_score.max() > 0:
+            local_peak_norm = local_peak_score / local_peak_score.max()
         else:
-            local_norm = local_incoming
+            local_peak_norm = local_peak_score
 
-        # Combined score: high self-attention AND high local incoming
-        anchor_scores = self_attn_norm * 0.5 + local_norm * 0.5
+        # Combined score: H2O importance + self-attention + local peak
+        # H2O is most important for TREC-like tasks (instruction tokens get attention)
+        anchor_scores = h2o_norm * 0.5 + self_attn_norm * 0.2 + local_peak_norm * 0.3
 
-        # Find peaks (local maxima with score > 0.3)
-        threshold = 0.3
-        min_spacing = seq_len // 50  # At least 2% of sequence between anchors
+        # Find peaks with lower threshold (TREC needs more anchors)
+        threshold = 0.2  # Lower threshold to catch more instruction tokens
+        min_spacing = seq_len // 100  # Allow denser anchors (1% spacing)
 
         # Sort by score and greedily select with spacing constraint
         sorted_indices = torch.argsort(anchor_scores, descending=True)
@@ -2022,19 +2031,25 @@ class CircuitKVCluster():
 
         # v3.0.0 Breakthrough 2: Instruction Anchor Detection
         # Detect and boost instruction-anchoring tokens for few-shot tasks
-        if self.use_instruction_anchors and BREAKTHROUGHS_AVAILABLE and self.tokenizer is not None:
+        # NOTE: Heuristic method uses attention patterns, doesn't need tokenizer
+        if self.use_instruction_anchors:
             try:
-                # Get input_ids from the tokenizer if available
-                # For now, we use a heuristic based on attention patterns
+                # Detect anchors using attention pattern heuristics
                 self._instruction_anchors = self._detect_instruction_anchors_heuristic(
                     full_attn, q_len
                 )
                 # Boost instruction anchors to ensure they're kept
+                num_boosted = 0
                 for anchor_pos in self._instruction_anchors:
                     if 0 <= anchor_pos < q_len:
                         combined_scores[anchor_pos] = 1.0
-            except Exception:
-                pass  # Fallback: no anchor detection
+                        num_boosted += 1
+
+                # Debug: Log anchor detection results
+                if num_boosted > 0:
+                    print(f"  [v3.0.0] Detected {len(self._instruction_anchors)} instruction anchors, boosted {num_boosted}")
+            except Exception as e:
+                print(f"  [v3.0.0] Anchor detection failed: {e}")
 
         # Expand to full buffer size
         scores = torch.zeros_like(influence_scores)
