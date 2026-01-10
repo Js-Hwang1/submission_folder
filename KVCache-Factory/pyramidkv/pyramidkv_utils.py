@@ -1235,7 +1235,7 @@ class CircuitKVCluster():
         # Debug logging
         debug: bool = False,
         # v3.0.0 Breakthroughs (ICML 2026)
-        use_instruction_anchors: bool = True,  # Breakthrough 2: Protect few-shot patterns
+        use_instruction_anchors: bool = False,  # Breakthrough 2: DISABLED (TREC issue was prompting, not KV)
         use_fundamental_norm: bool = False,  # Breakthrough 1: Principled normalization (expensive)
         use_multi_horizon: bool = True,  # Breakthrough 3: Adaptive walk lengths
         tokenizer = None,  # Required for instruction anchor detection
