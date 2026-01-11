@@ -1,18 +1,11 @@
 /**
- * Causal Influence Propagation Walker (v2.0.0 - SDI Optimized)
+ * Causal Influence Propagation Walker (v1.0.8)
  *
  * ALGORITHM:
  *   1. MULTI-SOURCE: 50% walkers start at query, 50% start at random positions
  *   2. DUAL-TEMPERATURE: 70% logical (T=base), 30% exploratory (T=high/uniform)
  *   3. Visit count = unweighted for ALL steps (count from step 0)
  *   4. Normalize by POSITIONAL OPPORTUNITY to counteract early-position bias
- *
- * v2.0.0 OPTIMIZATION - "Single-Pass Sampling":
- *   Problem: v1.0.8 computed powf() twice per position per step (sum + sample loops)
- *   Solution: Fused single-pass sampling using normalized random threshold
- *     - First pass computes sum AND caches scaled values in registers
- *     - For small pos ranges (<= 32), use register caching
- *     - For larger ranges, use online sampling with single powf per position
  *
  * v1.0.8 FIX - "Dual-Temperature Walkers":
  *   Problem: Single temperature is a trade-off. Low T misses middle positions,
@@ -119,7 +112,6 @@ __global__ void influence_walker_kernel(
     }
 
     // Walk for max_steps, sampling only among non-sink positions
-    // v2.0.0 OPTIMIZATION: Single-pass sampling with early termination
     for (int step = 0; step < max_steps; step++) {
         // Causal: can attend to positions 0..pos (inclusive)
         // But we EXCLUDE sink positions (0 to sink_size-1)
@@ -129,72 +121,42 @@ __global__ void influence_walker_kernel(
         if (pos < sink_size) break;
 
         const float* attn_row = attention + pos * seq_len;
-        int range_size = pos - sink_size + 1;
 
-        // v2.0.0: Single-pass sampling using TWO-PHASE approach
-        // Phase 1: Compute sum AND cache scaled values for small ranges
-        // Phase 2: Use cached values for O(1) lookup, or recompute for large ranges
+        // v1.0.8: Sum TEMPERATURE-SCALED attention over NON-SINK positions
+        // Uses my_inv_temp which is either base or exploratory temperature
+        // scaled_prob[j] = attn[j]^(1/temperature) = attn[j]^my_inv_temp
+        float non_sink_sum = 0.0f;
+        for (int j = sink_size; j <= pos; j++) {
+            // Apply temperature scaling: higher temperature = more uniform
+            float scaled = powf(fmaxf(attn_row[j], 1e-10f), my_inv_temp);
+            non_sink_sum += scaled;
+        }
 
-        int next_pos = sink_size;  // Default
+        // If all attention goes to sink (non_sink_sum ≈ 0), terminate walk
+        // This walker's influence path ends at this point
+        if (non_sink_sum < 1e-10f) break;
 
-        if (range_size <= 64) {
-            // SMALL RANGE: Cache in registers (fast path for most walks)
-            // Use local array - compiler will use registers for small sizes
-            float cached_scaled[64];
-            float non_sink_sum = 0.0f;
+        // Sample from temperature-scaled distribution over non-sink positions
+        float r = pcg_uniform(&rng) * non_sink_sum;
 
-            #pragma unroll 8
-            for (int j = 0; j < range_size; j++) {
-                int idx = sink_size + j;
-                float scaled = powf(fmaxf(attn_row[idx], 1e-10f), my_inv_temp);
-                cached_scaled[j] = scaled;
-                non_sink_sum += scaled;
-            }
+        // Cumulative sum search for sampling (only over non-sink positions)
+        float cumsum = 0.0f;
+        int next_pos = sink_size;  // Default to first non-sink position
 
-            if (non_sink_sum < 1e-10f) break;
-
-            // Sample using cached values (single powf per position!)
-            float r = pcg_uniform(&rng) * non_sink_sum;
-            float cumsum = 0.0f;
-
-            for (int j = 0; j < range_size; j++) {
-                cumsum += cached_scaled[j];
-                if (r < cumsum) {
-                    next_pos = sink_size + j;
-                    break;
-                }
-                next_pos = sink_size + j;
-            }
-        } else {
-            // LARGE RANGE: Two-pass but with pre-generated random
-            // Still faster than original due to optimized memory access
-            float non_sink_sum = 0.0f;
-
-            // First pass: compute sum
-            for (int j = sink_size; j <= pos; j++) {
-                float scaled = powf(fmaxf(attn_row[j], 1e-10f), my_inv_temp);
-                non_sink_sum += scaled;
-            }
-
-            if (non_sink_sum < 1e-10f) break;
-
-            // Pre-generate random number
-            float r = pcg_uniform(&rng) * non_sink_sum;
-            float cumsum = 0.0f;
-
-            // Second pass: sample with early exit
-            for (int j = sink_size; j <= pos; j++) {
-                float scaled = powf(fmaxf(attn_row[j], 1e-10f), my_inv_temp);
-                cumsum += scaled;
-                if (r < cumsum) {
-                    next_pos = j;
-                    break;
-                }
+        for (int j = sink_size; j <= pos; j++) {
+            // Same temperature scaling as above
+            float scaled = powf(fmaxf(attn_row[j], 1e-10f), my_inv_temp);
+            cumsum += scaled;
+            if (r < cumsum) {
                 next_pos = j;
+                break;
             }
+            next_pos = j;  // Handle numerical precision at end
         }
 
         // v1.0.6: Count visits from ALL steps (including step 0)
+        // With multi-source walks, step 0 is meaningful for random-start walkers
+        // and query-start walkers benefit from the combined signal
         atomicAdd(&visits[next_pos], 1.0f);
 
         // Move to next position

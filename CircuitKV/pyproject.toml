@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "circuit_kv"
 version = "3.0.0"
-description = "MAX(H2O, Influence) for KV Cache Eviction in LLMs"
+description = "Current-Flow Betweenness for KV Cache Eviction in LLMs"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}

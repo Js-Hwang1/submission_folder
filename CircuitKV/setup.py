@@ -66,7 +66,7 @@ def get_extensions():
 
 setup(
     name="circuit_kv",
-    version="4.0.0",  # MAX(H2O, Influence) with rank normalization
+    version="3.0.0",  # MAX(H2O, Influence) with rank normalization
     author="CircuitKV Authors",
     description="Current-Flow Betweenness for KV Cache Eviction in LLMs",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",
