@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "circuit_kv"
-version = "6.0.0"
-description = "Unified Coverage-Importance Selection for KV Cache Eviction in LLMs"
+version = "3.1.0"
+description = "L2 Aggregation (RMS + Floor) for KV Cache Eviction in LLMs"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}

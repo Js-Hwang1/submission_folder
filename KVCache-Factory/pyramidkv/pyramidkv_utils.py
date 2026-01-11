@@ -11,7 +11,7 @@ from typing import List
 from typing import List, Optional, Tuple, Set
 from transformers.cache_utils import Cache
 
-# v4.0.0 Optional breakthroughs import (instruction anchors, etc.)
+# v3.0.0 Breakthroughs import
 try:
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'CircuitKV'))
@@ -50,13 +50,13 @@ def _get_circuitkv_debug_log():
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n")
-        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v5.0.0 Debug Log - SDI (Stratified Diverse Influence)\n")
+        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v3.1.0 Debug Log - L2 Aggregation (RMS + Floor)\n")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n\n")
-        _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: SDI (Stratified Diverse Influence)\n")
-        _CIRCUITKV_DEBUG_LOG.write("  1. Task Detection: entropy(query_attn) → QA or Summarization\n")
-        _CIRCUITKV_DEBUG_LOG.write("  2. Multi-Source Walks: segment centers for summarization\n")
-        _CIRCUITKV_DEBUG_LOG.write("  3. MAX(H2O, Influence): hedging combination\n")
-        _CIRCUITKV_DEBUG_LOG.write("  4. Stratified Selection: K segments × C clusters\n\n")
+        _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: score[j] = max(RMS(h2o_rank[j], influence_rank[j]), floor)\n")
+        _CIRCUITKV_DEBUG_LOG.write("  - H2O: Column sums (incoming attention)\n")
+        _CIRCUITKV_DEBUG_LOG.write("  - Influence: Absorbing random walks (query→sink path)\n")
+        _CIRCUITKV_DEBUG_LOG.write("  - RMS: sqrt((h^2 + v^2) / 2) - rewards consistent importance\n")
+        _CIRCUITKV_DEBUG_LOG.write("  - Floor: 0.3 * max(h, v) - safety for strong unimodal signals\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
@@ -1155,84 +1155,46 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v6.0.0: Unified Coverage-Importance Selection for ICML 2026.
+    CircuitKV v3.1.0: L2 Aggregation (RMS + Floor) for ICML 2026.
 
-    ═══════════════════════════════════════════════════════════════════════════════
-    MATHEMATICAL FORMULATION
-    ═══════════════════════════════════════════════════════════════════════════════
+    This class implements a principled combination of two importance signals:
+    - H2O: Column sums of attention matrix (local importance - one-hop)
+    - Influence: Absorbing random walks (global importance - multi-hop paths)
 
-    Given attention matrix A ∈ ℝ^{n×n} where A[i,j] = softmax(q_i·k_j/√d) for j≤i,
-    we select tokens via a unified objective that combines importance and coverage.
+    Key Innovation (v3.1.0 - L2 Aggregation):
+    - RANK NORMALIZATION: Both H2O and Influence scores are rank-normalized to [0,1]
+    - L2 AGGREGATION: score[j] = sqrt((h2o_rank[j]^2 + influence_rank[j]^2) / 2)
+    - SAFETY FLOOR: Ensures tokens with strong unimodal signal aren't dismissed
+      floor[j] = floor_weight * max(h2o_rank[j], influence_rank[j])
+    - FINAL: combined[j] = max(rms[j], floor[j])
 
-    ═══════════════════════════════════════════════════════════════════════════════
-    v6.0.0 KEY INNOVATION: Unified Coverage-Importance
-    ═══════════════════════════════════════════════════════════════════════════════
+    Why L2 > MAX (Theoretical Justification):
+    - L2 (RMS) is from the generalized mean family: M_p(a,b) = ((a^p + b^p)/2)^(1/p)
+    - p=2 gives the quadratic mean, intermediate between MAX (p=inf) and arithmetic (p=1)
+    - Rewards tokens with CONSISTENT importance across both views
+    - Reduces sensitivity to noise in individual estimators
+    - Smooth gradients for potential end-to-end optimization
 
-    Instead of combining separate signals with ad-hoc MAX, we use a single objective:
+    Comparison (token with h=0.9, v=0.1 vs token with h=0.5, v=0.5):
+    - MAX: 0.9 vs 0.5 (1.8x advantage for extreme-on-one)
+    - RMS: 0.64 vs 0.50 (1.28x advantage - dampened)
+    - This reduces the influence of potentially noisy high scores
 
-    1. CONCENTRATION SCORE (Token Importance):
-       For each token j, compute how CONFIDENTLY it's attended to:
+    Algorithm:
+    1. Compute full attention matrix from query/key states
+    2. Compute H2O scores (column sums)
+    3. Run Influence Walker (absorbing random walks from query to sink)
+    4. Rank normalize both scores to [0, 1]
+    5. Compute RMS: sqrt((h2o_rank^2 + influence_rank^2) / 2)
+    6. Compute floor: floor_weight * max(h2o_rank, influence_rank)
+    7. Combined score = max(rms, floor) - principled with safety
+    8. Select top tokens by combined scores for KV cache retention
 
-       c[j] = exp(-H_j) · Σ_i A[i,j]
-
-       where H_j = -Σ_i p[i,j] log(p[i,j]) is the entropy of attention TO token j,
-       and p[i,j] = A[i,j] / Σ_k A[k,j] is the normalized distribution.
-
-       Interpretation:
-       - High c[j] = token receives FOCUSED attention from few positions (evidence)
-       - Low c[j] = token receives DIFFUSE attention from many positions (context)
-
-    2. WEIGHTED COVERAGE FUNCTION (Submodular Objective):
-       Define the weighted coverage:
-
-       f(S) = Σ_i min(1, Σ_{j∈S, j≤i} A[i,j] · c[j])
-
-       This measures: for each query position i, how much of its attention need
-       is "covered" by tokens in S, weighted by their importance c[j].
-
-       Key Property: f is SUBMODULAR (diminishing returns), so greedy selection
-       achieves (1 - 1/e) ≈ 63.2% of optimal.
-
-    3. GREEDY SELECTION:
-       S = {sink tokens}
-       while |S| < budget:
-           j* = argmax_{j ∉ S} [f(S ∪ {j}) - f(S)]  # Max marginal gain
-           S = S ∪ {j*}
-
-    ═══════════════════════════════════════════════════════════════════════════════
-    WHY THIS IS BETTER THAN MAX(H2O, Influence)
-    ═══════════════════════════════════════════════════════════════════════════════
-
-    | Aspect            | Old (v5.0.0 MAX)           | New (v6.0.0 Unified)        |
-    |-------------------|----------------------------|-----------------------------|
-    | Signals           | Two separate (H2O, walks)  | One integrated (Conc.)      |
-    | Combination       | Ad-hoc MAX                 | Principled submodular       |
-    | Coverage          | No guarantee               | (1-1/e) optimal             |
-    | Random walks      | Yes (noisy, slow)          | No (deterministic)          |
-    | CUDA kernel       | Required                   | Optional (pure PyTorch)     |
-
-    ═══════════════════════════════════════════════════════════════════════════════
-    ALGORITHM
-    ═══════════════════════════════════════════════════════════════════════════════
-
-    UnifiedSelect(A, B):
-    1. Compute attention matrix A from query/key states
-    2. Compute concentration scores: c[j] = exp(-entropy) * attention_sum[j]
-    3. Compute weighted attention: w[i,j] = A[i,j] * c[j]
-    4. Greedy submodular selection maximizing weighted coverage
-    5. Return selected token set S
-
-    ═══════════════════════════════════════════════════════════════════════════════
-    CONFIGURATION
-    ═══════════════════════════════════════════════════════════════════════════════
-
-    v6.0.0 Parameters:
-    - use_unified: Enable unified coverage-importance (default: True)
-    - greedy_batch_size: Batch size for greedy selection (default: 32)
-
-    Legacy Parameters (preserved for API compatibility):
-    - sink_size: Always-keep boundary (default: 4)
-    - window_size: Local window size (default: 32)
+    Configuration:
+    - num_walkers: Number of walkers for influence (default: 10000)
+    - max_steps: Max steps per walker (default: 10)
+    - sink_size: Absorbing boundary (default: 4)
+    - floor_weight: Safety floor as fraction of MAX (default: 0.3)
     """
 
     def __init__(
@@ -1252,9 +1214,9 @@ class CircuitKVCluster():
         # Capacitive model parameters
         decay: float = 0.95,  # EMA decay for charge accumulation
         observation_window: int = 1,  # P0+P1: Last W tokens for H2O attention + multi-source walks
-        # v4.0.0: Bidirectional Circuit Walks (P0 - ICML 2026)
-        # Captures betweenness: tokens on BOTH forward and backward paths
-        bidirectional: bool = False,  # v5.0.0: Disabled by default (SDI replaces this)
+        # RC+B: Bidirectional Circuit Walks
+        # NOTE: Disabled - R@65 improved but narrativeqa dropped (25.10 -> 23.78)
+        bidirectional: bool = False,
         # Spectral + Walker + MAX mode (v0.2.0)
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
@@ -1269,22 +1231,13 @@ class CircuitKVCluster():
         absorb_at_landmarks: bool = True,  # Legacy parameter (unused in v1.0.0)
         # Debug logging
         debug: bool = False,
-        # v4.0.0 Features (ICML 2026) - Most replaced by SDI in v5.0.0
-        use_instruction_anchors: bool = False,  # DISABLED (TREC issue was prompting, not KV)
-        use_fundamental_norm: bool = False,  # Principled normalization (expensive, optional)
-        use_multi_horizon: bool = False,  # v5.0.0: Disabled, SDI handles multi-scale differently
+        # v3.1.0: L2 Aggregation parameters
+        floor_weight: float = 0.3,  # Safety floor as fraction of MAX (default: 0.3)
+        # v3.0.0 Breakthroughs (ICML 2026) - kept for compatibility
+        use_instruction_anchors: bool = False,  # Breakthrough 2: DISABLED (TREC issue was prompting, not KV)
+        use_fundamental_norm: bool = False,  # Breakthrough 1: Principled normalization (expensive)
+        use_multi_horizon: bool = True,  # Breakthrough 3: Adaptive walk lengths
         tokenizer = None,  # Required for instruction anchor detection
-        # ═══════════════════════════════════════════════════════════════════════
-        # v6.0.0: Unified Coverage-Importance Parameters
-        # ═══════════════════════════════════════════════════════════════════════
-        use_unified: bool = True,  # Enable unified coverage-importance selection
-        greedy_batch_size: int = 32,  # Batch size for greedy selection (speed vs memory)
-        # Legacy v5.0.0 parameters (kept for API compatibility)
-        use_sdi: bool = False,  # Deprecated - use use_unified instead
-        num_segments: int = 8,  # Legacy: K segments (only used if use_sdi=True)
-        num_clusters: int = 4,  # Legacy: C clusters (only used if use_sdi=True)
-        entropy_threshold: float = 0.5,  # Legacy: Task detection threshold
-        sdi_query_weight: float = 0.7,  # Legacy: Walk weight
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1294,22 +1247,14 @@ class CircuitKVCluster():
         self.num_walkers = num_walkers
         self.num_steps = num_steps
         self.max_steps = max_steps  # v1.0.0: Max steps per walker
-        # v4.0.0 Features (legacy)
+        # v3.1.0: L2 Aggregation
+        self.floor_weight = floor_weight
+        # v3.0.0 Breakthroughs
         self.use_instruction_anchors = use_instruction_anchors
         self.use_fundamental_norm = use_fundamental_norm
         self.use_multi_horizon = use_multi_horizon
         self.tokenizer = tokenizer
         self._instruction_anchors = set()  # Cache for current sample
-        # v6.0.0: Unified Coverage-Importance Parameters
-        self.use_unified = use_unified
-        self.greedy_batch_size = greedy_batch_size
-        # Legacy v5.0.0: SDI Parameters (kept for API compatibility)
-        self.use_sdi = use_sdi
-        self.num_segments = num_segments
-        self.num_clusters = num_clusters
-        self.entropy_threshold = entropy_threshold
-        self.sdi_query_weight = sdi_query_weight
-        self._detected_task_type = None  # Cache for task detection
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1652,479 +1597,49 @@ class CircuitKVCluster():
             return torch.ones_like(ranks)
         return ranks / (n - 1)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # v6.0.0: Unified Coverage-Importance Methods
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _compute_concentration_scores(
+    def _combine_scores_l2(
         self,
-        attention_matrix: torch.Tensor,
-        q_len: int,
+        h2o_ranks: torch.Tensor,
+        influence_ranks: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute concentration scores for each token (FULLY VECTORIZED).
+        v3.1.0: L2 Aggregation (RMS + Floor) - Principled score combination.
 
-        Mathematical Formulation:
-            c[j] = exp(-H_j) · Σ_i A[i,j]
+        Combines H2O and Influence using the quadratic mean (L2/RMS) from the
+        generalized mean family, with a safety floor to preserve strong unimodal signals.
 
-        Args:
-            attention_matrix: Attention weights [seq_len, seq_len] (causal)
-            q_len: Sequence length
+        Mathematical Foundation:
+        - Generalized mean: M_p(a,b) = ((a^p + b^p)/2)^(1/p)
+        - p=1: Arithmetic mean (sum/2)
+        - p=2: Quadratic mean / RMS (what we use)
+        - p→∞: Maximum
 
-        Returns:
-            Concentration scores [q_len]
-        """
-        # Step 1: H2O scores (column sums) - vectorized
-        attn = attention_matrix[:q_len, :q_len]
-        h2o_scores = attn.sum(dim=0)  # [q_len]
+        Why RMS (p=2)?
+        - Intermediate between MAX and arithmetic mean
+        - Rewards tokens with consistent importance on BOTH views
+        - Reduces sensitivity to noise in individual estimators
+        - Smooth, differentiable (unlike MAX)
 
-        # Step 2: Entropy per column (vectorized)
-        col_sums = h2o_scores.clamp(min=1e-10)
-        p = attn / col_sums.unsqueeze(0)  # Normalize columns
-        p = p.clamp(min=1e-10)
-
-        # H[j] = -Σ_i p[i,j] log(p[i,j])
-        entropy = -(p * torch.log(p)).sum(dim=0)
-
-        # Concentration = exp(-H) * h2o
-        return torch.exp(-entropy) * h2o_scores
-
-    def _submodular_greedy_select(
-        self,
-        attention_matrix: torch.Tensor,
-        concentration: torch.Tensor,
-        budget: int,
-        q_len: int,
-    ) -> torch.Tensor:
-        """
-        Greedy submodular selection maximizing weighted coverage.
-
-        Mathematical Formulation:
-            f(S) = Σ_i min(1, Σ_{j∈S, j≤i} w[i,j])
-
-        where w[i,j] = A[i,j] * c[j] is attention weighted by concentration.
-
-        This is the facility location / coverage function, which is submodular.
-        Greedy selection achieves (1 - 1/e) ≈ 63.2% of optimal.
+        Safety Floor:
+        - Ensures tokens with strong unimodal importance aren't dismissed
+        - floor = floor_weight * max(h2o, influence)
+        - Typical floor_weight = 0.3 (30% of MAX is minimum score)
 
         Args:
-            attention_matrix: Attention weights [seq_len, seq_len]
-            concentration: Concentration scores [q_len]
-            budget: Total tokens to select
-            q_len: Sequence length
+            h2o_ranks: Rank-normalized H2O scores in [0, 1]
+            influence_ranks: Rank-normalized influence scores in [0, 1]
 
         Returns:
-            Boolean mask [q_len] where True = selected
+            Combined importance scores in [0, 1]
         """
-        device = attention_matrix.device
+        # RMS aggregation: sqrt((h^2 + v^2) / 2)
+        rms = torch.sqrt((h2o_ranks.square() + influence_ranks.square()) / 2)
 
-        # Compute weighted attention: w[i,j] = A[i,j] * c[j]
-        weighted_attn = attention_matrix[:q_len, :q_len] * concentration.unsqueeze(0)
+        # Safety floor: ensures strong unimodal signals aren't dismissed
+        floor = self.floor_weight * torch.maximum(h2o_ranks, influence_ranks)
 
-        # Initialize selection mask
-        mask = torch.zeros(q_len, dtype=torch.bool, device=device)
-
-        # Always keep sink tokens
-        mask[:self.sink_size] = True
-
-        # Always keep local window
-        window_start = max(self.sink_size, q_len - self.window_size)
-        mask[window_start:] = True
-
-        # Current coverage state
-        # covered[i] = Σ_{j∈S, j≤i} w[i,j]
-        covered = weighted_attn[:, mask].sum(dim=1)  # [q_len]
-
-        # Remaining budget (excluding sink and window)
-        current_count = mask.sum().item()
-        remaining_budget = max(0, budget - current_count)
-
-        if remaining_budget == 0:
-            return mask
-
-        # Precompute candidate set (exclude sink and window)
-        candidates = torch.where(~mask)[0]  # Indices of unselected tokens
-
-        # Greedy selection loop
-        # For efficiency, we process in batches and use vectorized marginal gain
-        for _ in range(remaining_budget):
-            if len(candidates) == 0:
-                break
-
-            # Compute marginal gain for all candidates
-            # Marginal gain of adding j = Σ_i max(0, min(1, covered[i] + w[i,j]) - min(1, covered[i]))
-            # Simplified: for each i, gain[j] += max(0, min(1-covered[i], w[i,j]))
-
-            # Get weighted attention columns for all candidates
-            candidate_attn = weighted_attn[:, candidates]  # [q_len, num_candidates]
-
-            # Current headroom: how much more coverage each position can absorb
-            headroom = (1.0 - covered).clamp(min=0)  # [q_len]
-
-            # Marginal contribution of each candidate to each position
-            marginal = torch.minimum(headroom.unsqueeze(1), candidate_attn)  # [q_len, num_cand]
-
-            # Total marginal gain per candidate
-            gains = marginal.sum(dim=0)  # [num_candidates]
-
-            # Select best candidate
-            best_idx = gains.argmax()
-            best_token = candidates[best_idx]
-
-            # Update mask and coverage
-            mask[best_token] = True
-            covered = covered + weighted_attn[:, best_token]
-
-            # Remove selected from candidates
-            candidates = candidates[candidates != best_token]
-
-        return mask
-
-    def _fast_greedy_select(
-        self,
-        attention_matrix: torch.Tensor,
-        concentration: torch.Tensor,
-        budget: int,
-        q_len: int,
-    ) -> torch.Tensor:
-        """
-        Fast selection using concentration scores (O(n log k), fully vectorized).
-
-        Instead of iterative greedy selection (slow), we use concentration scores
-        directly for top-k selection. This is much faster while still capturing
-        the importance-weighted coverage intuition.
-
-        Args:
-            attention_matrix: Attention weights [seq_len, seq_len]
-            concentration: Concentration scores [q_len]
-            budget: Total tokens to select
-            q_len: Sequence length
-
-        Returns:
-            Boolean mask [q_len] where True = selected
-        """
-        device = concentration.device
-
-        # Initialize mask with sink and window (always kept)
-        mask = torch.zeros(q_len, dtype=torch.bool, device=device)
-        mask[:self.sink_size] = True
-        window_start = max(self.sink_size, q_len - self.window_size)
-        mask[window_start:] = True
-
-        # Remaining budget for selection
-        current_count = mask.sum().item()
-        remaining_budget = max(0, budget - current_count)
-
-        if remaining_budget == 0:
-            return mask
-
-        # Use concentration scores for selection
-        # Mask out already-selected positions
-        scores = concentration.clone()
-        scores[mask] = -float('inf')
-
-        # Top-k selection (O(n log k))
-        k = min(remaining_budget, (~mask).sum().item())
-        if k > 0:
-            _, topk_indices = torch.topk(scores, k)
-            mask[topk_indices] = True
-
-        return mask
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # v5.0.0: SDI (Stratified Diverse Influence) Methods [LEGACY]
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _detect_task_type(self, attention_row: torch.Tensor, seq_len: int) -> str:
-        """
-        Detect task type via attention entropy.
-
-        Mathematical Formulation:
-            H_q = -Σ_j p[j] log(p[j])   where p = attention_row (normalized)
-            H_max = log(seq_len)
-
-        Decision Rule:
-            - H_q < threshold * H_max → "qa" (focused attention, query is informative)
-            - H_q >= threshold * H_max → "summarization" (diffuse attention, need coverage)
-
-        Args:
-            attention_row: Query's attention distribution [seq_len]
-            seq_len: Sequence length
-
-        Returns:
-            "qa" or "summarization"
-        """
-        # Normalize to valid probability distribution
-        p = attention_row / (attention_row.sum() + 1e-10)
-        p = p.clamp(min=1e-10)  # Avoid log(0)
-
-        # Compute entropy: H = -Σ p log(p)
-        entropy = -(p * torch.log(p)).sum().item()
-
-        # Maximum possible entropy
-        max_entropy = math.log(seq_len) if seq_len > 1 else 1.0
-
-        # Normalized entropy ratio
-        entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0
-
-        # Classify based on threshold
-        task_type = "summarization" if entropy_ratio >= self.entropy_threshold else "qa"
-
-        return task_type
-
-    def _compute_segment_centers(self, seq_len: int, num_segments: int) -> List[int]:
-        """
-        Compute center positions for each segment.
-
-        For stratified multi-source walks, we launch walkers from segment centers
-        to ensure coverage across the entire sequence.
-
-        Args:
-            seq_len: Sequence length
-            num_segments: Number of segments K
-
-        Returns:
-            List of segment center positions
-        """
-        segment_size = seq_len // num_segments
-        centers = []
-        for k in range(num_segments):
-            # Center of segment k
-            start = k * segment_size
-            end = (k + 1) * segment_size if k < num_segments - 1 else seq_len
-            center = (start + end) // 2
-            # Ensure center is valid (not in sink)
-            center = max(self.sink_size, center)
-            centers.append(center)
-        return centers
-
-    def _run_multi_source_walks(
-        self,
-        attention_matrix: torch.Tensor,
-        sources: List[int],
-        query_idx: int,
-        q_len: int,
-    ) -> torch.Tensor:
-        """
-        Run absorbing walks from multiple source positions.
-
-        Mathematical Formulation:
-            v[j] = w_q * Visits(j|query) + (1-w_q)/M * Σ_m Visits(j|source_m)
-
-        This captures global document structure by launching walks from
-        geographically diverse positions, not just the query.
-
-        Args:
-            attention_matrix: Full attention matrix [seq_len, seq_len]
-            sources: List of source positions for multi-source walks
-            query_idx: Query position
-            q_len: Sequence length
-
-        Returns:
-            Combined visit scores [q_len]
-        """
-        attn_contig = attention_matrix.contiguous()
-
-        # Query-source walks (always included)
-        self._graph.update_and_step_influence_walker(
-            attn_contig, query_idx,
-            self.num_walkers // 2, self.max_steps, self.sink_size,
-        )
-        query_scores = self._graph.get_influence_scores()[:q_len].clone()
-
-        # Multi-source walks from segment centers
-        # Use remaining walkers distributed across sources
-        walkers_per_source = max(100, self.num_walkers // (2 * len(sources)))
-        source_scores_sum = torch.zeros(q_len, device=attention_matrix.device, dtype=torch.float32)
-
-        for src in sources:
-            if src < self.sink_size or src >= q_len:
-                continue  # Skip invalid sources
-
-            self._graph.update_and_step_influence_walker(
-                attn_contig, src,
-                walkers_per_source, self.max_steps, self.sink_size,
-            )
-            source_scores = self._graph.get_influence_scores()[:q_len].clone()
-            source_scores_sum += source_scores
-
-        # Combine: weighted average of query and source walks
-        # w_q controls how much we weight query-focused vs uniform-source walks
-        w_q = self.sdi_query_weight
-        combined = w_q * query_scores + (1 - w_q) * source_scores_sum / max(1, len(sources))
-
-        return combined
-
-    def _simple_kmeans(
-        self,
-        keys: torch.Tensor,
-        n_clusters: int,
-        max_iters: int = 10,
-    ) -> torch.Tensor:
-        """
-        Simple k-means clustering for semantic diversity.
-
-        This is a lightweight GPU-based k-means for clustering key vectors
-        within each segment. We use few iterations since we only need
-        rough clusters for diversity, not precise clustering.
-
-        Args:
-            keys: Key vectors [n, head_dim]
-            n_clusters: Number of clusters C
-            max_iters: Maximum iterations (default: 10 for speed)
-
-        Returns:
-            Cluster assignments [n]
-        """
-        n = keys.shape[0]
-        if n <= n_clusters:
-            # More clusters than points - each point is its own cluster
-            return torch.arange(n, device=keys.device)
-
-        device = keys.device
-        dtype = keys.dtype
-
-        # Initialize centroids using k-means++ style (first point random, rest far)
-        indices = torch.randperm(n, device=device)[:n_clusters]
-        centroids = keys[indices].clone()
-
-        # Normalize for cosine similarity
-        keys_norm = F.normalize(keys.float(), dim=-1)
-
-        for _ in range(max_iters):
-            centroids_norm = F.normalize(centroids.float(), dim=-1)
-
-            # Compute distances (using cosine similarity for efficiency)
-            # distances[i,j] = similarity of point i to centroid j
-            similarities = torch.mm(keys_norm, centroids_norm.t())
-
-            # Assign to nearest centroid
-            assignments = similarities.argmax(dim=-1)
-
-            # Update centroids
-            new_centroids = torch.zeros_like(centroids)
-            counts = torch.zeros(n_clusters, device=device)
-
-            for c in range(n_clusters):
-                mask = (assignments == c)
-                if mask.sum() > 0:
-                    new_centroids[c] = keys[mask].mean(dim=0)
-                    counts[c] = mask.sum()
-                else:
-                    # Empty cluster - reinitialize
-                    new_centroids[c] = keys[torch.randint(n, (1,), device=device)]
-
-            centroids = new_centroids
-
-        return assignments
-
-    def _stratified_diverse_select(
-        self,
-        scores: torch.Tensor,
-        keys: torch.Tensor,
-        budget: int,
-        q_len: int,
-    ) -> torch.Tensor:
-        """
-        Stratified selection with semantic diversity.
-
-        Algorithm:
-        1. Divide sequence into K segments
-        2. For each segment:
-           a. Cluster keys into C clusters
-           b. Select top B/(K*C) tokens from each cluster by score
-        3. Union all selected tokens
-
-        Mathematical Guarantee:
-            ∀k ∈ [1,K]: |Selected ∩ Segment_k| ≥ B/K
-            ∀k,c: |Selected ∩ Cluster_{k,c}| ≥ B/(K*C)
-
-        Args:
-            scores: Combined importance scores [q_len]
-            keys: Key vectors [q_len, head_dim]
-            budget: Total tokens to select (B)
-            q_len: Sequence length
-
-        Returns:
-            Boolean mask [q_len] where True = selected
-        """
-        device = scores.device
-        K = self.num_segments
-        C = self.num_clusters
-
-        # Compute segment boundaries
-        # Reserve space for sink and window
-        selectable_start = self.sink_size
-        selectable_end = q_len - self.window_size
-
-        if selectable_end <= selectable_start:
-            # Very short sequence - just use standard selection
-            mask = torch.zeros(q_len, dtype=torch.bool, device=device)
-            mask[:self.sink_size] = True
-            mask[-self.window_size:] = True
-            return mask
-
-        selectable_len = selectable_end - selectable_start
-
-        # Budget for stratified selection (excluding sink and window)
-        sink_window_budget = self.sink_size + self.window_size
-        stratified_budget = max(0, budget - sink_window_budget)
-
-        # Tokens per segment
-        segment_size = selectable_len // K
-        tokens_per_segment = stratified_budget // K
-
-        # Initialize mask
-        mask = torch.zeros(q_len, dtype=torch.bool, device=device)
-        mask[:self.sink_size] = True  # Always keep sink
-        mask[-self.window_size:] = True  # Always keep window
-
-        # Process each segment
-        for k in range(K):
-            seg_start = selectable_start + k * segment_size
-            seg_end = selectable_start + (k + 1) * segment_size if k < K - 1 else selectable_end
-
-            seg_len = seg_end - seg_start
-            if seg_len <= 0:
-                continue
-
-            # Get keys and scores for this segment
-            seg_keys = keys[seg_start:seg_end]
-            seg_scores = scores[seg_start:seg_end]
-
-            # Cluster keys in this segment
-            actual_clusters = min(C, seg_len)
-            if actual_clusters <= 1:
-                # Too few tokens - just take top by score
-                tokens_to_select = min(tokens_per_segment, seg_len)
-                if tokens_to_select > 0:
-                    _, top_idx = torch.topk(seg_scores, tokens_to_select)
-                    mask[seg_start + top_idx] = True
-                continue
-
-            cluster_assignments = self._simple_kmeans(seg_keys, actual_clusters)
-
-            # Select from each cluster
-            tokens_per_cluster = max(1, tokens_per_segment // actual_clusters)
-
-            for c in range(actual_clusters):
-                cluster_mask = (cluster_assignments == c)
-                cluster_indices = cluster_mask.nonzero(as_tuple=True)[0]
-
-                if len(cluster_indices) == 0:
-                    continue
-
-                # Get scores for this cluster
-                cluster_scores = seg_scores[cluster_indices]
-
-                # Select top tokens from this cluster
-                tokens_to_select = min(tokens_per_cluster, len(cluster_indices))
-                if tokens_to_select > 0:
-                    _, top_idx = torch.topk(cluster_scores, tokens_to_select)
-                    selected_positions = cluster_indices[top_idx]
-                    mask[seg_start + selected_positions] = True
-
-        return mask
+        # Final score: max of RMS and floor
+        return torch.maximum(rms, floor)
 
     def _detect_instruction_anchors_heuristic(
         self,
@@ -2424,25 +1939,15 @@ class CircuitKVCluster():
         num_key_value_groups: int,
     ):
         """
-        Update KV cache using Unified Coverage-Importance eviction (v6.0.0).
+        Update KV cache using Stratified + Reachability eviction (v0.4.0).
 
-        ═══════════════════════════════════════════════════════════════════════════
-        UNIFIED COVERAGE-IMPORTANCE ALGORITHM (v6.0.0 - ICML 2026)
-        ═══════════════════════════════════════════════════════════════════════════
-
-        1. Compute attention matrix from query/key states
-        2. CONCENTRATION SCORES: c[j] = exp(-entropy) * attention_sum[j]
-           - High concentration = focused attention (evidence tokens)
-           - Low concentration = diffuse attention (context tokens)
-        3. SUBMODULAR GREEDY SELECTION:
-           - Maximize weighted coverage: f(S) = Σ_i min(1, Σ_{j∈S} A[i,j] * c[j])
-           - Greedy achieves (1 - 1/e) ≈ 63.2% of optimal
-
-        Key Advantages over v5.0.0 (SDI):
-        - No random walks (deterministic, faster)
-        - No CUDA kernel required (pure PyTorch)
-        - Principled submodular optimization with coverage guarantee
-        - Single unified objective (no ad-hoc MAX combination)
+        This implements multi-source absorbing walks from geographically-diverse landmarks:
+        1. Compute full attention matrix from query/key states
+        2. Run landmark walker (CUDA kernel):
+           - STRATIFIED landmark selection: one per segment, best H2O within segment
+           - Launch walkers from ALL sources (landmarks + query) in parallel
+           - Apply REACHABILITY normalization: visits / total_walkers_that_could_reach
+        3. EVICTION: Select top tokens by normalized landmark walker scores
 
         Args:
             key_states: [bsz, num_heads, seq_len, head_dim]
@@ -2458,15 +1963,19 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        print(f"CircuitKV v6.0.0 (Unified={self.use_unified}) max_capacity_prompt {self.max_capacity_prompt}")
+        print(f"CircuitKV v3.1.0 (L2 Aggregation: RMS + Floor) max_capacity_prompt {self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
 
+        # Initialize CUDA graph if needed
+        self._lazy_init(key_states.device, q_len)
+
         # =====================================================================
-        # STEP 1: Compute window attention (NOT full matrix - O(window*seq))
+        # STEP 1: Compute full attention matrix (averaged across heads)
         # =====================================================================
+        # Use last window queries for attention computation
         attn_weights = torch.matmul(
             query_states[..., -self.window_size:, :],
             key_states.transpose(2, 3)
@@ -2482,96 +1991,132 @@ class CircuitKVCluster():
         mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
         attn_weights[:, :, :, -self.window_size:] += mask[None, None, :, :]
 
-        # Softmax and MAX-POOL across heads
+        # Softmax and MAX-POOL across heads (preserves induction head signal)
+        # v1.0.9: Max-pooling keeps sharp attention patterns from specialized heads
+        # that get washed out by averaging (e.g., induction heads for few-shot)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
-        attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # [window_size, q_len]
+        attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
+
+        # Build full attention matrix approximation
+        # For positions outside the window, use uniform causal attention
+        full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
+
+        # Fill the window portion with actual attention
+        full_attn[-self.window_size:, :] = attn_avg
+
+        # For positions outside window, use H2O-WEIGHTED transitions (not uniform)
+        # This guides walkers toward high-attention tokens instead of random backward jumps
+        n_prefix = q_len - self.window_size
+        if n_prefix > 1:
+            # Compute H2O scores (column sums) from window attention
+            # This captures how much recent tokens attend to each position
+            h2o_scores = attn_avg.sum(dim=0)  # [seq_len]
+            h2o_prefix = h2o_scores[:n_prefix].clone()
+
+            # Ensure positive scores (add small epsilon to avoid zeros)
+            h2o_prefix = h2o_prefix.clamp(min=1e-6)
+
+            # For row i, transition prob to j = h2o[j] / sum(h2o[0:i]) for j < i
+            # This creates a valid probability distribution that sums to 1
+            cumsum = h2o_prefix.cumsum(dim=0)  # [n_prefix]
+
+            # denom[i] = sum(h2o[0:i]) = cumsum[i-1]
+            denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
+            denom[1:] = cumsum[:-1]
+            denom[0] = 1.0  # Avoid div-by-zero (row 0 masked anyway)
+
+            # Broadcast to create transition matrix
+            # h2o_expanded[i,j] = h2o[j] for all i
+            h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
+            denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
+
+            # P[i,j] = h2o[j] / sum(h2o[0:i])
+            h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
+
+            # Apply causal mask (only attend to strictly previous positions)
+            mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
+            full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
-        # STEP 2: Unified Coverage-Importance Selection (v6.0.0) - FAST PATH
+        # STEP 2: Run Causal Influence Walker (CUDA kernel) - v1.0.0
+        # VALIDATED BY PoC5:
+        #   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
+        #   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
         # =====================================================================
-        if self.use_unified:
-            # Compute H2O scores directly from window attention (O(window*seq))
-            h2o_scores = attn_avg.sum(dim=0)  # [q_len]
+        current_idx = q_len - 1
 
-            # Compute concentration: c[j] = exp(-entropy) * h2o[j]
-            # Entropy computed from window attention to each token
-            col_sums = h2o_scores.clamp(min=1e-10)
-            p = attn_avg / col_sums.unsqueeze(0)  # Normalize columns
-            p = p.clamp(min=1e-10)
-            entropy = -(p * torch.log(p)).sum(dim=0)  # [q_len]
-            concentration = torch.exp(-entropy) * h2o_scores
+        # v1.0.0: Use Causal Influence Walker (single source, weighted visits)
+        self._graph.update_and_step_influence_walker(
+            full_attn.contiguous(),
+            current_idx,
+            self.num_walkers,    # 10000 walkers (validated by PoC5)
+            self.max_steps,      # 10 steps (matches oracle computation)
+            self.sink_size,      # Absorb at first 4 tokens
+        )
 
-            # Fast top-k selection based on concentration
-            keep_mask = self._fast_greedy_select(
-                None,  # Not needed for fast path
-                concentration,
-                self.max_capacity_prompt,
-                q_len
-            )
-            print(f"  [v6.0.0] Fast selection: {keep_mask.sum().item()} tokens")
+        # Get normalized scores from influence walker (v1.0.0)
+        influence_scores = self._graph.get_influence_scores()
 
-        else:
-            # =====================================================================
-            # FALLBACK: Legacy SDI or simple top-k (v5.0.0 compatibility)
-            # NOTE: This path creates full q_len x q_len matrix - SLOW for long seqs
-            # =====================================================================
-            self._lazy_init(key_states.device, q_len)
+        # =====================================================================
+        # STEP 2b: MAX(H2O, Influence) with Rank Normalization
+        # - H2O = column sums (good for NarrativeQA-style simple retrieval)
+        # - Influence = walker scores (good for HotpotQA-style multi-hop)
+        # - MAX = hedging strategy that works for both
+        # v3.0.0: + Instruction Anchor Detection for TREC-like tasks
+        # =====================================================================
+        # Compute H2O scores (column sums)
+        h2o_scores = full_attn.sum(dim=0)  # [seq_len]
 
-            # Build full attention matrix (expensive for legacy mode)
-            full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
-            full_attn[-self.window_size:, :] = attn_avg
+        # Rank normalize both to [0, 1] (puts them on equal footing)
+        h2o_rank = self._rank_normalize(h2o_scores[:q_len])
+        influence_rank = self._rank_normalize(influence_scores[:q_len])
 
-            n_prefix = q_len - self.window_size
-            if n_prefix > 1:
-                h2o_prefix = attn_avg.sum(dim=0)[:n_prefix].clone().clamp(min=1e-6)
-                cumsum = h2o_prefix.cumsum(dim=0)
-                denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
-                denom[1:] = cumsum[:-1]
-                denom[0] = 1.0
-                h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
-                denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
-                h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
-                causal_mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
-                full_attn[:n_prefix, :n_prefix] = h2o_trans * causal_mask
+        # v3.1.0: L2 Aggregation (RMS + Floor) - principled combination
+        combined_scores = self._combine_scores_l2(h2o_rank, influence_rank)
 
-            current_idx = q_len - 1
-            attn_contig = full_attn.contiguous()
-
-            query_attention = full_attn[-1, :q_len]
-            task_type = self._detect_task_type(query_attention, q_len) if self.use_sdi else "qa"
-
-            if self.use_sdi and task_type == "summarization":
-                segment_centers = self._compute_segment_centers(q_len, self.num_segments)
-                influence_scores = self._run_multi_source_walks(
-                    full_attn, segment_centers, current_idx, q_len
+        # v3.0.0 Breakthrough 2: Instruction Anchor Detection
+        # Detect and boost instruction-anchoring tokens for few-shot tasks
+        # NOTE: Heuristic method uses attention patterns, doesn't need tokenizer
+        if self.use_instruction_anchors:
+            try:
+                # Detect anchors using attention pattern heuristics
+                self._instruction_anchors = self._detect_instruction_anchors_heuristic(
+                    full_attn, q_len
                 )
-                print(f"  [Legacy SDI] Task=summarization")
-            else:
-                self._graph.update_and_step_influence_walker(
-                    attn_contig, current_idx,
-                    self.num_walkers, self.max_steps, self.sink_size,
-                )
-                influence_scores = self._graph.get_influence_scores()[:q_len].clone()
-                print(f"  [Legacy] query-focused walks")
+                # Boost instruction anchors to ensure they're kept
+                num_boosted = 0
+                for anchor_pos in self._instruction_anchors:
+                    if 0 <= anchor_pos < q_len:
+                        combined_scores[anchor_pos] = 1.0
+                        num_boosted += 1
 
-            h2o_scores = full_attn.sum(dim=0)[:q_len]
-            h2o_rank = self._rank_normalize(h2o_scores)
-            influence_rank = self._rank_normalize(influence_scores)
-            combined_scores = torch.maximum(h2o_rank, influence_rank)
+                # Debug: Log anchor detection results
+                if num_boosted > 0:
+                    print(f"  [v3.0.0] Detected {len(self._instruction_anchors)} instruction anchors, boosted {num_boosted}")
+            except Exception as e:
+                print(f"  [v3.0.0] Anchor detection failed: {e}")
 
-            if self.use_sdi:
-                keys_for_clustering = key_states.mean(dim=1).squeeze(0)
-                keep_mask = self._stratified_diverse_select(
-                    combined_scores, keys_for_clustering, self.max_capacity_prompt, q_len
-                )
-            else:
-                scores_buffer = torch.zeros(self._max_seq_len, device=combined_scores.device, dtype=combined_scores.dtype)
-                scores_buffer[:q_len] = combined_scores
-                keep_mask = self._get_keep_mask(scores_buffer, self.max_capacity_prompt, q_len)
+        # Expand to full buffer size
+        scores = torch.zeros_like(influence_scores)
+        scores[:q_len] = combined_scores
 
         # =====================================================================
-        # STEP 3: Apply Eviction
+        # STEP 3: EVICTION BASED ON MAX(H2O, Influence) SCORES
         # =====================================================================
+        # Compute keep mask using static budgeting
+        keep_mask = self._get_keep_mask(
+            scores,
+            self.max_capacity_prompt,
+            q_len
+        )
+
+        # Debug logging
+        if self.debug:
+            # Compute H2O scores (column sums) for comparison
+            h2o_scores = full_attn.sum(dim=0)
+            self._log_debug(q_len, h2o_scores, scores, keep_mask, full_attn)
+
+        # Apply eviction per head
         # Get indices of tokens to keep (excluding local window which is appended)
         non_local_mask = keep_mask.clone()
         non_local_mask[-self.window_size:] = False
@@ -2638,6 +2183,8 @@ class MaxKVCluster():
         max_steps: int = 10,
         # Debug logging
         debug: bool = False,
+        # v3.1.0: L2 Aggregation
+        floor_weight: float = 0.3,
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -2651,6 +2198,7 @@ class MaxKVCluster():
         self.pooling = pooling
         self.merge = merge
         self.debug = debug
+        self.floor_weight = floor_weight
 
         # Lazy initialization of CUDA graph
         self._graph = None
@@ -2697,6 +2245,20 @@ class MaxKVCluster():
         """Rank-based normalization to [0, 1]."""
         ranks = torch.argsort(torch.argsort(scores)).float()
         return ranks / (len(scores) - 1 + 1e-10)
+
+    def _combine_scores_l2(
+        self,
+        h2o_ranks: torch.Tensor,
+        influence_ranks: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        v3.1.0: L2 Aggregation (RMS + Floor) - Principled score combination.
+        """
+        # RMS aggregation: sqrt((h^2 + v^2) / 2)
+        rms = torch.sqrt((h2o_ranks.square() + influence_ranks.square()) / 2)
+        # Safety floor
+        floor = self.floor_weight * torch.maximum(h2o_ranks, influence_ranks)
+        return torch.maximum(rms, floor)
 
     def _get_keep_mask(self, scores: torch.Tensor, budget: int, seq_len: int) -> torch.Tensor:
         """Get boolean mask indicating which tokens to keep."""
@@ -2821,8 +2383,8 @@ class MaxKVCluster():
         h2o_rank = self._rank_normalize(h2o_scores[:q_len])
         influence_rank = self._rank_normalize(influence_scores[:q_len])
 
-        # MAX combination: robust hedging
-        combined_scores = torch.maximum(h2o_rank, influence_rank)
+        # v3.1.0: L2 Aggregation (RMS + Floor) - principled combination
+        combined_scores = self._combine_scores_l2(h2o_rank, influence_rank)
 
         # Debug: show contribution breakdown
         if self.debug:
@@ -2932,9 +2494,9 @@ def init_circuitkv(self):
         # Capacitive model parameter
         if not hasattr(self.config, 'decay'):
             self.config.decay = 0.99  # EMA decay for charge accumulation
-        # v4.0.0: Bidirectional Circuit Walks (P0 - ICML 2026)
+        # RC+B: Bidirectional Circuit Walks (disabled - hurt narrativeqa score)
         if not hasattr(self.config, 'bidirectional'):
-            self.config.bidirectional = True
+            self.config.bidirectional = False
         # Legacy Landmark Walker parameters (kept for API compatibility)
         if not hasattr(self.config, 'num_landmarks'):
             self.config.num_landmarks = 8  # Legacy (unused in v1.0.0)
@@ -2954,9 +2516,6 @@ def init_circuitkv(self):
         # Debug logging
         if not hasattr(self.config, 'circuitkv_debug'):
             self.config.circuitkv_debug = False
-        # v4.0.0: Multi-Scale Ensemble (P1 - ICML 2026)
-        if not hasattr(self.config, 'use_multi_horizon'):
-            self.config.use_multi_horizon = True
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -2981,8 +2540,6 @@ def init_circuitkv(self):
         use_reachability=self.config.use_reachability,
         # v0.5.0: Landmark Absorbing Walker (legacy)
         absorb_at_landmarks=self.config.absorb_at_landmarks,
-        # v4.0.0 Features
-        use_multi_horizon=self.config.use_multi_horizon,
         # Debug
         debug=self.config.circuitkv_debug,
     )
