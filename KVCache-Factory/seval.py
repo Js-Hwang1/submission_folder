@@ -32,7 +32,7 @@ def evaluate_file(filepath, dataset):
     return round(100 * total / len(predictions), 2)
 
 # Adjust this path to match your results directory
-results_dir = "/Users/j/Desktop/results/Llama3-8B-Instruct-2048/meta-llama-3-8b-instruct_CircuitKV_2048"
+results_dir = "/Users/j/Desktop/submission_folder/results/CKV/meta-llama-3-8b-instruct_2048"
 
 print("CircuitKV Results:")
 print("-" * 40)
