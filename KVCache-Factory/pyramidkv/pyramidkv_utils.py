@@ -11,7 +11,7 @@ from typing import List
 from typing import List, Optional, Tuple, Set
 from transformers.cache_utils import Cache
 
-# v3.0.0 Breakthroughs import
+# v4.0.0 Optional breakthroughs import (instruction anchors, etc.)
 try:
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'CircuitKV'))
@@ -50,7 +50,7 @@ def _get_circuitkv_debug_log():
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n")
-        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v2.0.0 Debug Log - MAX(H2O, Influence)\n")
+        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v4.0.0 Debug Log - Bidirectional + Multi-Scale\n")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n\n")
         _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: score[j] = max(rank_h2o[j], rank_influence[j])\n")
         _CIRCUITKV_DEBUG_LOG.write("  - H2O: Column sums (incoming attention)\n")
@@ -1154,22 +1154,23 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v3.0.0: MAX(H2O, Influence) + ICML 2026 Breakthroughs.
+    CircuitKV v4.0.0: Bidirectional + Multi-Scale Absorbing Walks (ICML 2026).
 
     This class implements a hedging strategy that combines:
     - H2O: Column sums of attention matrix (good for simple retrieval tasks)
     - Influence: Absorbing random walks (good for multi-hop reasoning tasks)
 
+    v4.0.0 Key Innovations (ICML 2026):
+    - BIDIRECTIONAL WALKS (P0): Run walks in BOTH directions (query→sink and sink→query)
+      Score = sqrt(backward * forward) captures BETWEENNESS (tokens on the path)
+    - MULTI-SCALE ENSEMBLE (P1): Run walks at 3 scales (5, 10, 20 steps)
+      Captures local syntax (short), paragraph reasoning (medium), cross-doc (long)
+    - INVERSE-VARIANCE WEIGHTING: Combine scales with adaptive weights
+
     Key Innovation (v2.0.0 - MAX Combination):
     - RANK NORMALIZATION: Both H2O and Influence scores are rank-normalized to [0,1]
     - MAX COMBINATION: score[j] = max(h2o_rank[j], influence_rank[j])
     - HEDGING: Token is kept if EITHER force wants it (robust across task types)
-
-    v3.0.0 Breakthroughs (ICML 2026):
-    - INSTRUCTION ANCHORS: Detect and protect few-shot instruction patterns
-      (fixes TREC = 0.0 by preserving "Question: X\nType: Y" format)
-    - FUNDAMENTAL MATRIX: Principled normalization via Neumann series (optional)
-    - MULTI-HORIZON: Adaptive walk lengths based on attention entropy (optional)
 
     Why MAX > Individual Methods:
     - H2O excels at NarrativeQA-style simple retrieval (popularity matters)
@@ -1180,23 +1181,23 @@ class CircuitKVCluster():
     - H2O = Mass (how popular is this token?)
     - Influence = Path (can this token reach the query through attention chains?)
     - MAX = Gravity Walker (keep token if it has high mass OR is on the path)
-    - Anchors = Fixed points (instruction structure is protected)
+    - Bidirectional = Betweenness (tokens on BOTH forward and backward paths)
 
     Algorithm:
     1. Compute full attention matrix from query/key states
-    2. Compute H2O scores (column sums)
-    3. Run Influence Walker (absorbing random walks from query to sink)
-    4. Rank normalize both scores to [0, 1]
-    5. Combined score = max(h2o_rank, influence_rank)
-    6. [v3.0.0] Detect instruction anchors and boost their scores to 1.0
+    2. [v4.0.0] Run Multi-Scale walks at 3 step lengths, combine with inverse-variance
+    3. [v4.0.0] Run Bidirectional walks (forward + backward), combine with sqrt(prod)
+    4. Compute H2O scores (column sums)
+    5. Rank normalize both H2O and Influence to [0, 1]
+    6. Combined score = max(h2o_rank, influence_rank)
     7. Select top tokens by combined scores for KV cache retention
 
     Configuration:
+    - bidirectional: Enable bidirectional walks (default: True)
+    - use_multi_horizon: Enable multi-scale ensemble (default: True)
     - num_walkers: Number of walkers for influence (default: 10000)
-    - max_steps: Max steps per walker (default: 10)
+    - max_steps: Max steps per walker (default: 10, used if multi_horizon=False)
     - sink_size: Absorbing boundary (default: 4)
-    - use_instruction_anchors: Enable anchor detection (default: True)
-    - use_fundamental_norm: Enable Neumann normalization (default: False, expensive)
     - use_multi_horizon: Enable adaptive walk lengths (default: True)
     """
 
@@ -1217,9 +1218,9 @@ class CircuitKVCluster():
         # Capacitive model parameters
         decay: float = 0.95,  # EMA decay for charge accumulation
         observation_window: int = 1,  # P0+P1: Last W tokens for H2O attention + multi-source walks
-        # RC+B: Bidirectional Circuit Walks
-        # NOTE: Disabled - R@65 improved but narrativeqa dropped (25.10 -> 23.78)
-        bidirectional: bool = False,
+        # v4.0.0: Bidirectional Circuit Walks (P0 - ICML 2026)
+        # Captures betweenness: tokens on BOTH forward and backward paths
+        bidirectional: bool = True,
         # Spectral + Walker + MAX mode (v0.2.0)
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
@@ -1234,10 +1235,10 @@ class CircuitKVCluster():
         absorb_at_landmarks: bool = True,  # Legacy parameter (unused in v1.0.0)
         # Debug logging
         debug: bool = False,
-        # v3.0.0 Breakthroughs (ICML 2026)
-        use_instruction_anchors: bool = False,  # Breakthrough 2: DISABLED (TREC issue was prompting, not KV)
-        use_fundamental_norm: bool = False,  # Breakthrough 1: Principled normalization (expensive)
-        use_multi_horizon: bool = True,  # Breakthrough 3: Adaptive walk lengths
+        # v4.0.0 Features (ICML 2026)
+        use_instruction_anchors: bool = False,  # DISABLED (TREC issue was prompting, not KV)
+        use_fundamental_norm: bool = False,  # Principled normalization (expensive, optional)
+        use_multi_horizon: bool = True,  # P1: Multi-Scale Ensemble (5, 10, 20 steps)
         tokenizer = None,  # Required for instruction anchor detection
     ):
         self.window_size = window_size
@@ -1248,7 +1249,7 @@ class CircuitKVCluster():
         self.num_walkers = num_walkers
         self.num_steps = num_steps
         self.max_steps = max_steps  # v1.0.0: Max steps per walker
-        # v3.0.0 Breakthroughs
+        # v4.0.0 Features
         self.use_instruction_anchors = use_instruction_anchors
         self.use_fundamental_norm = use_fundamental_norm
         self.use_multi_horizon = use_multi_horizon
@@ -1918,7 +1919,7 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        print(f"CircuitKV v3.0.0 (MAX + Instruction Anchors) max_capacity_prompt {self.max_capacity_prompt}")
+        print(f"CircuitKV v4.0.0 (Bidirectional={self.bidirectional}, MultiScale={self.use_multi_horizon}) max_capacity_prompt {self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -1997,20 +1998,115 @@ class CircuitKVCluster():
         # VALIDATED BY PoC5:
         #   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
         #   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
+        # v4.0.0: Bidirectional + Multi-Scale Ensemble
         # =====================================================================
         current_idx = q_len - 1
 
-        # v1.0.0: Use Causal Influence Walker (single source, weighted visits)
-        self._graph.update_and_step_influence_walker(
-            full_attn.contiguous(),
-            current_idx,
-            self.num_walkers,    # 10000 walkers (validated by PoC5)
-            self.max_steps,      # 10 steps (matches oracle computation)
-            self.sink_size,      # Absorb at first 4 tokens
-        )
+        # v4.0.0: Multi-Scale Ensemble (P1)
+        # Run walks at multiple step lengths to capture different dependency scales
+        # OPTIMIZATION NOTE: The kernel computes powf twice per position per step.
+        # Future optimization: precompute temperature-scaled attention in Python.
+        # Precompute contiguous attention once (avoid multiple .contiguous() calls)
+        attn_contig = full_attn.contiguous()
 
-        # Get normalized scores from influence walker (v1.0.0)
-        influence_scores = self._graph.get_influence_scores()
+        if self.use_multi_horizon:
+            # Short walks (5 steps): Local syntax dependencies
+            self._graph.update_and_step_influence_walker(
+                attn_contig, current_idx,
+                self.num_walkers // 3, 5, self.sink_size,
+            )
+            scores_short = self._graph.get_influence_scores()[:q_len].clone()
+
+            # Medium walks (10 steps): Paragraph-level reasoning
+            self._graph.update_and_step_influence_walker(
+                attn_contig, current_idx,
+                self.num_walkers // 3, 10, self.sink_size,
+            )
+            scores_medium = self._graph.get_influence_scores()[:q_len].clone()
+
+            # Long walks (20 steps): Cross-document connections
+            self._graph.update_and_step_influence_walker(
+                attn_contig, current_idx,
+                self.num_walkers // 3, 20, self.sink_size,
+            )
+            scores_long = self._graph.get_influence_scores()[:q_len].clone()
+
+            # Combine with inverse-variance weighting (more stable scales get higher weight)
+            var_short = scores_short.var().clamp(min=1e-6)
+            var_medium = scores_medium.var().clamp(min=1e-6)
+            var_long = scores_long.var().clamp(min=1e-6)
+
+            w_short = 1.0 / var_short
+            w_medium = 1.0 / var_medium
+            w_long = 1.0 / var_long
+            w_total = w_short + w_medium + w_long
+
+            backward_scores = (w_short * scores_short + w_medium * scores_medium + w_long * scores_long) / w_total
+        else:
+            # Single-scale (original behavior)
+            self._graph.update_and_step_influence_walker(
+                attn_contig, current_idx,
+                self.num_walkers, self.max_steps, self.sink_size,
+            )
+            backward_scores = self._graph.get_influence_scores()[:q_len].clone()
+
+        # v4.0.0: Bidirectional Flow (P0)
+        # Forward walks: Start from sink, walk toward query using transposed attention
+        # Captures "can this token reach important sources?"
+        if self.bidirectional:
+            # Transpose attention: A_T[i,j] = A[j,i]
+            # This makes walkers go forward in token order instead of backward
+            attn_transposed = full_attn.t().contiguous()
+
+            # Run forward walks from early positions toward query
+            # Use sink positions as "sources" for forward walks
+            if self.use_multi_horizon:
+                self._graph.update_and_step_influence_walker(
+                    attn_transposed, self.sink_size,  # Start from first non-sink position
+                    self.num_walkers // 3, 5, 0,  # No absorption for forward
+                )
+                fwd_short = self._graph.get_influence_scores()[:q_len].clone()
+
+                self._graph.update_and_step_influence_walker(
+                    attn_transposed, self.sink_size,
+                    self.num_walkers // 3, 10, 0,
+                )
+                fwd_medium = self._graph.get_influence_scores()[:q_len].clone()
+
+                self._graph.update_and_step_influence_walker(
+                    attn_transposed, self.sink_size,
+                    self.num_walkers // 3, 20, 0,
+                )
+                fwd_long = self._graph.get_influence_scores()[:q_len].clone()
+
+                # Combine forward scales
+                var_fwd_short = fwd_short.var().clamp(min=1e-6)
+                var_fwd_medium = fwd_medium.var().clamp(min=1e-6)
+                var_fwd_long = fwd_long.var().clamp(min=1e-6)
+
+                w_fwd_short = 1.0 / var_fwd_short
+                w_fwd_medium = 1.0 / var_fwd_medium
+                w_fwd_long = 1.0 / var_fwd_long
+                w_fwd_total = w_fwd_short + w_fwd_medium + w_fwd_long
+
+                forward_scores = (w_fwd_short * fwd_short + w_fwd_medium * fwd_medium + w_fwd_long * fwd_long) / w_fwd_total
+            else:
+                self._graph.update_and_step_influence_walker(
+                    attn_transposed, self.sink_size,
+                    self.num_walkers, self.max_steps, 0,
+                )
+                forward_scores = self._graph.get_influence_scores()[:q_len].clone()
+
+            # Betweenness-style combination: sqrt(backward * forward)
+            # Tokens on BOTH paths get high scores
+            # Add small epsilon to avoid sqrt(0)
+            influence_scores = torch.sqrt(backward_scores * forward_scores + 1e-8)
+        else:
+            influence_scores = backward_scores
+
+        # Expand to full buffer size
+        full_influence = torch.zeros(self._max_seq_len, device=influence_scores.device, dtype=influence_scores.dtype)
+        full_influence[:q_len] = influence_scores
 
         # =====================================================================
         # STEP 2b: MAX(H2O, Influence) with Rank Normalization
@@ -2024,7 +2120,7 @@ class CircuitKVCluster():
 
         # Rank normalize both to [0, 1] (puts them on equal footing)
         h2o_rank = self._rank_normalize(h2o_scores[:q_len])
-        influence_rank = self._rank_normalize(influence_scores[:q_len])
+        influence_rank = self._rank_normalize(influence_scores)  # Already q_len sized
 
         # MAX combination: keeps token if EITHER force wants it
         combined_scores = torch.maximum(h2o_rank, influence_rank)
@@ -2051,8 +2147,8 @@ class CircuitKVCluster():
             except Exception as e:
                 print(f"  [v3.0.0] Anchor detection failed: {e}")
 
-        # Expand to full buffer size
-        scores = torch.zeros_like(influence_scores)
+        # Expand to full buffer size (use full_influence which has _max_seq_len size)
+        scores = torch.zeros_like(full_influence)
         scores[:q_len] = combined_scores
 
         # =====================================================================
@@ -2432,9 +2528,9 @@ def init_circuitkv(self):
         # Capacitive model parameter
         if not hasattr(self.config, 'decay'):
             self.config.decay = 0.99  # EMA decay for charge accumulation
-        # RC+B: Bidirectional Circuit Walks (disabled - hurt narrativeqa score)
+        # v4.0.0: Bidirectional Circuit Walks (P0 - ICML 2026)
         if not hasattr(self.config, 'bidirectional'):
-            self.config.bidirectional = False
+            self.config.bidirectional = True
         # Legacy Landmark Walker parameters (kept for API compatibility)
         if not hasattr(self.config, 'num_landmarks'):
             self.config.num_landmarks = 8  # Legacy (unused in v1.0.0)
@@ -2454,6 +2550,9 @@ def init_circuitkv(self):
         # Debug logging
         if not hasattr(self.config, 'circuitkv_debug'):
             self.config.circuitkv_debug = False
+        # v4.0.0: Multi-Scale Ensemble (P1 - ICML 2026)
+        if not hasattr(self.config, 'use_multi_horizon'):
+            self.config.use_multi_horizon = True
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -2478,6 +2577,8 @@ def init_circuitkv(self):
         use_reachability=self.config.use_reachability,
         # v0.5.0: Landmark Absorbing Walker (legacy)
         absorb_at_landmarks=self.config.absorb_at_landmarks,
+        # v4.0.0 Features
+        use_multi_horizon=self.config.use_multi_horizon,
         # Debug
         debug=self.config.circuitkv_debug,
     )
