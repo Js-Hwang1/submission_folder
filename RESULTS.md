@@ -12,9 +12,9 @@
 | Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
 |--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
 | FullKV | 25.56 | 32.27 | 39.71 | 43.56 | 35.29 | 21.18 | 28.74 | 23.20 | 26.73 | 74.00 | 90.48 | 42.53 | 4.80 | 69.75 | 59.27 | 53.92 | **41.94** |
-| SnapKV |
+| SnapKV | 25.76 | 26.74 | 37.74 | 43.39 | 34.64 | 19.94 | 24.87 | 22.87 | 25.67 | 73.00 | 90.56 | 41.25 | 5.13 | 69.25 | 60.26 | 56.25 | **41.08** |
 | PyramidKV |
-| H2O |
+| H2O | 25.27 | 26.94 | 35.59 | 42.66 | 30.65 | 18.58 | 26.37 | 22.27 | 26.05 | 73.00 | 91.20 | 41.05 | 5.55 | 69.03 | 59.66 | 56.60 | **40.65** |
 | StreamingLLM |
 | CircuitKV |
 
@@ -24,9 +24,9 @@
 | Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
 |--------|---------------|--------------|---------------|----------|-----------|------|-------------|
 | FullKV | 32.51 | 33.34 | 26.22 | 69.00 | 37.28 | 56.60 | **41.94** |
-| SnapKV |
+| SnapKV | 30.08 | 32.66 | 24.47 | 68.27 | 37.19 | 58.26 | **41.08** |
 | PyramidKV |
-| H2O |
+| H2O | 29.27 | 30.63 | 24.90 | 68.42 | 37.29 | 58.13 | **40.65** |
 | StreamingLLM |
 | CircuitKV |
 
@@ -37,7 +37,7 @@
 - Summarization: GovReport, QMSum, MultiNews
 - Few-shot: TREC, TriviaQA, SAMSum
 - Synthetic: PassageCount, PassageRetrieval
-- Code: LCC, RepoBench-P  
+- Code: LCC, RepoBench-P
 
 ---
 
