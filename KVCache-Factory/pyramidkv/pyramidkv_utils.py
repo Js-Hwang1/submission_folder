@@ -1662,19 +1662,10 @@ class CircuitKVCluster():
         q_len: int,
     ) -> torch.Tensor:
         """
-        Compute concentration scores for each token.
+        Compute concentration scores for each token (FULLY VECTORIZED).
 
         Mathematical Formulation:
             c[j] = exp(-H_j) · Σ_i A[i,j]
-
-        where:
-            - H_j = -Σ_i p[i,j] log(p[i,j]) is the entropy of attention TO token j
-            - p[i,j] = A[i,j] / Σ_k A[k,j] is the normalized distribution
-            - Σ_i A[i,j] is the total attention received by token j (H2O score)
-
-        Interpretation:
-            - High concentration = token receives focused attention from few positions
-            - This indicates the token is "evidence" rather than "context"
 
         Args:
             attention_matrix: Attention weights [seq_len, seq_len] (causal)
@@ -1683,38 +1674,20 @@ class CircuitKVCluster():
         Returns:
             Concentration scores [q_len]
         """
-        device = attention_matrix.device
+        # Step 1: H2O scores (column sums) - vectorized
+        attn = attention_matrix[:q_len, :q_len]
+        h2o_scores = attn.sum(dim=0)  # [q_len]
 
-        # Step 1: Compute total attention received (H2O scores)
-        # h2o[j] = Σ_i A[i,j] (column sums)
-        h2o_scores = attention_matrix.sum(dim=0)[:q_len]  # [q_len]
+        # Step 2: Entropy per column (vectorized)
+        col_sums = h2o_scores.clamp(min=1e-10)
+        p = attn / col_sums.unsqueeze(0)  # Normalize columns
+        p = p.clamp(min=1e-10)
 
-        # Step 2: Compute entropy of attention TO each token
-        # For token j, we look at how attention from positions i >= j is distributed
-        concentration = torch.zeros(q_len, device=device, dtype=torch.float32)
+        # H[j] = -Σ_i p[i,j] log(p[i,j])
+        entropy = -(p * torch.log(p)).sum(dim=0)
 
-        for j in range(q_len):
-            # Attention TO token j from positions i >= j (causal constraint)
-            attn_to_j = attention_matrix[j:q_len, j]  # [q_len - j]
-
-            total_attn = attn_to_j.sum()
-            if total_attn < 1e-10:
-                # No attention to this token
-                concentration[j] = 0.0
-                continue
-
-            # Normalize to probability distribution
-            p_j = attn_to_j / total_attn
-            p_j = p_j.clamp(min=1e-10)  # Avoid log(0)
-
-            # Compute entropy: H = -Σ p log(p)
-            H_j = -(p_j * torch.log(p_j)).sum()
-
-            # Concentration = exp(-H) * total_attention
-            # exp(-H) is high when entropy is low (focused attention)
-            concentration[j] = torch.exp(-H_j) * total_attn
-
-        return concentration
+        # Concentration = exp(-H) * h2o
+        return torch.exp(-entropy) * h2o_scores
 
     def _submodular_greedy_select(
         self,
@@ -1815,13 +1788,11 @@ class CircuitKVCluster():
         q_len: int,
     ) -> torch.Tensor:
         """
-        Fast greedy selection using lazy evaluation.
+        Fast selection using concentration scores (O(n log k), fully vectorized).
 
-        This is an optimized version that avoids recomputing all marginal gains
-        at each step by using lazy evaluation with gain upper bounds.
-
-        For very long sequences, this can be significantly faster than
-        the naive greedy while producing identical results.
+        Instead of iterative greedy selection (slow), we use concentration scores
+        directly for top-k selection. This is much faster while still capturing
+        the importance-weighted coverage intuition.
 
         Args:
             attention_matrix: Attention weights [seq_len, seq_len]
@@ -1832,67 +1803,31 @@ class CircuitKVCluster():
         Returns:
             Boolean mask [q_len] where True = selected
         """
-        device = attention_matrix.device
+        device = concentration.device
 
-        # Compute weighted attention
-        weighted_attn = attention_matrix[:q_len, :q_len] * concentration.unsqueeze(0)
-
-        # Initialize mask with sink and window
+        # Initialize mask with sink and window (always kept)
         mask = torch.zeros(q_len, dtype=torch.bool, device=device)
         mask[:self.sink_size] = True
         window_start = max(self.sink_size, q_len - self.window_size)
         mask[window_start:] = True
 
-        # Current coverage
-        covered = weighted_attn[:, mask].sum(dim=1)
-
-        # Remaining budget
+        # Remaining budget for selection
         current_count = mask.sum().item()
         remaining_budget = max(0, budget - current_count)
 
         if remaining_budget == 0:
             return mask
 
-        # Initialize priority queue with initial gains
-        # (We use a simple tensor for efficiency)
-        candidates_mask = ~mask
-        initial_headroom = (1.0 - covered).clamp(min=0)
-        initial_gains = (torch.minimum(
-            initial_headroom.unsqueeze(1),
-            weighted_attn[:, candidates_mask]
-        )).sum(dim=0)
+        # Use concentration scores for selection
+        # Mask out already-selected positions
+        scores = concentration.clone()
+        scores[mask] = -float('inf')
 
-        # Map candidate indices
-        candidate_indices = torch.where(candidates_mask)[0]
-        gains = torch.zeros(q_len, device=device)
-        gains[candidate_indices] = initial_gains
-
-        for _ in range(remaining_budget):
-            # Get current best candidate
-            gains[mask] = -float('inf')  # Exclude already selected
-            best_token = gains.argmax().item()
-
-            if gains[best_token] <= 0:
-                break  # No more positive gains
-
-            # Verify the gain is still valid by recomputing
-            # (lazy evaluation check)
-            headroom = (1.0 - covered).clamp(min=0)
-            true_gain = torch.minimum(headroom, weighted_attn[:, best_token]).sum()
-
-            if true_gain < gains[best_token] * 0.99:  # Significant decrease
-                # Update gain and try again (don't select yet)
-                gains[best_token] = true_gain
-                continue
-
-            # Select this token
-            mask[best_token] = True
-            covered = covered + weighted_attn[:, best_token]
-            gains[best_token] = -float('inf')
-
-            # Check if we've selected enough
-            if mask.sum().item() >= budget:
-                break
+        # Top-k selection (O(n log k))
+        k = min(remaining_budget, (~mask).sum().item())
+        if k > 0:
+            _, topk_indices = torch.topk(scores, k)
+            mask[topk_indices] = True
 
         return mask
 
@@ -2530,9 +2465,8 @@ class CircuitKVCluster():
             return key_states, value_states
 
         # =====================================================================
-        # STEP 1: Compute attention matrix (averaged across heads)
+        # STEP 1: Compute window attention (NOT full matrix - O(window*seq))
         # =====================================================================
-        # Use last window queries for attention computation
         attn_weights = torch.matmul(
             query_states[..., -self.window_size:, :],
             key_states.transpose(2, 3)
@@ -2548,88 +2482,78 @@ class CircuitKVCluster():
         mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
         attn_weights[:, :, :, -self.window_size:] += mask[None, None, :, :]
 
-        # Softmax and MAX-POOL across heads (preserves induction head signal)
+        # Softmax and MAX-POOL across heads
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
-        attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
-
-        # Build full attention matrix approximation
-        full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
-
-        # Fill the window portion with actual attention
-        full_attn[-self.window_size:, :] = attn_avg
-
-        # For positions outside window, use H2O-weighted transitions
-        n_prefix = q_len - self.window_size
-        if n_prefix > 1:
-            h2o_scores = attn_avg.sum(dim=0)  # [seq_len]
-            h2o_prefix = h2o_scores[:n_prefix].clone().clamp(min=1e-6)
-
-            cumsum = h2o_prefix.cumsum(dim=0)
-            denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
-            denom[1:] = cumsum[:-1]
-            denom[0] = 1.0
-
-            h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
-            denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
-            h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
-
-            causal_mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
-            full_attn[:n_prefix, :n_prefix] = h2o_trans * causal_mask
+        attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # [window_size, q_len]
 
         # =====================================================================
-        # STEP 2: Unified Coverage-Importance Selection (v6.0.0)
+        # STEP 2: Unified Coverage-Importance Selection (v6.0.0) - FAST PATH
         # =====================================================================
         if self.use_unified:
-            # ─────────────────────────────────────────────────────────────────
-            # STEP 2a: Compute Concentration Scores
-            # ─────────────────────────────────────────────────────────────────
-            # c[j] = exp(-entropy) * attention_sum[j]
-            concentration = self._compute_concentration_scores(full_attn, q_len)
-            print(f"  [v6.0.0] Concentration scores computed (max={concentration.max():.3f}, min={concentration.min():.3f})")
+            # Compute H2O scores directly from window attention (O(window*seq))
+            h2o_scores = attn_avg.sum(dim=0)  # [q_len]
 
-            # ─────────────────────────────────────────────────────────────────
-            # STEP 2b: Submodular Greedy Selection
-            # ─────────────────────────────────────────────────────────────────
-            # Maximize: f(S) = Σ_i min(1, Σ_{j∈S} A[i,j] * c[j])
+            # Compute concentration: c[j] = exp(-entropy) * h2o[j]
+            # Entropy computed from window attention to each token
+            col_sums = h2o_scores.clamp(min=1e-10)
+            p = attn_avg / col_sums.unsqueeze(0)  # Normalize columns
+            p = p.clamp(min=1e-10)
+            entropy = -(p * torch.log(p)).sum(dim=0)  # [q_len]
+            concentration = torch.exp(-entropy) * h2o_scores
+
+            # Fast top-k selection based on concentration
             keep_mask = self._fast_greedy_select(
-                full_attn,
+                None,  # Not needed for fast path
                 concentration,
                 self.max_capacity_prompt,
                 q_len
             )
-            print(f"  [v6.0.0] Submodular greedy selection: selected {keep_mask.sum().item()} tokens")
+            print(f"  [v6.0.0] Fast selection: {keep_mask.sum().item()} tokens")
 
         else:
             # =====================================================================
             # FALLBACK: Legacy SDI or simple top-k (v5.0.0 compatibility)
+            # NOTE: This path creates full q_len x q_len matrix - SLOW for long seqs
             # =====================================================================
-            # Initialize CUDA graph for legacy mode
             self._lazy_init(key_states.device, q_len)
+
+            # Build full attention matrix (expensive for legacy mode)
+            full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
+            full_attn[-self.window_size:, :] = attn_avg
+
+            n_prefix = q_len - self.window_size
+            if n_prefix > 1:
+                h2o_prefix = attn_avg.sum(dim=0)[:n_prefix].clone().clamp(min=1e-6)
+                cumsum = h2o_prefix.cumsum(dim=0)
+                denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
+                denom[1:] = cumsum[:-1]
+                denom[0] = 1.0
+                h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
+                denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
+                h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
+                causal_mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
+                full_attn[:n_prefix, :n_prefix] = h2o_trans * causal_mask
 
             current_idx = q_len - 1
             attn_contig = full_attn.contiguous()
 
-            # Task detection
             query_attention = full_attn[-1, :q_len]
             task_type = self._detect_task_type(query_attention, q_len) if self.use_sdi else "qa"
-            self._detected_task_type = task_type
 
-            # Compute influence scores
             if self.use_sdi and task_type == "summarization":
                 segment_centers = self._compute_segment_centers(q_len, self.num_segments)
                 influence_scores = self._run_multi_source_walks(
                     full_attn, segment_centers, current_idx, q_len
                 )
-                print(f"  [Legacy SDI] Task=summarization, multi-source walks")
+                print(f"  [Legacy SDI] Task=summarization")
             else:
                 self._graph.update_and_step_influence_walker(
                     attn_contig, current_idx,
                     self.num_walkers, self.max_steps, self.sink_size,
                 )
                 influence_scores = self._graph.get_influence_scores()[:q_len].clone()
-                print(f"  [Legacy] Task=qa, query-focused walks")
+                print(f"  [Legacy] query-focused walks")
 
-            # H2O + Influence MAX combination
             h2o_scores = full_attn.sum(dim=0)[:q_len]
             h2o_rank = self._rank_normalize(h2o_scores)
             influence_rank = self._rank_normalize(influence_scores)
@@ -2638,19 +2562,12 @@ class CircuitKVCluster():
             if self.use_sdi:
                 keys_for_clustering = key_states.mean(dim=1).squeeze(0)
                 keep_mask = self._stratified_diverse_select(
-                    combined_scores,
-                    keys_for_clustering,
-                    self.max_capacity_prompt,
-                    q_len
+                    combined_scores, keys_for_clustering, self.max_capacity_prompt, q_len
                 )
             else:
                 scores_buffer = torch.zeros(self._max_seq_len, device=combined_scores.device, dtype=combined_scores.dtype)
                 scores_buffer[:q_len] = combined_scores
-                keep_mask = self._get_keep_mask(
-                    scores_buffer,
-                    self.max_capacity_prompt,
-                    q_len
-                )
+                keep_mask = self._get_keep_mask(scores_buffer, self.max_capacity_prompt, q_len)
 
         # =====================================================================
         # STEP 3: Apply Eviction
