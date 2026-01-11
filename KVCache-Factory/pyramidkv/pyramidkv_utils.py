@@ -50,13 +50,12 @@ def _get_circuitkv_debug_log():
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n")
-        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v3.1.0 Debug Log - L2 Aggregation (RMS + Floor)\n")
+        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v2.0.0 Debug Log - MAX(H2O, Influence)\n")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n\n")
-        _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: score[j] = max(RMS(h2o_rank[j], influence_rank[j]), floor)\n")
+        _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: score[j] = max(rank_h2o[j], rank_influence[j])\n")
         _CIRCUITKV_DEBUG_LOG.write("  - H2O: Column sums (incoming attention)\n")
         _CIRCUITKV_DEBUG_LOG.write("  - Influence: Absorbing random walks (query→sink path)\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - RMS: sqrt((h^2 + v^2) / 2) - rewards consistent importance\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - Floor: 0.3 * max(h, v) - safety for strong unimodal signals\n\n")
+        _CIRCUITKV_DEBUG_LOG.write("  - MAX: Hedging - keeps token if EITHER method wants it\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
@@ -1155,46 +1154,50 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v3.1.0: L2 Aggregation (RMS + Floor) for ICML 2026.
+    CircuitKV v3.0.0: MAX(H2O, Influence) + ICML 2026 Breakthroughs.
 
-    This class implements a principled combination of two importance signals:
-    - H2O: Column sums of attention matrix (local importance - one-hop)
-    - Influence: Absorbing random walks (global importance - multi-hop paths)
+    This class implements a hedging strategy that combines:
+    - H2O: Column sums of attention matrix (good for simple retrieval tasks)
+    - Influence: Absorbing random walks (good for multi-hop reasoning tasks)
 
-    Key Innovation (v3.1.0 - L2 Aggregation):
+    Key Innovation (v2.0.0 - MAX Combination):
     - RANK NORMALIZATION: Both H2O and Influence scores are rank-normalized to [0,1]
-    - L2 AGGREGATION: score[j] = sqrt((h2o_rank[j]^2 + influence_rank[j]^2) / 2)
-    - SAFETY FLOOR: Ensures tokens with strong unimodal signal aren't dismissed
-      floor[j] = floor_weight * max(h2o_rank[j], influence_rank[j])
-    - FINAL: combined[j] = max(rms[j], floor[j])
+    - MAX COMBINATION: score[j] = max(h2o_rank[j], influence_rank[j])
+    - HEDGING: Token is kept if EITHER force wants it (robust across task types)
 
-    Why L2 > MAX (Theoretical Justification):
-    - L2 (RMS) is from the generalized mean family: M_p(a,b) = ((a^p + b^p)/2)^(1/p)
-    - p=2 gives the quadratic mean, intermediate between MAX (p=inf) and arithmetic (p=1)
-    - Rewards tokens with CONSISTENT importance across both views
-    - Reduces sensitivity to noise in individual estimators
-    - Smooth gradients for potential end-to-end optimization
+    v3.0.0 Breakthroughs (ICML 2026):
+    - INSTRUCTION ANCHORS: Detect and protect few-shot instruction patterns
+      (fixes TREC = 0.0 by preserving "Question: X\nType: Y" format)
+    - FUNDAMENTAL MATRIX: Principled normalization via Neumann series (optional)
+    - MULTI-HORIZON: Adaptive walk lengths based on attention entropy (optional)
 
-    Comparison (token with h=0.9, v=0.1 vs token with h=0.5, v=0.5):
-    - MAX: 0.9 vs 0.5 (1.8x advantage for extreme-on-one)
-    - RMS: 0.64 vs 0.50 (1.28x advantage - dampened)
-    - This reduces the influence of potentially noisy high scores
+    Why MAX > Individual Methods:
+    - H2O excels at NarrativeQA-style simple retrieval (popularity matters)
+    - Influence excels at HotpotQA-style multi-hop reasoning (path matters)
+    - MAX captures the union of both - works well on BOTH task types
+
+    Physics Analogy:
+    - H2O = Mass (how popular is this token?)
+    - Influence = Path (can this token reach the query through attention chains?)
+    - MAX = Gravity Walker (keep token if it has high mass OR is on the path)
+    - Anchors = Fixed points (instruction structure is protected)
 
     Algorithm:
     1. Compute full attention matrix from query/key states
     2. Compute H2O scores (column sums)
     3. Run Influence Walker (absorbing random walks from query to sink)
     4. Rank normalize both scores to [0, 1]
-    5. Compute RMS: sqrt((h2o_rank^2 + influence_rank^2) / 2)
-    6. Compute floor: floor_weight * max(h2o_rank, influence_rank)
-    7. Combined score = max(rms, floor) - principled with safety
-    8. Select top tokens by combined scores for KV cache retention
+    5. Combined score = max(h2o_rank, influence_rank)
+    6. [v3.0.0] Detect instruction anchors and boost their scores to 1.0
+    7. Select top tokens by combined scores for KV cache retention
 
     Configuration:
     - num_walkers: Number of walkers for influence (default: 10000)
     - max_steps: Max steps per walker (default: 10)
     - sink_size: Absorbing boundary (default: 4)
-    - floor_weight: Safety floor as fraction of MAX (default: 0.3)
+    - use_instruction_anchors: Enable anchor detection (default: True)
+    - use_fundamental_norm: Enable Neumann normalization (default: False, expensive)
+    - use_multi_horizon: Enable adaptive walk lengths (default: True)
     """
 
     def __init__(
@@ -1231,9 +1234,7 @@ class CircuitKVCluster():
         absorb_at_landmarks: bool = True,  # Legacy parameter (unused in v1.0.0)
         # Debug logging
         debug: bool = False,
-        # v3.1.0: L2 Aggregation parameters
-        floor_weight: float = 0.3,  # Safety floor as fraction of MAX (default: 0.3)
-        # v3.0.0 Breakthroughs (ICML 2026) - kept for compatibility
+        # v3.0.0 Breakthroughs (ICML 2026)
         use_instruction_anchors: bool = False,  # Breakthrough 2: DISABLED (TREC issue was prompting, not KV)
         use_fundamental_norm: bool = False,  # Breakthrough 1: Principled normalization (expensive)
         use_multi_horizon: bool = True,  # Breakthrough 3: Adaptive walk lengths
@@ -1247,8 +1248,6 @@ class CircuitKVCluster():
         self.num_walkers = num_walkers
         self.num_steps = num_steps
         self.max_steps = max_steps  # v1.0.0: Max steps per walker
-        # v3.1.0: L2 Aggregation
-        self.floor_weight = floor_weight
         # v3.0.0 Breakthroughs
         self.use_instruction_anchors = use_instruction_anchors
         self.use_fundamental_norm = use_fundamental_norm
@@ -1597,50 +1596,6 @@ class CircuitKVCluster():
             return torch.ones_like(ranks)
         return ranks / (n - 1)
 
-    def _combine_scores_l2(
-        self,
-        h2o_ranks: torch.Tensor,
-        influence_ranks: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        v3.1.0: L2 Aggregation (RMS + Floor) - Principled score combination.
-
-        Combines H2O and Influence using the quadratic mean (L2/RMS) from the
-        generalized mean family, with a safety floor to preserve strong unimodal signals.
-
-        Mathematical Foundation:
-        - Generalized mean: M_p(a,b) = ((a^p + b^p)/2)^(1/p)
-        - p=1: Arithmetic mean (sum/2)
-        - p=2: Quadratic mean / RMS (what we use)
-        - p→∞: Maximum
-
-        Why RMS (p=2)?
-        - Intermediate between MAX and arithmetic mean
-        - Rewards tokens with consistent importance on BOTH views
-        - Reduces sensitivity to noise in individual estimators
-        - Smooth, differentiable (unlike MAX)
-
-        Safety Floor:
-        - Ensures tokens with strong unimodal importance aren't dismissed
-        - floor = floor_weight * max(h2o, influence)
-        - Typical floor_weight = 0.3 (30% of MAX is minimum score)
-
-        Args:
-            h2o_ranks: Rank-normalized H2O scores in [0, 1]
-            influence_ranks: Rank-normalized influence scores in [0, 1]
-
-        Returns:
-            Combined importance scores in [0, 1]
-        """
-        # RMS aggregation: sqrt((h^2 + v^2) / 2)
-        rms = torch.sqrt((h2o_ranks.square() + influence_ranks.square()) / 2)
-
-        # Safety floor: ensures strong unimodal signals aren't dismissed
-        floor = self.floor_weight * torch.maximum(h2o_ranks, influence_ranks)
-
-        # Final score: max of RMS and floor
-        return torch.maximum(rms, floor)
-
     def _detect_instruction_anchors_heuristic(
         self,
         attention_matrix: torch.Tensor,
@@ -1963,7 +1918,7 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        print(f"CircuitKV v3.1.0 (L2 Aggregation: RMS + Floor) max_capacity_prompt {self.max_capacity_prompt}")
+        print(f"CircuitKV v3.0.0 (MAX + Instruction Anchors) max_capacity_prompt {self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2071,8 +2026,8 @@ class CircuitKVCluster():
         h2o_rank = self._rank_normalize(h2o_scores[:q_len])
         influence_rank = self._rank_normalize(influence_scores[:q_len])
 
-        # v3.1.0: L2 Aggregation (RMS + Floor) - principled combination
-        combined_scores = self._combine_scores_l2(h2o_rank, influence_rank)
+        # MAX combination: keeps token if EITHER force wants it
+        combined_scores = torch.maximum(h2o_rank, influence_rank)
 
         # v3.0.0 Breakthrough 2: Instruction Anchor Detection
         # Detect and boost instruction-anchoring tokens for few-shot tasks
@@ -2183,8 +2138,6 @@ class MaxKVCluster():
         max_steps: int = 10,
         # Debug logging
         debug: bool = False,
-        # v3.1.0: L2 Aggregation
-        floor_weight: float = 0.3,
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -2198,7 +2151,6 @@ class MaxKVCluster():
         self.pooling = pooling
         self.merge = merge
         self.debug = debug
-        self.floor_weight = floor_weight
 
         # Lazy initialization of CUDA graph
         self._graph = None
@@ -2245,20 +2197,6 @@ class MaxKVCluster():
         """Rank-based normalization to [0, 1]."""
         ranks = torch.argsort(torch.argsort(scores)).float()
         return ranks / (len(scores) - 1 + 1e-10)
-
-    def _combine_scores_l2(
-        self,
-        h2o_ranks: torch.Tensor,
-        influence_ranks: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        v3.1.0: L2 Aggregation (RMS + Floor) - Principled score combination.
-        """
-        # RMS aggregation: sqrt((h^2 + v^2) / 2)
-        rms = torch.sqrt((h2o_ranks.square() + influence_ranks.square()) / 2)
-        # Safety floor
-        floor = self.floor_weight * torch.maximum(h2o_ranks, influence_ranks)
-        return torch.maximum(rms, floor)
 
     def _get_keep_mask(self, scores: torch.Tensor, budget: int, seq_len: int) -> torch.Tensor:
         """Get boolean mask indicating which tokens to keep."""
@@ -2383,8 +2321,8 @@ class MaxKVCluster():
         h2o_rank = self._rank_normalize(h2o_scores[:q_len])
         influence_rank = self._rank_normalize(influence_scores[:q_len])
 
-        # v3.1.0: L2 Aggregation (RMS + Floor) - principled combination
-        combined_scores = self._combine_scores_l2(h2o_rank, influence_rank)
+        # MAX combination: robust hedging
+        combined_scores = torch.maximum(h2o_rank, influence_rank)
 
         # Debug: show contribution breakdown
         if self.debug:
