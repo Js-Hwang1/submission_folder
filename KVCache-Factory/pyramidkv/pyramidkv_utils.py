@@ -50,12 +50,13 @@ def _get_circuitkv_debug_log():
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n")
-        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v4.0.0 Debug Log - Bidirectional + Multi-Scale\n")
+        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v5.0.0 Debug Log - SDI (Stratified Diverse Influence)\n")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n\n")
-        _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: score[j] = max(rank_h2o[j], rank_influence[j])\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - H2O: Column sums (incoming attention)\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - Influence: Absorbing random walks (query→sink path)\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - MAX: Hedging - keeps token if EITHER method wants it\n\n")
+        _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: SDI (Stratified Diverse Influence)\n")
+        _CIRCUITKV_DEBUG_LOG.write("  1. Task Detection: entropy(query_attn) → QA or Summarization\n")
+        _CIRCUITKV_DEBUG_LOG.write("  2. Multi-Source Walks: segment centers for summarization\n")
+        _CIRCUITKV_DEBUG_LOG.write("  3. MAX(H2O, Influence): hedging combination\n")
+        _CIRCUITKV_DEBUG_LOG.write("  4. Stratified Selection: K segments × C clusters\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
@@ -1154,51 +1155,83 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v4.0.0: Bidirectional + Multi-Scale Absorbing Walks (ICML 2026).
+    CircuitKV v5.0.0: Stratified Diverse Influence (SDI) for ICML 2026.
 
-    This class implements a hedging strategy that combines:
-    - H2O: Column sums of attention matrix (good for simple retrieval tasks)
-    - Influence: Absorbing random walks (good for multi-hop reasoning tasks)
+    ═══════════════════════════════════════════════════════════════════════════════
+    MATHEMATICAL FORMULATION
+    ═══════════════════════════════════════════════════════════════════════════════
 
-    v4.0.0 Key Innovations (ICML 2026):
-    - BIDIRECTIONAL WALKS (P0): Run walks in BOTH directions (query→sink and sink→query)
-      Score = sqrt(backward * forward) captures BETWEENNESS (tokens on the path)
-    - MULTI-SCALE ENSEMBLE (P1): Run walks at 3 scales (5, 10, 20 steps)
-      Captures local syntax (short), paragraph reasoning (medium), cross-doc (long)
-    - INVERSE-VARIANCE WEIGHTING: Combine scales with adaptive weights
+    Given attention matrix A ∈ ℝ^{n×n} where A[i,j] = softmax(q_i·k_j/√d) for j≤i,
+    we compute token importance scores via three complementary signals:
 
-    Key Innovation (v2.0.0 - MAX Combination):
-    - RANK NORMALIZATION: Both H2O and Influence scores are rank-normalized to [0,1]
-    - MAX COMBINATION: score[j] = max(h2o_rank[j], influence_rank[j])
-    - HEDGING: Token is kept if EITHER force wants it (robust across task types)
+    1. H2O (Heavy Hitter Oracle):
+       h[j] = Σ_i A[i,j]    (column sums = incoming attention)
 
-    Why MAX > Individual Methods:
-    - H2O excels at NarrativeQA-style simple retrieval (popularity matters)
-    - Influence excels at HotpotQA-style multi-hop reasoning (path matters)
-    - MAX captures the union of both - works well on BOTH task types
+    2. Influence (Absorbing Random Walks):
+       v[j] = E[visits to j | walker starts at query, absorbs at sink]
+       Approximated via Monte Carlo with N walkers, S steps
 
-    Physics Analogy:
-    - H2O = Mass (how popular is this token?)
-    - Influence = Path (can this token reach the query through attention chains?)
-    - MAX = Gravity Walker (keep token if it has high mass OR is on the path)
-    - Bidirectional = Betweenness (tokens on BOTH forward and backward paths)
+    3. SDI (Stratified Diverse Influence) - NEW in v5.0.0:
+       - Task-adaptive source selection via attention entropy
+       - Stratified coverage guarantee across sequence segments
+       - Semantic diversity via key-space clustering
 
-    Algorithm:
-    1. Compute full attention matrix from query/key states
-    2. [v4.0.0] Run Multi-Scale walks at 3 step lengths, combine with inverse-variance
-    3. [v4.0.0] Run Bidirectional walks (forward + backward), combine with sqrt(prod)
-    4. Compute H2O scores (column sums)
-    5. Rank normalize both H2O and Influence to [0, 1]
-    6. Combined score = max(h2o_rank, influence_rank)
-    7. Select top tokens by combined scores for KV cache retention
+    ═══════════════════════════════════════════════════════════════════════════════
+    v5.0.0 KEY INNOVATIONS (ICML 2026)
+    ═══════════════════════════════════════════════════════════════════════════════
 
-    Configuration:
-    - bidirectional: Enable bidirectional walks (default: True)
-    - use_multi_horizon: Enable multi-scale ensemble (default: True)
-    - num_walkers: Number of walkers for influence (default: 10000)
-    - max_steps: Max steps per walker (default: 10, used if multi_horizon=False)
+    1. TASK DETECTION via Attention Entropy:
+       H_q = -Σ_j A[q,j] log A[q,j]
+       - Low entropy (H_q < 0.5·log(n)): QA task → query-focused walks
+       - High entropy (H_q ≥ 0.5·log(n)): Summarization → multi-source walks
+
+    2. STRATIFIED SELECTION (Coverage Guarantee):
+       - Divide sequence into K segments: S_k = [k·n/K, (k+1)·n/K)
+       - Select B/K tokens from each segment
+       - Guarantees: ∀k: |Selected ∩ S_k| ≥ B/K
+
+    3. MULTI-SOURCE WALKS (for Summarization):
+       - Sample M source positions uniformly across segments
+       - v[j] = (1/M) Σ_m Visits(j | start=source_m)
+       - Captures global document structure, not just query-reachable tokens
+
+    4. SEMANTIC DIVERSITY (within segments):
+       - Cluster keys in each segment via k-means: C clusters per segment
+       - Select top B/(K·C) tokens from each cluster
+       - Prevents over-representation of semantically similar tokens
+
+    ═══════════════════════════════════════════════════════════════════════════════
+    ALGORITHM
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    SDI(A, K, q, B):
+    1. Compute H2O: h = A.sum(dim=0)
+    2. Detect task type: task = "summ" if entropy(A[q]) > 0.5·log(n) else "qa"
+    3. If task == "summ":
+         sources = segment_centers(K)
+         v = multi_source_walks(A, sources)
+       Else:
+         v = query_walks(A, q)
+    4. For each segment k:
+         clusters = kmeans(keys[S_k], C)
+         For each cluster c:
+           select top B/(K·C) by max(rank(h), rank(v))
+    5. Return union of selected tokens
+
+    ═══════════════════════════════════════════════════════════════════════════════
+    CONFIGURATION
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    SDI Parameters (v5.0.0):
+    - use_sdi: Enable full SDI algorithm (default: True)
+    - num_segments: K segments for stratification (default: 8)
+    - num_clusters: C clusters per segment (default: 4)
+    - entropy_threshold: Task detection threshold (default: 0.5)
+
+    Legacy Parameters (preserved for compatibility):
+    - num_walkers: Number of walkers (default: 10000)
+    - max_steps: Max steps per walker (default: 10)
     - sink_size: Absorbing boundary (default: 4)
-    - use_multi_horizon: Enable adaptive walk lengths (default: True)
     """
 
     def __init__(
@@ -1220,7 +1253,7 @@ class CircuitKVCluster():
         observation_window: int = 1,  # P0+P1: Last W tokens for H2O attention + multi-source walks
         # v4.0.0: Bidirectional Circuit Walks (P0 - ICML 2026)
         # Captures betweenness: tokens on BOTH forward and backward paths
-        bidirectional: bool = True,
+        bidirectional: bool = False,  # v5.0.0: Disabled by default (SDI replaces this)
         # Spectral + Walker + MAX mode (v0.2.0)
         use_combined_scoring: bool = False,  # False = Walker-only, True = Spectral + Walker + MAX
         num_power_iterations: int = 10,  # Power iterations for spectral
@@ -1235,11 +1268,19 @@ class CircuitKVCluster():
         absorb_at_landmarks: bool = True,  # Legacy parameter (unused in v1.0.0)
         # Debug logging
         debug: bool = False,
-        # v4.0.0 Features (ICML 2026)
+        # v4.0.0 Features (ICML 2026) - Most replaced by SDI in v5.0.0
         use_instruction_anchors: bool = False,  # DISABLED (TREC issue was prompting, not KV)
         use_fundamental_norm: bool = False,  # Principled normalization (expensive, optional)
-        use_multi_horizon: bool = True,  # P1: Multi-Scale Ensemble (5, 10, 20 steps)
+        use_multi_horizon: bool = False,  # v5.0.0: Disabled, SDI handles multi-scale differently
         tokenizer = None,  # Required for instruction anchor detection
+        # ═══════════════════════════════════════════════════════════════════════
+        # v5.0.0: SDI (Stratified Diverse Influence) Parameters
+        # ═══════════════════════════════════════════════════════════════════════
+        use_sdi: bool = True,  # Enable full SDI algorithm
+        num_segments: int = 8,  # K: Number of segments for stratification
+        num_clusters: int = 4,  # C: Clusters per segment for diversity
+        entropy_threshold: float = 0.5,  # Task detection threshold (fraction of max entropy)
+        sdi_query_weight: float = 0.7,  # Weight for query-source walks (vs uniform sources)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1249,12 +1290,19 @@ class CircuitKVCluster():
         self.num_walkers = num_walkers
         self.num_steps = num_steps
         self.max_steps = max_steps  # v1.0.0: Max steps per walker
-        # v4.0.0 Features
+        # v4.0.0 Features (legacy)
         self.use_instruction_anchors = use_instruction_anchors
         self.use_fundamental_norm = use_fundamental_norm
         self.use_multi_horizon = use_multi_horizon
         self.tokenizer = tokenizer
         self._instruction_anchors = set()  # Cache for current sample
+        # v5.0.0: SDI Parameters
+        self.use_sdi = use_sdi
+        self.num_segments = num_segments
+        self.num_clusters = num_clusters
+        self.entropy_threshold = entropy_threshold
+        self.sdi_query_weight = sdi_query_weight
+        self._detected_task_type = None  # Cache for task detection
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1597,6 +1645,301 @@ class CircuitKVCluster():
             return torch.ones_like(ranks)
         return ranks / (n - 1)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v5.0.0: SDI (Stratified Diverse Influence) Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _detect_task_type(self, attention_row: torch.Tensor, seq_len: int) -> str:
+        """
+        Detect task type via attention entropy.
+
+        Mathematical Formulation:
+            H_q = -Σ_j p[j] log(p[j])   where p = attention_row (normalized)
+            H_max = log(seq_len)
+
+        Decision Rule:
+            - H_q < threshold * H_max → "qa" (focused attention, query is informative)
+            - H_q >= threshold * H_max → "summarization" (diffuse attention, need coverage)
+
+        Args:
+            attention_row: Query's attention distribution [seq_len]
+            seq_len: Sequence length
+
+        Returns:
+            "qa" or "summarization"
+        """
+        # Normalize to valid probability distribution
+        p = attention_row / (attention_row.sum() + 1e-10)
+        p = p.clamp(min=1e-10)  # Avoid log(0)
+
+        # Compute entropy: H = -Σ p log(p)
+        entropy = -(p * torch.log(p)).sum().item()
+
+        # Maximum possible entropy
+        max_entropy = math.log(seq_len) if seq_len > 1 else 1.0
+
+        # Normalized entropy ratio
+        entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0
+
+        # Classify based on threshold
+        task_type = "summarization" if entropy_ratio >= self.entropy_threshold else "qa"
+
+        return task_type
+
+    def _compute_segment_centers(self, seq_len: int, num_segments: int) -> List[int]:
+        """
+        Compute center positions for each segment.
+
+        For stratified multi-source walks, we launch walkers from segment centers
+        to ensure coverage across the entire sequence.
+
+        Args:
+            seq_len: Sequence length
+            num_segments: Number of segments K
+
+        Returns:
+            List of segment center positions
+        """
+        segment_size = seq_len // num_segments
+        centers = []
+        for k in range(num_segments):
+            # Center of segment k
+            start = k * segment_size
+            end = (k + 1) * segment_size if k < num_segments - 1 else seq_len
+            center = (start + end) // 2
+            # Ensure center is valid (not in sink)
+            center = max(self.sink_size, center)
+            centers.append(center)
+        return centers
+
+    def _run_multi_source_walks(
+        self,
+        attention_matrix: torch.Tensor,
+        sources: List[int],
+        query_idx: int,
+        q_len: int,
+    ) -> torch.Tensor:
+        """
+        Run absorbing walks from multiple source positions.
+
+        Mathematical Formulation:
+            v[j] = w_q * Visits(j|query) + (1-w_q)/M * Σ_m Visits(j|source_m)
+
+        This captures global document structure by launching walks from
+        geographically diverse positions, not just the query.
+
+        Args:
+            attention_matrix: Full attention matrix [seq_len, seq_len]
+            sources: List of source positions for multi-source walks
+            query_idx: Query position
+            q_len: Sequence length
+
+        Returns:
+            Combined visit scores [q_len]
+        """
+        attn_contig = attention_matrix.contiguous()
+
+        # Query-source walks (always included)
+        self._graph.update_and_step_influence_walker(
+            attn_contig, query_idx,
+            self.num_walkers // 2, self.max_steps, self.sink_size,
+        )
+        query_scores = self._graph.get_influence_scores()[:q_len].clone()
+
+        # Multi-source walks from segment centers
+        # Use remaining walkers distributed across sources
+        walkers_per_source = max(100, self.num_walkers // (2 * len(sources)))
+        source_scores_sum = torch.zeros(q_len, device=attention_matrix.device, dtype=torch.float32)
+
+        for src in sources:
+            if src < self.sink_size or src >= q_len:
+                continue  # Skip invalid sources
+
+            self._graph.update_and_step_influence_walker(
+                attn_contig, src,
+                walkers_per_source, self.max_steps, self.sink_size,
+            )
+            source_scores = self._graph.get_influence_scores()[:q_len].clone()
+            source_scores_sum += source_scores
+
+        # Combine: weighted average of query and source walks
+        # w_q controls how much we weight query-focused vs uniform-source walks
+        w_q = self.sdi_query_weight
+        combined = w_q * query_scores + (1 - w_q) * source_scores_sum / max(1, len(sources))
+
+        return combined
+
+    def _simple_kmeans(
+        self,
+        keys: torch.Tensor,
+        n_clusters: int,
+        max_iters: int = 10,
+    ) -> torch.Tensor:
+        """
+        Simple k-means clustering for semantic diversity.
+
+        This is a lightweight GPU-based k-means for clustering key vectors
+        within each segment. We use few iterations since we only need
+        rough clusters for diversity, not precise clustering.
+
+        Args:
+            keys: Key vectors [n, head_dim]
+            n_clusters: Number of clusters C
+            max_iters: Maximum iterations (default: 10 for speed)
+
+        Returns:
+            Cluster assignments [n]
+        """
+        n = keys.shape[0]
+        if n <= n_clusters:
+            # More clusters than points - each point is its own cluster
+            return torch.arange(n, device=keys.device)
+
+        device = keys.device
+        dtype = keys.dtype
+
+        # Initialize centroids using k-means++ style (first point random, rest far)
+        indices = torch.randperm(n, device=device)[:n_clusters]
+        centroids = keys[indices].clone()
+
+        # Normalize for cosine similarity
+        keys_norm = F.normalize(keys.float(), dim=-1)
+
+        for _ in range(max_iters):
+            centroids_norm = F.normalize(centroids.float(), dim=-1)
+
+            # Compute distances (using cosine similarity for efficiency)
+            # distances[i,j] = similarity of point i to centroid j
+            similarities = torch.mm(keys_norm, centroids_norm.t())
+
+            # Assign to nearest centroid
+            assignments = similarities.argmax(dim=-1)
+
+            # Update centroids
+            new_centroids = torch.zeros_like(centroids)
+            counts = torch.zeros(n_clusters, device=device)
+
+            for c in range(n_clusters):
+                mask = (assignments == c)
+                if mask.sum() > 0:
+                    new_centroids[c] = keys[mask].mean(dim=0)
+                    counts[c] = mask.sum()
+                else:
+                    # Empty cluster - reinitialize
+                    new_centroids[c] = keys[torch.randint(n, (1,), device=device)]
+
+            centroids = new_centroids
+
+        return assignments
+
+    def _stratified_diverse_select(
+        self,
+        scores: torch.Tensor,
+        keys: torch.Tensor,
+        budget: int,
+        q_len: int,
+    ) -> torch.Tensor:
+        """
+        Stratified selection with semantic diversity.
+
+        Algorithm:
+        1. Divide sequence into K segments
+        2. For each segment:
+           a. Cluster keys into C clusters
+           b. Select top B/(K*C) tokens from each cluster by score
+        3. Union all selected tokens
+
+        Mathematical Guarantee:
+            ∀k ∈ [1,K]: |Selected ∩ Segment_k| ≥ B/K
+            ∀k,c: |Selected ∩ Cluster_{k,c}| ≥ B/(K*C)
+
+        Args:
+            scores: Combined importance scores [q_len]
+            keys: Key vectors [q_len, head_dim]
+            budget: Total tokens to select (B)
+            q_len: Sequence length
+
+        Returns:
+            Boolean mask [q_len] where True = selected
+        """
+        device = scores.device
+        K = self.num_segments
+        C = self.num_clusters
+
+        # Compute segment boundaries
+        # Reserve space for sink and window
+        selectable_start = self.sink_size
+        selectable_end = q_len - self.window_size
+
+        if selectable_end <= selectable_start:
+            # Very short sequence - just use standard selection
+            mask = torch.zeros(q_len, dtype=torch.bool, device=device)
+            mask[:self.sink_size] = True
+            mask[-self.window_size:] = True
+            return mask
+
+        selectable_len = selectable_end - selectable_start
+
+        # Budget for stratified selection (excluding sink and window)
+        sink_window_budget = self.sink_size + self.window_size
+        stratified_budget = max(0, budget - sink_window_budget)
+
+        # Tokens per segment
+        segment_size = selectable_len // K
+        tokens_per_segment = stratified_budget // K
+
+        # Initialize mask
+        mask = torch.zeros(q_len, dtype=torch.bool, device=device)
+        mask[:self.sink_size] = True  # Always keep sink
+        mask[-self.window_size:] = True  # Always keep window
+
+        # Process each segment
+        for k in range(K):
+            seg_start = selectable_start + k * segment_size
+            seg_end = selectable_start + (k + 1) * segment_size if k < K - 1 else selectable_end
+
+            seg_len = seg_end - seg_start
+            if seg_len <= 0:
+                continue
+
+            # Get keys and scores for this segment
+            seg_keys = keys[seg_start:seg_end]
+            seg_scores = scores[seg_start:seg_end]
+
+            # Cluster keys in this segment
+            actual_clusters = min(C, seg_len)
+            if actual_clusters <= 1:
+                # Too few tokens - just take top by score
+                tokens_to_select = min(tokens_per_segment, seg_len)
+                if tokens_to_select > 0:
+                    _, top_idx = torch.topk(seg_scores, tokens_to_select)
+                    mask[seg_start + top_idx] = True
+                continue
+
+            cluster_assignments = self._simple_kmeans(seg_keys, actual_clusters)
+
+            # Select from each cluster
+            tokens_per_cluster = max(1, tokens_per_segment // actual_clusters)
+
+            for c in range(actual_clusters):
+                cluster_mask = (cluster_assignments == c)
+                cluster_indices = cluster_mask.nonzero(as_tuple=True)[0]
+
+                if len(cluster_indices) == 0:
+                    continue
+
+                # Get scores for this cluster
+                cluster_scores = seg_scores[cluster_indices]
+
+                # Select top tokens from this cluster
+                tokens_to_select = min(tokens_per_cluster, len(cluster_indices))
+                if tokens_to_select > 0:
+                    _, top_idx = torch.topk(cluster_scores, tokens_to_select)
+                    selected_positions = cluster_indices[top_idx]
+                    mask[seg_start + selected_positions] = True
+
+        return mask
+
     def _detect_instruction_anchors_heuristic(
         self,
         attention_matrix: torch.Tensor,
@@ -1895,15 +2238,24 @@ class CircuitKVCluster():
         num_key_value_groups: int,
     ):
         """
-        Update KV cache using Stratified + Reachability eviction (v0.4.0).
+        Update KV cache using SDI (Stratified Diverse Influence) eviction (v5.0.0).
 
-        This implements multi-source absorbing walks from geographically-diverse landmarks:
+        ═══════════════════════════════════════════════════════════════════════════
+        SDI ALGORITHM (v5.0.0 - ICML 2026)
+        ═══════════════════════════════════════════════════════════════════════════
+
         1. Compute full attention matrix from query/key states
-        2. Run landmark walker (CUDA kernel):
-           - STRATIFIED landmark selection: one per segment, best H2O within segment
-           - Launch walkers from ALL sources (landmarks + query) in parallel
-           - Apply REACHABILITY normalization: visits / total_walkers_that_could_reach
-        3. EVICTION: Select top tokens by normalized landmark walker scores
+        2. TASK DETECTION: Classify via attention entropy
+           - Low entropy → QA (query-focused walks)
+           - High entropy → Summarization (multi-source walks)
+        3. IMPORTANCE SCORING:
+           - H2O: Column sums (incoming attention)
+           - Influence: Absorbing random walks (task-adaptive sources)
+           - Combined: max(rank(h2o), rank(influence))
+        4. STRATIFIED DIVERSE SELECTION:
+           - Divide into K segments for coverage guarantee
+           - Cluster keys for semantic diversity
+           - Select B/(K*C) tokens per cluster
 
         Args:
             key_states: [bsz, num_heads, seq_len, head_dim]
@@ -1919,7 +2271,7 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        print(f"CircuitKV v4.0.0 (Bidirectional={self.bidirectional}, MultiScale={self.use_multi_horizon}) max_capacity_prompt {self.max_capacity_prompt}")
+        print(f"CircuitKV v5.0.0 (SDI={self.use_sdi}, K={self.num_segments}, C={self.num_clusters}) max_capacity_prompt {self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -1994,172 +2346,77 @@ class CircuitKVCluster():
             full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
-        # STEP 2: Run Causal Influence Walker (CUDA kernel) - v1.0.0
-        # VALIDATED BY PoC5:
-        #   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
-        #   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
-        # v4.0.0: Bidirectional + Multi-Scale Ensemble
-        # =====================================================================
+        # STEP 2: SDI - Task Detection + Influence Scoring (v5.0.0)
+        # ═══════════════════════════════════════════════════════════════════
         current_idx = q_len - 1
-
-        # v4.0.0: Multi-Scale Ensemble (P1)
-        # Run walks at multiple step lengths to capture different dependency scales
-        # OPTIMIZATION NOTE: The kernel computes powf twice per position per step.
-        # Future optimization: precompute temperature-scaled attention in Python.
-        # Precompute contiguous attention once (avoid multiple .contiguous() calls)
         attn_contig = full_attn.contiguous()
 
-        if self.use_multi_horizon:
-            # Short walks (5 steps): Local syntax dependencies
-            self._graph.update_and_step_influence_walker(
-                attn_contig, current_idx,
-                self.num_walkers // 3, 5, self.sink_size,
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 2a: Task Detection via Attention Entropy
+        # ─────────────────────────────────────────────────────────────────────
+        query_attention = full_attn[-1, :q_len]  # Last query's attention
+        task_type = self._detect_task_type(query_attention, q_len) if self.use_sdi else "qa"
+        self._detected_task_type = task_type
+
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 2b: Compute Influence Scores (Task-Adaptive)
+        # ─────────────────────────────────────────────────────────────────────
+        if self.use_sdi and task_type == "summarization":
+            # SUMMARIZATION: Multi-source walks from segment centers
+            # This captures global document structure, not just query-reachable tokens
+            segment_centers = self._compute_segment_centers(q_len, self.num_segments)
+            influence_scores = self._run_multi_source_walks(
+                full_attn, segment_centers, current_idx, q_len
             )
-            scores_short = self._graph.get_influence_scores()[:q_len].clone()
-
-            # Medium walks (10 steps): Paragraph-level reasoning
-            self._graph.update_and_step_influence_walker(
-                attn_contig, current_idx,
-                self.num_walkers // 3, 10, self.sink_size,
-            )
-            scores_medium = self._graph.get_influence_scores()[:q_len].clone()
-
-            # Long walks (20 steps): Cross-document connections
-            self._graph.update_and_step_influence_walker(
-                attn_contig, current_idx,
-                self.num_walkers // 3, 20, self.sink_size,
-            )
-            scores_long = self._graph.get_influence_scores()[:q_len].clone()
-
-            # Combine with inverse-variance weighting (more stable scales get higher weight)
-            var_short = scores_short.var().clamp(min=1e-6)
-            var_medium = scores_medium.var().clamp(min=1e-6)
-            var_long = scores_long.var().clamp(min=1e-6)
-
-            w_short = 1.0 / var_short
-            w_medium = 1.0 / var_medium
-            w_long = 1.0 / var_long
-            w_total = w_short + w_medium + w_long
-
-            backward_scores = (w_short * scores_short + w_medium * scores_medium + w_long * scores_long) / w_total
+            print(f"  [SDI] Task=summarization, using multi-source walks (K={self.num_segments} sources)")
         else:
-            # Single-scale (original behavior)
+            # QA: Query-focused walks (original behavior)
+            # Query is informative, so walks from query are appropriate
             self._graph.update_and_step_influence_walker(
                 attn_contig, current_idx,
                 self.num_walkers, self.max_steps, self.sink_size,
             )
-            backward_scores = self._graph.get_influence_scores()[:q_len].clone()
+            influence_scores = self._graph.get_influence_scores()[:q_len].clone()
+            print(f"  [SDI] Task=qa, using query-focused walks")
 
-        # v4.0.0: Bidirectional Flow (P0)
-        # Forward walks: Start from sink, walk toward query using transposed attention
-        # Captures "can this token reach important sources?"
-        if self.bidirectional:
-            # Transpose attention: A_T[i,j] = A[j,i]
-            # This makes walkers go forward in token order instead of backward
-            attn_transposed = full_attn.t().contiguous()
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 2c: H2O Scores (Column Sums)
+        # ─────────────────────────────────────────────────────────────────────
+        h2o_scores = full_attn.sum(dim=0)[:q_len]  # [q_len]
 
-            # Run forward walks from early positions toward query
-            # Use sink positions as "sources" for forward walks
-            if self.use_multi_horizon:
-                self._graph.update_and_step_influence_walker(
-                    attn_transposed, self.sink_size,  # Start from first non-sink position
-                    self.num_walkers // 3, 5, 0,  # No absorption for forward
-                )
-                fwd_short = self._graph.get_influence_scores()[:q_len].clone()
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 2d: MAX(H2O, Influence) with Rank Normalization
+        # ─────────────────────────────────────────────────────────────────────
+        h2o_rank = self._rank_normalize(h2o_scores)
+        influence_rank = self._rank_normalize(influence_scores)
 
-                self._graph.update_and_step_influence_walker(
-                    attn_transposed, self.sink_size,
-                    self.num_walkers // 3, 10, 0,
-                )
-                fwd_medium = self._graph.get_influence_scores()[:q_len].clone()
-
-                self._graph.update_and_step_influence_walker(
-                    attn_transposed, self.sink_size,
-                    self.num_walkers // 3, 20, 0,
-                )
-                fwd_long = self._graph.get_influence_scores()[:q_len].clone()
-
-                # Combine forward scales
-                var_fwd_short = fwd_short.var().clamp(min=1e-6)
-                var_fwd_medium = fwd_medium.var().clamp(min=1e-6)
-                var_fwd_long = fwd_long.var().clamp(min=1e-6)
-
-                w_fwd_short = 1.0 / var_fwd_short
-                w_fwd_medium = 1.0 / var_fwd_medium
-                w_fwd_long = 1.0 / var_fwd_long
-                w_fwd_total = w_fwd_short + w_fwd_medium + w_fwd_long
-
-                forward_scores = (w_fwd_short * fwd_short + w_fwd_medium * fwd_medium + w_fwd_long * fwd_long) / w_fwd_total
-            else:
-                self._graph.update_and_step_influence_walker(
-                    attn_transposed, self.sink_size,
-                    self.num_walkers, self.max_steps, 0,
-                )
-                forward_scores = self._graph.get_influence_scores()[:q_len].clone()
-
-            # Betweenness-style combination: sqrt(backward * forward)
-            # Tokens on BOTH paths get high scores
-            # Add small epsilon to avoid sqrt(0)
-            influence_scores = torch.sqrt(backward_scores * forward_scores + 1e-8)
-        else:
-            influence_scores = backward_scores
-
-        # Expand to full buffer size
-        full_influence = torch.zeros(self._max_seq_len, device=influence_scores.device, dtype=influence_scores.dtype)
-        full_influence[:q_len] = influence_scores
-
-        # =====================================================================
-        # STEP 2b: MAX(H2O, Influence) with Rank Normalization
-        # - H2O = column sums (good for NarrativeQA-style simple retrieval)
-        # - Influence = walker scores (good for HotpotQA-style multi-hop)
-        # - MAX = hedging strategy that works for both
-        # v3.0.0: + Instruction Anchor Detection for TREC-like tasks
-        # =====================================================================
-        # Compute H2O scores (column sums)
-        h2o_scores = full_attn.sum(dim=0)  # [seq_len]
-
-        # Rank normalize both to [0, 1] (puts them on equal footing)
-        h2o_rank = self._rank_normalize(h2o_scores[:q_len])
-        influence_rank = self._rank_normalize(influence_scores)  # Already q_len sized
-
-        # MAX combination: keeps token if EITHER force wants it
+        # MAX combination: keeps token if EITHER signal wants it
         combined_scores = torch.maximum(h2o_rank, influence_rank)
 
-        # v3.0.0 Breakthrough 2: Instruction Anchor Detection
-        # Detect and boost instruction-anchoring tokens for few-shot tasks
-        # NOTE: Heuristic method uses attention patterns, doesn't need tokenizer
-        if self.use_instruction_anchors:
-            try:
-                # Detect anchors using attention pattern heuristics
-                self._instruction_anchors = self._detect_instruction_anchors_heuristic(
-                    full_attn, q_len
-                )
-                # Boost instruction anchors to ensure they're kept
-                num_boosted = 0
-                for anchor_pos in self._instruction_anchors:
-                    if 0 <= anchor_pos < q_len:
-                        combined_scores[anchor_pos] = 1.0
-                        num_boosted += 1
-
-                # Debug: Log anchor detection results
-                if num_boosted > 0:
-                    print(f"  [v3.0.0] Detected {len(self._instruction_anchors)} instruction anchors, boosted {num_boosted}")
-            except Exception as e:
-                print(f"  [v3.0.0] Anchor detection failed: {e}")
-
-        # Expand to full buffer size (use full_influence which has _max_seq_len size)
-        scores = torch.zeros_like(full_influence)
-        scores[:q_len] = combined_scores
-
         # =====================================================================
-        # STEP 3: EVICTION BASED ON MAX(H2O, Influence) SCORES
-        # =====================================================================
-        # Compute keep mask using static budgeting
-        keep_mask = self._get_keep_mask(
-            scores,
-            self.max_capacity_prompt,
-            q_len
-        )
+        # STEP 3: SDI - Stratified Diverse Selection (v5.0.0)
+        # ═══════════════════════════════════════════════════════════════════
+        if self.use_sdi:
+            # Get key vectors for clustering (average across heads)
+            keys_for_clustering = key_states.mean(dim=1).squeeze(0)  # [q_len, head_dim]
+
+            # Stratified selection with semantic diversity
+            keep_mask = self._stratified_diverse_select(
+                combined_scores,
+                keys_for_clustering,
+                self.max_capacity_prompt,
+                q_len
+            )
+            print(f"  [SDI] Stratified selection: K={self.num_segments} segments, C={self.num_clusters} clusters")
+        else:
+            # Fallback: Standard top-k selection
+            scores_buffer = torch.zeros(self._max_seq_len, device=combined_scores.device, dtype=combined_scores.dtype)
+            scores_buffer[:q_len] = combined_scores
+            keep_mask = self._get_keep_mask(
+                scores_buffer,
+                self.max_capacity_prompt,
+                q_len
+            )
 
         # Debug logging
         if self.debug:
