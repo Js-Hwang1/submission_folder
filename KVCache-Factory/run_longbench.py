@@ -394,6 +394,8 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for CircuitKV (writes to longbench_CKV_dbg.log)")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
+    parser.add_argument("--gh200_unified_memory", action="store_true",
+                        help="Enable GH200 unified memory mode: limits GPU allocation to allow UVM spillover to CPU RAM.")
 
     parser.add_argument(
         "--use_chat_format", 
@@ -438,6 +440,15 @@ if __name__ == "__main__":
         print(f"Unknown model family '{model_family}', attempting Llama patches...")
         replace_llama(args.method.lower())
     
+    # Configure GH200 unified memory if requested
+    if args.gh200_unified_memory:
+        # Limit PyTorch GPU memory to allow UVM spillover to unified CPU memory
+        # GH200 has 900GB/s NVLink-C2C bandwidth to CPU, so spillover is fast
+        fraction = 0.5  # Use 50% of GPU (~47GB), rest can spill to unified memory
+        torch.cuda.set_per_process_memory_fraction(fraction, device=0)
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+        print(f"GH200 unified memory mode: GPU limited to {fraction*100:.0f}% ({fraction*94.5:.1f}GB), UVM spillover enabled")
+
     # Configure memory allocation (for GH200 unified memory or CPU offloading)
     load_kwargs = {
         "torch_dtype": torch.float16,
