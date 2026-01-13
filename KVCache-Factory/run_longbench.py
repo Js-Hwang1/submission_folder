@@ -442,12 +442,10 @@ if __name__ == "__main__":
     
     # Configure GH200 unified memory if requested
     if args.gh200_unified_memory:
-        # Limit PyTorch GPU memory to allow UVM spillover to unified CPU memory
-        # GH200 has 900GB/s NVLink-C2C bandwidth to CPU, so spillover is fast
-        fraction = 0.5  # Use 50% of GPU (~47GB), rest can spill to unified memory
-        torch.cuda.set_per_process_memory_fraction(fraction, device=0)
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
-        print(f"GH200 unified memory mode: GPU limited to {fraction*100:.0f}% ({fraction*94.5:.1f}GB), UVM spillover enabled")
+        # Enable expandable segments to reduce fragmentation on GH200
+        # Don't set hard limits - let unified memory handle overflow automatically
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        print(f"GH200 unified memory mode: expandable_segments enabled for better memory management")
 
     # Configure memory allocation (for GH200 unified memory or CPU offloading)
     load_kwargs = {
