@@ -392,6 +392,8 @@ if __name__ == "__main__":
     parser.add_argument("--recent_size", type=int, default=32, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="pruning ratio of Key Cache")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for CircuitKV (writes to longbench_CKV_dbg.log)")
+    parser.add_argument("--max_gpu_memory", type=str, default=None,
+                        help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
 
     parser.add_argument(
         "--use_chat_format", 
@@ -436,14 +438,20 @@ if __name__ == "__main__":
         print(f"Unknown model family '{model_family}', attempting Llama patches...")
         replace_llama(args.method.lower())
     
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="auto",
-        use_cache=args.use_cache,
-        attn_implementation=args.attn_implementation
-    )
+    # Configure memory allocation (for GH200 unified memory or CPU offloading)
+    load_kwargs = {
+        "torch_dtype": torch.float16,
+        "low_cpu_mem_usage": True,
+        "device_map": "auto",
+        "use_cache": args.use_cache,
+        "attn_implementation": args.attn_implementation
+    }
+    if args.max_gpu_memory:
+        # Offload to CPU when GPU memory is limited (fast on GH200 via NVLink-C2C)
+        load_kwargs["max_memory"] = {0: args.max_gpu_memory, "cpu": "350GiB"}
+        print(f"Using max_memory: GPU={args.max_gpu_memory}, CPU=350GiB (unified memory offloading)")
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, **load_kwargs)
         
 
     tokenizer.padding_side = "left"
