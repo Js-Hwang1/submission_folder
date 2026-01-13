@@ -50,6 +50,67 @@ if is_flash_attn_2_available():
 logger = logging.get_logger(__name__)
 
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb_compat(q, k, cos, sin, position_ids=None):
+    """
+    Compatibility wrapper for apply_rotary_pos_emb across transformers versions.
+
+    In newer transformers (4.40+), cos/sin from rotary_emb are already indexed
+    by position_ids and have shape [batch, 1, seq_len, head_dim].
+    In older versions, cos/sin have shape [1, 1, max_seq_len, head_dim] and need indexing.
+
+    This function detects the format and applies rotary embedding correctly.
+    """
+    # Check if cos/sin are already indexed (newer transformers)
+    # In newer versions: cos shape is [batch, 1, seq_len, head_dim] matching q's seq_len
+    # In older versions: cos shape is [1, 1, max_seq_len, head_dim] with max_seq_len > seq_len
+
+    q_seq_len = q.shape[2]  # q is [batch, num_heads, seq_len, head_dim]
+    cos_seq_len = cos.shape[2] if cos.dim() == 4 else cos.shape[0]
+
+    if cos_seq_len == q_seq_len:
+        # cos/sin already indexed for our sequence - just apply directly
+        # Ensure cos/sin have right shape for broadcasting
+        if cos.dim() == 4:
+            # Shape: [batch, 1, seq_len, head_dim] - need to match [batch, num_heads, seq_len, head_dim]
+            pass  # Already correct for broadcasting
+        else:
+            # Shape might be [seq_len, head_dim], unsqueeze to broadcast
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+    else:
+        # cos/sin need indexing by position_ids (older transformers style)
+        # First squeeze to [seq_len, head_dim] if needed
+        if cos.dim() == 4:
+            cos = cos.squeeze(1).squeeze(0)
+            sin = sin.squeeze(1).squeeze(0)
+        elif cos.dim() == 3:
+            cos = cos.squeeze(0)
+            sin = sin.squeeze(0)
+
+        # Index by position_ids
+        if position_ids is not None:
+            cos = cos[position_ids].unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+            sin = sin[position_ids].unsqueeze(1)
+        else:
+            cos = cos[:q_seq_len].unsqueeze(0).unsqueeze(0)
+            sin = sin[:q_seq_len].unsqueeze(0).unsqueeze(0)
+
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+
 def _get_rotary_emb_compat(rotary_emb, value_states, position_ids):
     """
     Compatibility wrapper for rotary embedding across transformers versions.
@@ -164,7 +225,7 @@ def qwen2_attn_forward_H2O(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -270,7 +331,7 @@ def qwen2_sdpa_attn_forward_H2O(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -368,7 +429,7 @@ def qwen2_flash_attn2_forward_H2O(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -472,7 +533,7 @@ def qwen2_attn_forward_SnapKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -574,7 +635,7 @@ def qwen2_sdpa_attn_forward_SnapKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -672,7 +733,7 @@ def qwen2_flash_attn2_forward_SnapKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -776,7 +837,7 @@ def qwen2_attn_forward_PyramidKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -878,7 +939,7 @@ def qwen2_sdpa_attn_forward_PyramidKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -976,7 +1037,7 @@ def qwen2_flash_attn2_forward_PyramidKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1080,7 +1141,7 @@ def qwen2_attn_forward_StreamingLLM(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1182,7 +1243,7 @@ def qwen2_sdpa_attn_forward_StreamingLLM(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1280,7 +1341,7 @@ def qwen2_flash_attn2_forward_StreamingLLM(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1384,7 +1445,7 @@ def qwen2_attn_forward_CircuitKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1486,7 +1547,7 @@ def qwen2_sdpa_attn_forward_CircuitKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1584,7 +1645,7 @@ def qwen2_flash_attn2_forward_CircuitKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
