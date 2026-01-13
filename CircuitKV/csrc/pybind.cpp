@@ -6,6 +6,7 @@
  */
 
 #include <torch/extension.h>
+#include <cstdint>
 #include "circuit_manager.h"
 
 namespace circuit_kv {
@@ -40,13 +41,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             >>> scores = graph.get_scores()
         )pbdoc"
     )
-    .def(py::init<int, int, float, int, int, int>(),
+    .def(py::init<int, int, float, int, int, int, uint64_t>(),
         py::arg("max_seq_len"),
         py::arg("top_k"),
         py::arg("alpha"),
         py::arg("num_walkers"),
         py::arg("num_steps"),
         py::arg("query_window") = 64,
+        py::arg("seed") = 42,
         R"pbdoc(
         Initialize a CircuitGraph.
 
@@ -57,6 +59,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             num_walkers: Number of parallel random walkers.
             num_steps: (Unused by CircuitKV, uses MAX_STEPS=100 internally)
             query_window: (Unused, kept for API compatibility)
+            seed: Random seed for reproducibility (default 42)
         )pbdoc"
     )
     .def("update_and_step_circuit", &CircuitGraph::update_and_step_circuit,

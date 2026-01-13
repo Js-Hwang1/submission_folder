@@ -29,7 +29,8 @@ CircuitGraph::CircuitGraph(
     float alpha,
     int num_walkers,
     int num_steps,
-    int query_window
+    int query_window,
+    uint64_t seed
 )
     : max_seq_len_(max_seq_len)
     , top_k_(top_k)
@@ -37,6 +38,7 @@ CircuitGraph::CircuitGraph(
     , num_walkers_(num_walkers)
     , num_steps_(num_steps)  // Kept for API compatibility (unused, uses MAX_STEPS)
     , query_window_(query_window)  // Kept for API compatibility (unused)
+    , seed_(seed)  // Random seed for reproducibility
     , current_seq_len_(0)
     , adj_list_(nullptr)
     , adj_weights_(nullptr)
@@ -78,9 +80,8 @@ CircuitGraph::CircuitGraph(
     // Create sidecar stream for async walker kernel
     CUDA_CHECK(cudaStreamCreate(&sidecar_stream_));
 
-    // Initialize RNG with time-based seed
-    auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
-    init_rng(static_cast<uint64_t>(seed));
+    // Initialize RNG with fixed seed for reproducibility
+    init_rng(seed_);
 }
 
 CircuitGraph::~CircuitGraph() {
@@ -103,6 +104,7 @@ CircuitGraph::CircuitGraph(CircuitGraph&& other) noexcept
     , num_walkers_(other.num_walkers_)
     , num_steps_(other.num_steps_)
     , query_window_(other.query_window_)
+    , seed_(other.seed_)
     , current_seq_len_(other.current_seq_len_)
     , adj_list_(other.adj_list_)
     , adj_weights_(other.adj_weights_)
@@ -178,6 +180,7 @@ CircuitGraph& CircuitGraph::operator=(CircuitGraph&& other) noexcept {
         num_walkers_ = other.num_walkers_;
         num_steps_ = other.num_steps_;
         query_window_ = other.query_window_;
+        seed_ = other.seed_;
         current_seq_len_ = other.current_seq_len_;
         adj_list_ = other.adj_list_;
         adj_weights_ = other.adj_weights_;
@@ -804,10 +807,9 @@ void CircuitGraph::update_and_step_landmark_walker(
                 "total_walkers exceeds max_landmark_walkers");
 
     if (!landmark_rng_initialized_) {
-        auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
         launch_init_rng_kernel(
             landmark_rng_states_,
-            static_cast<uint64_t>(seed),
+            seed_ + 1000,  // Offset to differentiate from main RNG
             max_landmark_walkers_,
             sidecar_stream_
         );
@@ -997,10 +999,9 @@ void CircuitGraph::update_and_step_landmark_absorbing_walker(
                 "total_walkers exceeds max_landmark_walkers");
 
     if (!landmark_rng_initialized_) {
-        auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
         launch_init_rng_kernel(
             landmark_rng_states_,
-            static_cast<uint64_t>(seed),
+            seed_ + 2000,  // Offset to differentiate from other RNGs
             max_landmark_walkers_,
             sidecar_stream_
         );
@@ -1234,10 +1235,9 @@ void CircuitGraph::update_and_step_influence_walker(
 
     // Initialize influence RNG if needed
     if (!influence_rng_initialized_) {
-        auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
         launch_init_rng_kernel(
             influence_rng_states_,
-            static_cast<uint64_t>(seed),
+            seed_ + 3000,  // Offset to differentiate from other RNGs
             influence_max_walkers_,
             sidecar_stream_
         );

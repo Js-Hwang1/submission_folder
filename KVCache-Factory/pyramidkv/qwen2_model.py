@@ -50,6 +50,30 @@ if is_flash_attn_2_available():
 logger = logging.get_logger(__name__)
 
 
+def _get_rotary_emb_compat(rotary_emb, value_states, position_ids):
+    """
+    Compatibility wrapper for rotary embedding across transformers versions.
+    Handles API changes between transformers 4.38 and 4.40+.
+    """
+    try:
+        # Try newer API first (transformers 4.40+)
+        return rotary_emb(value_states, position_ids)
+    except (TypeError, RuntimeError) as e:
+        # Fall back to older API or handle edge cases
+        if "Boolean value of Tensor" in str(e):
+            # The issue is seq_len comparison - extract scalar seq_len
+            seq_len = position_ids.shape[-1] if position_ids.dim() > 1 else position_ids.max().item() + 1
+            # Some versions expect (x, seq_len) instead of (x, position_ids)
+            try:
+                return rotary_emb(value_states, seq_len)
+            except TypeError:
+                # If that fails, try with position_ids reshaped
+                if position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0)
+                return rotary_emb(value_states, position_ids)
+        raise
+
+
 def _flash_attention_forward(
     self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
 ):
@@ -137,7 +161,7 @@ def qwen2_attn_forward_H2O(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -243,7 +267,7 @@ def qwen2_sdpa_attn_forward_H2O(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -341,7 +365,7 @@ def qwen2_flash_attn2_forward_H2O(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -445,7 +469,7 @@ def qwen2_attn_forward_SnapKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -547,7 +571,7 @@ def qwen2_sdpa_attn_forward_SnapKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -645,7 +669,7 @@ def qwen2_flash_attn2_forward_SnapKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -749,7 +773,7 @@ def qwen2_attn_forward_PyramidKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -851,7 +875,7 @@ def qwen2_sdpa_attn_forward_PyramidKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -949,7 +973,7 @@ def qwen2_flash_attn2_forward_PyramidKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -1053,7 +1077,7 @@ def qwen2_attn_forward_StreamingLLM(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -1155,7 +1179,7 @@ def qwen2_sdpa_attn_forward_StreamingLLM(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -1253,7 +1277,7 @@ def qwen2_flash_attn2_forward_StreamingLLM(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -1357,7 +1381,7 @@ def qwen2_attn_forward_CircuitKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -1459,7 +1483,7 @@ def qwen2_sdpa_attn_forward_CircuitKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -1557,7 +1581,7 @@ def qwen2_flash_attn2_forward_CircuitKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     if position_embeddings is None:
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)

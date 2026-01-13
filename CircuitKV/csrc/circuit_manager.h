@@ -48,6 +48,7 @@ public:
      * @param num_walkers   Number of parallel random walkers
      * @param num_steps     (Unused by CircuitKV, uses MAX_STEPS=100 internally)
      * @param query_window  (Unused, kept for API compatibility)
+     * @param seed          Random seed for reproducibility (default 42)
      */
     CircuitGraph(
         int max_seq_len,
@@ -55,7 +56,8 @@ public:
         float alpha,
         int num_walkers,
         int num_steps,
-        int query_window = 64
+        int query_window = 64,
+        uint64_t seed = 42
     );
 
     ~CircuitGraph();
@@ -315,6 +317,7 @@ private:
     int num_walkers_;
     int num_steps_;  // Kept for API compatibility (unused, uses MAX_STEPS)
     int query_window_;  // Kept for API compatibility (unused)
+    uint64_t seed_;  // Random seed for reproducibility
     int current_seq_len_;
 
     // GPU memory: Adjacency list (token i attends to token j)
