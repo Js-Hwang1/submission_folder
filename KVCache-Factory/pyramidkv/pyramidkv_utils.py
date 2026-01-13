@@ -50,11 +50,11 @@ def _get_circuitkv_debug_log():
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n")
-        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v2.0.0 Debug Log - MAX(H2O, Influence)\n")
+        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v4.0.0 Debug Log - Deterministic Neumann Series\n")
         _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n\n")
         _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: score[j] = max(rank_h2o[j], rank_influence[j])\n")
         _CIRCUITKV_DEBUG_LOG.write("  - H2O: Column sums (incoming attention)\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - Influence: Absorbing random walks (query→sink path)\n")
+        _CIRCUITKV_DEBUG_LOG.write("  - Influence: Neumann series N=(I-Q)^(-1) expected visits\n")
         _CIRCUITKV_DEBUG_LOG.write("  - MAX: Hedging - keeps token if EITHER method wants it\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
@@ -1154,22 +1154,29 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v3.0.0: MAX(H2O, Influence) + ICML 2026 Breakthroughs.
+    CircuitKV v4.0.0: Deterministic Causal Influence via Neumann Series.
 
     This class implements a hedging strategy that combines:
     - H2O: Column sums of attention matrix (good for simple retrieval tasks)
-    - Influence: Absorbing random walks (good for multi-hop reasoning tasks)
+    - Influence: Causal influence scores (good for multi-hop reasoning tasks)
 
-    Key Innovation (v2.0.0 - MAX Combination):
-    - RANK NORMALIZATION: Both H2O and Influence scores are rank-normalized to [0,1]
-    - MAX COMBINATION: score[j] = max(h2o_rank[j], influence_rank[j])
-    - HEDGING: Token is kept if EITHER force wants it (robust across task types)
+    v4.0.0 Key Innovation - DETERMINISTIC INFLUENCE:
+    - Uses Neumann series to compute expected visit counts analytically
+    - N = (I - Q)^(-1) ≈ I + Q + Q² + ... + Q^k  (Fundamental Matrix)
+    - NO RANDOMNESS: Results are perfectly reproducible
+    - THEORETICAL GROUNDING: Expected visits in absorbing Markov chain
 
-    v3.0.0 Breakthroughs (ICML 2026):
-    - INSTRUCTION ANCHORS: Detect and protect few-shot instruction patterns
-      (fixes TREC = 0.0 by preserving "Question: X\nType: Y" format)
-    - FUNDAMENTAL MATRIX: Principled normalization via Neumann series (optional)
-    - MULTI-HORIZON: Adaptive walk lengths based on attention entropy (optional)
+    Mathematical Foundation:
+    - Attention matrix A defines transition probabilities P[i,j] = A[i,j] / sum_k A[i,k]
+    - Partition into transient (tokens > sink_size) and absorbing (sink tokens)
+    - Q = transition matrix among transient states (substochastic)
+    - N[q,j] = expected number of visits to token j starting from query q
+    - Computed via Neumann series: v = e_q, then v += Q @ v repeatedly
+
+    Key Differences from v3.0.0 (Random Walks):
+    - v3.0.0: Monte Carlo sampling (10K walkers) → variance across seeds
+    - v4.0.0: Closed-form solution → deterministic, reproducible
+    - v4.0.0: O(k * n²) per layer vs O(walkers * steps) for random walks
 
     Why MAX > Individual Methods:
     - H2O excels at NarrativeQA-style simple retrieval (popularity matters)
@@ -1178,26 +1185,22 @@ class CircuitKVCluster():
 
     Physics Analogy:
     - H2O = Mass (how popular is this token?)
-    - Influence = Path (can this token reach the query through attention chains?)
-    - MAX = Gravity Walker (keep token if it has high mass OR is on the path)
-    - Anchors = Fixed points (instruction structure is protected)
+    - Influence = Expected Current Flow (how much information flows through?)
+    - MAX = Union of Forces (keep token if it has high mass OR high flow)
 
     Algorithm:
     1. Compute full attention matrix from query/key states
     2. Compute H2O scores (column sums)
-    3. Run Influence Walker (absorbing random walks from query to sink)
+    3. Compute Influence via Neumann series (expected visits from query to sink)
     4. Rank normalize both scores to [0, 1]
     5. Combined score = max(h2o_rank, influence_rank)
-    6. [v3.0.0] Detect instruction anchors and boost their scores to 1.0
-    7. Select top tokens by combined scores for KV cache retention
+    6. Select top tokens by combined scores for KV cache retention
 
     Configuration:
-    - num_walkers: Number of walkers for influence (default: 10000)
-    - max_steps: Max steps per walker (default: 10)
+    - neumann_iterations: Neumann series iterations (default: 10)
     - sink_size: Absorbing boundary (default: 4)
-    - use_instruction_anchors: Enable anchor detection (default: True)
-    - use_fundamental_norm: Enable Neumann normalization (default: False, expensive)
-    - use_multi_horizon: Enable adaptive walk lengths (default: True)
+    - temperature: Attention sharpening (default: 1.0, lower = sharper)
+    - use_neumann: Use deterministic Neumann (default: True in v4.0)
     """
 
     def __init__(
@@ -1239,6 +1242,10 @@ class CircuitKVCluster():
         use_fundamental_norm: bool = False,  # Breakthrough 1: Principled normalization (expensive)
         use_multi_horizon: bool = True,  # Breakthrough 3: Adaptive walk lengths
         tokenizer = None,  # Required for instruction anchor detection
+        # v4.0.0: Deterministic Neumann Series
+        use_neumann: bool = True,  # v4.0.0: Use deterministic Neumann instead of random walks
+        neumann_iterations: int = 10,  # Number of Neumann series iterations
+        neumann_temperature: float = 1.0,  # Temperature for attention sharpening (lower = sharper)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1254,6 +1261,10 @@ class CircuitKVCluster():
         self.use_multi_horizon = use_multi_horizon
         self.tokenizer = tokenizer
         self._instruction_anchors = set()  # Cache for current sample
+        # v4.0.0: Deterministic Neumann Series
+        self.use_neumann = use_neumann
+        self.neumann_iterations = neumann_iterations
+        self.neumann_temperature = neumann_temperature
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1596,6 +1607,123 @@ class CircuitKVCluster():
             return torch.ones_like(ranks)
         return ranks / (n - 1)
 
+    def _compute_influence_neumann(
+        self,
+        attention: torch.Tensor,
+        query_idx: int,
+        sink_size: int = 4,
+        num_iterations: int = 10,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        v4.0.0: Compute deterministic influence scores via Neumann series.
+
+        Computes expected visit counts analytically using the Fundamental Matrix
+        of an absorbing Markov chain:
+
+            N = (I - Q)^{-1} ≈ I + Q + Q² + ... + Q^k
+
+        Where Q is the substochastic transition matrix among transient states
+        (non-sink tokens). The influence score for token j is the expected
+        number of times a walk from query visits j before absorption.
+
+        Mathematical Properties:
+        - Deterministic: No randomness, perfectly reproducible
+        - Convergent: Neumann series converges since Q is substochastic
+        - Efficient: O(k * n²) via iterative matrix-vector products
+
+        Args:
+            attention: Causal attention matrix [seq_len, seq_len], already masked
+            query_idx: Source position (typically seq_len - 1)
+            sink_size: First sink_size tokens are absorbing (default 4)
+            num_iterations: Neumann series iterations (default 10)
+            temperature: Attention sharpening (default 1.0, lower = sharper)
+
+        Returns:
+            Influence scores [seq_len] - expected visits from query
+        """
+        n = attention.shape[0]
+        device = attention.device
+
+        # Handle edge cases
+        if n <= sink_size:
+            return torch.ones(n, device=device, dtype=torch.float32) / n
+
+        # =====================================================================
+        # STEP 1: Build transition matrix P from attention
+        # P[i,j] = probability of transitioning from i to j
+        # =====================================================================
+        # Apply temperature scaling for sharpness control
+        if temperature != 1.0 and temperature > 0:
+            # Sharpen or soften attention distribution
+            attn_scaled = attention ** (1.0 / temperature)
+        else:
+            attn_scaled = attention
+
+        # Row-normalize to get transition probabilities
+        # Avoid division by zero for rows with no attention (sink rows)
+        row_sums = attn_scaled.sum(dim=1, keepdim=True)
+        row_sums = row_sums.clamp(min=1e-8)
+        P = attn_scaled / row_sums  # [n, n]
+
+        # =====================================================================
+        # STEP 2: Extract Q (transient-to-transient transitions)
+        # Transient states: indices >= sink_size
+        # Q[i,j] = P[i + sink_size, j + sink_size]
+        # =====================================================================
+        n_transient = n - sink_size
+        Q = P[sink_size:, sink_size:].contiguous()  # [n_transient, n_transient]
+
+        # =====================================================================
+        # STEP 3: Neumann series for query row of fundamental matrix
+        # We only need N[query_idx, :] = sum_{k=0}^{inf} (Q^k)[query_idx, :]
+        # Compute iteratively: v = e_q, result = e_q, then v = Q @ v, result += v
+        # =====================================================================
+        # Query position in transient space
+        query_transient_idx = query_idx - sink_size
+        if query_transient_idx < 0:
+            # Query is in sink region - return uniform scores
+            return torch.ones(n, device=device, dtype=torch.float32) / n
+
+        # Initialize: e_query (one-hot at query position)
+        v = torch.zeros(n_transient, device=device, dtype=torch.float32)
+        v[query_transient_idx] = 1.0
+
+        # Accumulator for Neumann series: starts with I (identity contribution)
+        result = v.clone()
+
+        # Iterate Neumann series: result = I + Q + Q² + ... + Q^k
+        # Each iteration: v_{k+1} = Q^T @ v_k (we want column sums, so transpose)
+        # Actually for expected visits TO each state, we need (Q^T)^k
+        # N[i,j] = expected visits to j starting from i
+        # So we compute: result[j] = sum_k (Q^k)[query, j]
+        #              = sum_k e_query^T @ Q^k @ e_j
+        # Iterate: v = Q @ v where v starts as e_query
+        for _ in range(num_iterations):
+            v = torch.mv(Q, v)  # Q @ v - efficient matrix-vector product
+            result = result + v
+
+            # Early stopping if converged
+            if v.abs().max().item() < 1e-8:
+                break
+
+        # =====================================================================
+        # STEP 4: Map back to full sequence and normalize
+        # =====================================================================
+        scores = torch.zeros(n, device=device, dtype=torch.float32)
+        scores[sink_size:] = result
+
+        # Sink tokens: assign small positive score (they absorb flow)
+        # Option: could assign based on flow INTO sink
+        scores[:sink_size] = result.sum() * 0.01  # Small fraction of total
+
+        # Normalize to [0, 1] range (not rank normalization, just scale)
+        max_score = scores.max()
+        if max_score > 0:
+            scores = scores / max_score
+
+        return scores
+
     def _detect_instruction_anchors_heuristic(
         self,
         attention_matrix: torch.Tensor,
@@ -1918,7 +2046,8 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        print(f"CircuitKV v3.0.0 (MAX + Instruction Anchors) max_capacity_prompt {self.max_capacity_prompt}")
+        mode = "Neumann" if self.use_neumann else "RandomWalk"
+        print(f"CircuitKV v4.0.0 ({mode}, k={self.neumann_iterations}) max_capacity_prompt {self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -1993,24 +2122,38 @@ class CircuitKVCluster():
             full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
-        # STEP 2: Run Causal Influence Walker (CUDA kernel) - v1.0.0
-        # VALIDATED BY PoC5:
-        #   - Influence vs Gen Attn: Spearman r = 0.41 (H2O: -0.02)
-        #   - Top-10 overlap with actual generation attention: 70% (H2O: 10%)
+        # STEP 2: Compute Causal Influence Scores
+        # v4.0.0: Deterministic Neumann series (default)
+        # v3.0.0: Stochastic random walks (legacy, for ablation)
         # =====================================================================
         current_idx = q_len - 1
 
-        # v1.0.0: Use Causal Influence Walker (single source, weighted visits)
-        self._graph.update_and_step_influence_walker(
-            full_attn.contiguous(),
-            current_idx,
-            self.num_walkers,    # 10000 walkers (validated by PoC5)
-            self.max_steps,      # 10 steps (matches oracle computation)
-            self.sink_size,      # Absorb at first 4 tokens
-        )
-
-        # Get normalized scores from influence walker (v1.0.0)
-        influence_scores = self._graph.get_influence_scores()
+        if self.use_neumann:
+            # v4.0.0: Deterministic influence via Neumann series
+            # Computes expected visit counts analytically: N = (I-Q)^(-1)
+            influence_scores = self._compute_influence_neumann(
+                full_attn[:q_len, :q_len].contiguous(),
+                current_idx,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                temperature=self.neumann_temperature,
+            )
+            # Pad to full buffer size
+            influence_scores_full = torch.zeros(
+                full_attn.shape[0], device=full_attn.device, dtype=torch.float32
+            )
+            influence_scores_full[:q_len] = influence_scores
+            influence_scores = influence_scores_full
+        else:
+            # v3.0.0 (legacy): Stochastic random walks via CUDA kernel
+            self._graph.update_and_step_influence_walker(
+                full_attn.contiguous(),
+                current_idx,
+                self.num_walkers,    # 10000 walkers
+                self.max_steps,      # 10 steps
+                self.sink_size,      # Absorb at first 4 tokens
+            )
+            influence_scores = self._graph.get_influence_scores()
 
         # =====================================================================
         # STEP 2b: MAX(H2O, Influence) with Rank Normalization

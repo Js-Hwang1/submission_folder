@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "circuit_kv"
-version = "3.0.0"
-description = "Current-Flow Betweenness for KV Cache Eviction in LLMs"
+version = "4.0.0"
+description = "Deterministic Causal Influence for KV Cache Eviction in LLMs"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}

@@ -3,6 +3,84 @@
 ## LongBench Evaluation
 
 **Model:** Meta-Llama-3-8B-Instruct
+**KV Budget:** 256 tokens
+**Attention:** flash_attention_2
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
+
+### Results Table
+
+| Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
+|--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
+| FullKV | 25.56 | 32.27 | 39.71 | 43.56 | 35.29 | 21.18 | 28.74 | 23.20 | 26.73 | 74.00 | 90.48 | 42.53 | 4.80 | 69.75 | 59.27 | 53.92 | **41.94** |
+| SnapKV | 23.30 | 19.91 | 37.35 | 42.59 | 33.02 | 19.90 | 21.76 | 22.27 | 22.90 | 71.50 | 90.86 | 40.07 | 5.58 | 69.50 | 59.96 | 55.68 | **39.76** |
+| PyramidKV | 23.81 | 19.96 | 35.67 | 42.52 | 31.76 | 20.12 | 21.26 | 22.84 | 22.61 | 71.50 | 90.48 | 39.97 | 5.83 | 69.50 | 58.39 | 53.78 | **39.38** |
+| H2O | 23.47 | 18.47 | 29.11 | 35.90 | 28.29 | 15.62 | 23.20 | 21.95 | 24.73 | 60.50 | 88.20 | 38.64 | 5.37 | 67.74 | 58.67 | 52.52 | **37.02** |
+| StreamingLLM | 17.78 | 11.04 | 20.68 | 33.22 | 25.81 | 15.99 | 19.17 | 20.51 | 20.65 | 53.00 | 79.51 | 39.40 | 5.83 | 68.37 | 58.35 | 54.51 | **33.99** |
+| OURS |
+
+
+### Task Categories
+
+| Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
+|--------|---------------|--------------|---------------|----------|-----------|------|-------------|
+| FullKV | 32.51 | 33.34 | 26.22 | 69.00 | 37.28 | 56.60 | **41.94** |
+| SnapKV | 26.85 | 31.84 | 22.31 | 67.48 | 37.54 | 57.82 | **39.76** |
+| PyramidKV | 26.48 | 31.47 | 22.24 | 67.32 | 37.67 | 56.09 | **39.38** |
+| H2O | 23.68 | 26.60 | 23.29 | 62.45 | 36.56 | 55.60 | **37.02** |
+| StreamingLLM | 16.50 | 25.01 | 20.11 | 57.30 | 37.10 | 56.43 | **33.99** |
+| OURS |
+
+
+**Category Mapping:**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
+- Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
+- Summarization: GovReport, QMSum, MultiNews
+- Few-shot: TREC, TriviaQA, SAMSum
+- Synthetic: PassageCount, PassageRetrieval
+- Code: LCC, RepoBench-P
+
+---
+
+**Model:** Meta-Llama-3-8B-Instruct
+**KV Budget:** 512 tokens
+**Attention:** flash_attention_2
+**Hardware:** NVIDIA GH200 Grace Hopper Superchip
+
+### Results Table
+
+| Method | NarrativeQA | Qasper | MultifieldQA | HotpotQA | 2WikiMQA | Musique | GovReport | QMSum | MultiNews | TREC | TriviaQA | SAMSum | PassageCount | PassageRetrieval | LCC | RepoBench-P | **Avg** |
+|--------|-------------|--------|--------------|----------|----------|---------|-----------|-------|-----------|------|----------|--------|--------------|------------------|-----|-------------|---------|
+| FullKV | 25.56 | 32.27 | 39.71 | 43.56 | 35.29 | 21.18 | 28.74 | 23.20 | 26.73 | 74.00 | 90.48 | 42.53 | 4.80 | 69.75 | 59.27 | 53.92 | **41.94** |
+| SnapKV | 25.55 | 23.80 | 38.46 | 43.78 | 33.42 | 19.92 | 23.28 | 22.46 | 24.23 | 71.50 | 90.57 | 40.34 | 5.43 | 69.50 | 61.10 | 57.41 | **40.67** |
+| PyramidKV | 24.79 | 23.44 | 34.85 | 43.29 | 31.63 | 20.09 | 23.47 | 22.92 | 24.26 | 72.00 | 90.61 | 40.82 | 5.83 | 69.50 | 59.30 | 54.62 | **40.09** |
+| H2O | 23.56 | 21.45 | 31.57 | 41.00 | 30.73 | 17.97 | 25.09 | 22.41 | 25.58 | 69.00 | 90.67 | 39.98 | 5.65 | 67.62 | 60.86 | 55.98 | **39.32** |
+| StreamingLLM | 20.70 | 12.14 | 22.00 | 35.48 | 26.80 | 15.79 | 21.02 | 20.59 | 23.85 | 62.50 | 83.38 | 40.15 | 5.35 | 67.81 | 60.15 | 55.03 | **35.80** |
+| OURS |
+
+
+### Task Categories
+
+| Method | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot | Synthetic | Code | **Overall** |
+|--------|---------------|--------------|---------------|----------|-----------|------|-------------|
+| FullKV | 32.51 | 33.34 | 26.22 | 69.00 | 37.28 | 56.60 | **41.94** |
+| SnapKV | 29.27 | 32.37 | 23.32 | 67.47 | 37.47 | 59.26 | **40.67** |
+| PyramidKV | 27.69 | 31.67 | 23.55 | 67.81 | 37.67 | 56.96 | **40.09** |
+| H2O | 25.53 | 29.90 | 24.36 | 66.55 | 36.64 | 58.42 | **39.32** |
+| StreamingLLM | 18.28 | 26.02 | 21.82 | 62.01 | 36.58 | 57.59 | **35.80** |
+| OURS |
+
+
+**Category Mapping:**
+- Single-Doc QA: NarrativeQA , Qasper, MultifieldQA
+- Multi-Doc QA: HotpotQA, 2WikiMQA, Musique
+- Summarization: GovReport, QMSum, MultiNews
+- Few-shot: TREC, TriviaQA, SAMSum
+- Synthetic: PassageCount, PassageRetrieval
+- Code: LCC, RepoBench-P
+
+---
+
+**Model:** Meta-Llama-3-8B-Instruct
 **KV Budget:** 1024 tokens
 **Attention:** flash_attention_2
 **Hardware:** NVIDIA GH200 Grace Hopper Superchip

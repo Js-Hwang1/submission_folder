@@ -319,7 +319,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "2.0.0";  // MAX(H2O, Influence) with rank normalization
+    m.attr("__version__") = "4.0.0";  // Deterministic Neumann series for influence
 }
 
 }  // namespace circuit_kv
