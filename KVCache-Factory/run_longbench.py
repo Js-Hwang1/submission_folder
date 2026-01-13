@@ -297,7 +297,7 @@ def main(args):
             
 
         context_length = batch_input_ids.shape[-1]
-        if args.quant_method == None:        
+        if args.quant_method == None:
             output = model.generate(
                 **tokenized_prompts,
                 output_attentions = args.output_attentions,
@@ -306,7 +306,8 @@ def main(args):
                 do_sample=False,
                 temperature=1.0,
                 min_length=context_length+1,
-                eos_token_id=[tokenizer.eos_token_id]
+                eos_token_id=[tokenizer.eos_token_id],
+                num_logits_to_keep=1,  # Only compute logits for last token (saves memory)
             )
         else:
             output = model.generate(
@@ -318,7 +319,8 @@ def main(args):
                 temperature=1.0,
                 min_length=context_length+1,
                 eos_token_id=[tokenizer.eos_token_id],
-                cache_implementation="quantized", 
+                num_logits_to_keep=1,  # Only compute logits for last token (saves memory)
+                cache_implementation="quantized",
                 cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
             )
 
