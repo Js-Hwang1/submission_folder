@@ -164,7 +164,7 @@ def qwen2_attn_forward_H2O(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -270,7 +270,7 @@ def qwen2_sdpa_attn_forward_H2O(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -368,7 +368,7 @@ def qwen2_flash_attn2_forward_H2O(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -472,7 +472,7 @@ def qwen2_attn_forward_SnapKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -574,7 +574,7 @@ def qwen2_sdpa_attn_forward_SnapKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -672,7 +672,7 @@ def qwen2_flash_attn2_forward_SnapKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -776,7 +776,7 @@ def qwen2_attn_forward_PyramidKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -878,7 +878,7 @@ def qwen2_sdpa_attn_forward_PyramidKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -976,7 +976,7 @@ def qwen2_flash_attn2_forward_PyramidKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1080,7 +1080,7 @@ def qwen2_attn_forward_StreamingLLM(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1182,7 +1182,7 @@ def qwen2_sdpa_attn_forward_StreamingLLM(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1280,7 +1280,7 @@ def qwen2_flash_attn2_forward_StreamingLLM(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1384,7 +1384,7 @@ def qwen2_attn_forward_CircuitKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1486,7 +1486,7 @@ def qwen2_sdpa_attn_forward_CircuitKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1584,7 +1584,7 @@ def qwen2_flash_attn2_forward_CircuitKV(
         cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
     else:
         cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
