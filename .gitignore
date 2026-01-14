@@ -8,6 +8,7 @@ stash.py
 paper.md
 icml2026/
 run_baselines.sh
+run.sh
 # =============================================================================
 # CircuitKV Build Artifacts - MUST be excluded for fresh builds on clone
 # =============================================================================

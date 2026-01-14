@@ -1169,53 +1169,56 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v4.0.0: Deterministic Causal Influence via Neumann Series.
+    CircuitKV v4.2.0: Dual-Importance Scoring (DIS) via Absorbing Markov Chains.
 
-    This class implements a hedging strategy that combines:
-    - H2O: Column sums of attention matrix (good for simple retrieval tasks)
-    - Influence: Causal influence scores (good for multi-hop reasoning tasks)
+    This class implements importance scoring for KV cache eviction using
+    the FUNDAMENTAL MATRIX of absorbing Markov chains.
 
-    v4.0.0 Key Innovation - DETERMINISTIC INFLUENCE:
-    - Uses Neumann series to compute expected visit counts analytically
-    - N = (I - Q)^(-1) ≈ I + Q + Q² + ... + Q^k  (Fundamental Matrix)
-    - NO RANDOMNESS: Results are perfectly reproducible
-    - THEORETICAL GROUNDING: Expected visits in absorbing Markov chain
+    v4.2.0 Key Innovation - DUAL-IMPORTANCE SCORING (DIS):
+    Instead of mixing H2O (one-hop) with Influence (multi-hop), we derive
+    BOTH importance signals from the SAME mathematical object:
+
+    1. QUERY IMPORTANCE (QI): N[q, j] = expected visits FROM query to j
+       - "How important is j for answering THIS specific query?"
+       - Captures tokens on paths from query to sink
+
+    2. HUB IMPORTANCE (HI): (1/n) Σᵢ N[i, j] = average expected visits to j
+       - "How central is j in the overall information flow network?"
+       - Captures globally important "hub" tokens
+
+    Final Score: DIS[j] = √(QI[j] × HI[j])  (geometric mean)
+    - Requires BOTH query-relevance AND hub-centrality
+    - More principled than MAX (which is OR)
+    - Both signals derived from same theoretical foundation
 
     Mathematical Foundation:
-    - Attention matrix A defines transition probabilities P[i,j] = A[i,j] / sum_k A[i,k]
-    - Partition into transient (tokens > sink_size) and absorbing (sink tokens)
-    - Q = transition matrix among transient states (substochastic)
-    - N[q,j] = expected number of visits to token j starting from query q
-    - Computed via Neumann series: v = e_q, then v += Q @ v repeatedly
+    - Attention matrix A defines transition probabilities P[i,j]
+    - Q = transition matrix among transient states (non-sink tokens)
+    - N = (I - Q)^{-1} = fundamental matrix of absorbing chain
+    - Computed via Neumann series: I + Q + Q² + ... + Q^k
 
-    Key Differences from v3.0.0 (Random Walks):
-    - v3.0.0: Monte Carlo sampling (10K walkers) → variance across seeds
-    - v4.0.0: Closed-form solution → deterministic, reproducible
-    - v4.0.0: O(k * n²) per layer vs O(walkers * steps) for random walks
+    Combination Modes (combination_mode parameter):
+    - "dis": Dual-Importance Scoring (v4.2.0) - √(QI × HI)
+    - "max": MAX(H2O_rank, Influence_rank) (v4.0.0)
+    - "weighted": α * H2O + (1-α) * Influence (v4.1.0)
 
-    Why MAX > Individual Methods:
-    - H2O excels at NarrativeQA-style simple retrieval (popularity matters)
-    - Influence excels at HotpotQA-style multi-hop reasoning (path matters)
-    - MAX captures the union of both - works well on BOTH task types
+    Why DIS > MAX:
+    - MAX: Token kept if EITHER H2O OR Influence is high (OR logic)
+    - DIS: Token kept if BOTH QI AND HI are high (AND logic via geom mean)
+    - DIS is more selective but captures genuinely important tokens
+    - Both signals from same theory (no mixing apples with oranges)
 
     Physics Analogy:
-    - H2O = Mass (how popular is this token?)
-    - Influence = Expected Current Flow (how much information flows through?)
-    - MAX = Union of Forces (keep token if it has high mass OR high flow)
-
-    Algorithm:
-    1. Compute full attention matrix from query/key states
-    2. Compute H2O scores (column sums)
-    3. Compute Influence via Neumann series (expected visits from query to sink)
-    4. Rank normalize both scores to [0, 1]
-    5. Combined score = max(h2o_rank, influence_rank)
-    6. Select top tokens by combined scores for KV cache retention
+    - QI = "How much current from query flows through this token?"
+    - HI = "How much current from ALL positions flows through this token?"
+    - DIS = Tokens that are BOTH query-relevant AND globally central
 
     Configuration:
+    - combination_mode: "dis", "max", or "weighted"
+    - dis_alpha: QI weight in DIS (0.5=symmetric, >0.5=favor QI, <0.5=favor HI)
     - neumann_iterations: Neumann series iterations (default: 10)
+    - neumann_temperature: Attention sharpening (default: 1.0, lower = sharper)
     - sink_size: Absorbing boundary (default: 4)
-    - temperature: Attention sharpening (default: 1.0, lower = sharper)
-    - use_neumann: Use deterministic Neumann (default: True in v4.0)
     """
 
     def __init__(
@@ -1261,6 +1264,11 @@ class CircuitKVCluster():
         use_neumann: bool = True,  # v4.0.0: Use deterministic Neumann instead of random walks
         neumann_iterations: int = 10,  # Number of Neumann series iterations
         neumann_temperature: float = 1.0,  # Temperature for attention sharpening (lower = sharper)
+        # v4.1.0: Combination tuning
+        h2o_weight: float = 0.5,  # Weight for H2O in combination (0.5 = equal, >0.5 = favor H2O)
+        combination_mode: str = "max",  # "max", "weighted", or "dis" (v4.2.0: Dual-Importance Scoring)
+        # v4.2.0: Dual-Importance Scoring
+        dis_alpha: float = 0.5,  # QI weight in DIS (0.5 = symmetric geometric mean)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1280,6 +1288,11 @@ class CircuitKVCluster():
         self.use_neumann = use_neumann
         self.neumann_iterations = neumann_iterations
         self.neumann_temperature = neumann_temperature
+        # v4.1.0: Combination tuning
+        self.h2o_weight = h2o_weight
+        self.combination_mode = combination_mode
+        # v4.2.0: Dual-Importance Scoring
+        self.dis_alpha = dis_alpha
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1740,6 +1753,133 @@ class CircuitKVCluster():
 
         return scores
 
+    def _compute_dual_importance_scores(
+        self,
+        attention: torch.Tensor,
+        query_idx: int,
+        sink_size: int = 4,
+        num_iterations: int = 10,
+        temperature: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        v4.2.0: Dual-Importance Scoring (DIS) via Absorbing Markov Chain.
+
+        Computes TWO importance scores from the SAME fundamental matrix N:
+
+        1. QUERY IMPORTANCE (QI): N[q, j] = expected visits to j FROM query
+           - "How important is j for answering THIS specific query?"
+           - Captures query-relevant tokens on the path to sink
+
+        2. HUB IMPORTANCE (HI): (1/n) Σᵢ N[i, j] = avg expected visits to j
+           - "How central is j in the overall information flow network?"
+           - Captures globally important "hub" tokens
+
+        Mathematical Foundation:
+        - N = (I - Q)^{-1} is the fundamental matrix of absorbing Markov chain
+        - QI[j] = row q of N = expected visits from query position
+        - HI[j] = column mean of N = average importance from ALL starting points
+
+        Efficient Computation (O(k * n²) for BOTH metrics):
+        - QI: Iterate v = Q.t() @ v starting from e_query
+        - HI: Iterate u = Q.t() @ u starting from uniform (1/n)
+
+        Why BOTH Matter:
+        - QI alone misses globally important tokens that query doesn't directly see
+        - HI alone misses query-specific relevant tokens
+        - Together, they capture complementary notions of importance
+
+        Combination Strategy (external):
+        - DIS[j] = √(QI[j] × HI[j])  (geometric mean)
+        - Requires BOTH properties - more selective than MAX
+
+        Args:
+            attention: Causal attention matrix [seq_len, seq_len]
+            query_idx: Source position (typically seq_len - 1)
+            sink_size: First sink_size tokens are absorbing (default 4)
+            num_iterations: Neumann series iterations (default 10)
+            temperature: Attention sharpening (default 1.0, lower = sharper)
+
+        Returns:
+            Tuple of (query_importance, hub_importance), each [seq_len]
+        """
+        n = attention.shape[0]
+        device = attention.device
+
+        # Handle edge cases
+        if n <= sink_size:
+            uniform = torch.ones(n, device=device, dtype=torch.float32) / n
+            return uniform, uniform
+
+        # =====================================================================
+        # STEP 1: Build transition matrix P from attention
+        # =====================================================================
+        if temperature != 1.0 and temperature > 0:
+            attn_scaled = attention ** (1.0 / temperature)
+        else:
+            attn_scaled = attention
+
+        row_sums = attn_scaled.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        P = attn_scaled / row_sums  # [n, n]
+
+        # =====================================================================
+        # STEP 2: Extract Q (transient-to-transient transitions)
+        # =====================================================================
+        n_transient = n - sink_size
+        Q = P[sink_size:, sink_size:].contiguous()  # [n_transient, n_transient]
+
+        # Query position in transient space
+        query_transient_idx = query_idx - sink_size
+        if query_transient_idx < 0:
+            uniform = torch.ones(n, device=device, dtype=torch.float32) / n
+            return uniform, uniform
+
+        # =====================================================================
+        # STEP 3: Parallel Neumann series for BOTH QI and HI
+        # QI: Start from e_query (one-hot at query position)
+        # HI: Start from uniform (1/n_transient) for average over all starts
+        # =====================================================================
+        # Initialize Query Importance vector
+        v_qi = torch.zeros(n_transient, device=device, dtype=torch.float32)
+        v_qi[query_transient_idx] = 1.0
+        result_qi = v_qi.clone()
+
+        # Initialize Hub Importance vector (uniform start = average over all)
+        v_hi = torch.ones(n_transient, device=device, dtype=torch.float32) / n_transient
+        result_hi = v_hi.clone()
+
+        # Iterate both in parallel
+        for _ in range(num_iterations):
+            v_qi = torch.mv(Q.t(), v_qi)
+            v_hi = torch.mv(Q.t(), v_hi)
+            result_qi = result_qi + v_qi
+            result_hi = result_hi + v_hi
+
+            # Early stopping if both converged
+            if v_qi.abs().max().item() < 1e-8 and v_hi.abs().max().item() < 1e-8:
+                break
+
+        # =====================================================================
+        # STEP 4: Map back to full sequence
+        # =====================================================================
+        qi_scores = torch.zeros(n, device=device, dtype=torch.float32)
+        qi_scores[sink_size:] = result_qi
+        qi_scores[:sink_size] = result_qi.sum() * 0.01  # Small score for sink
+
+        hi_scores = torch.zeros(n, device=device, dtype=torch.float32)
+        hi_scores[sink_size:] = result_hi
+        hi_scores[:sink_size] = result_hi.sum() * 0.01  # Small score for sink
+
+        # Normalize each to [0, 1]
+        qi_max = qi_scores.max()
+        if qi_max > 0:
+            qi_scores = qi_scores / qi_max
+
+        hi_max = hi_scores.max()
+        if hi_max > 0:
+            hi_scores = hi_scores / hi_max
+
+        return qi_scores, hi_scores
+
     def _detect_instruction_anchors_heuristic(
         self,
         attention_matrix: torch.Tensor,
@@ -2063,7 +2203,13 @@ class CircuitKVCluster():
         bsz, num_heads, q_len, head_dim = query_states.shape
 
         mode = "Neumann" if self.use_neumann else "RandomWalk"
-        print(f"CircuitKV v4.0.0 ({mode}, k={self.neumann_iterations}) max_capacity_prompt {self.max_capacity_prompt}")
+        if self.combination_mode == "dis":
+            comb = f"DIS(α={self.dis_alpha:.1f})"
+        elif self.combination_mode == "weighted":
+            comb = f"weighted({self.h2o_weight:.1f})"
+        else:
+            comb = "MAX"
+        print(f"CircuitKV v4.2.0 ({mode}, k={self.neumann_iterations}, T={self.neumann_temperature}, {comb}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2138,13 +2284,44 @@ class CircuitKVCluster():
             full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
-        # STEP 2: Compute Causal Influence Scores
+        # STEP 2: Compute Importance Scores
+        # v4.2.0: Dual-Importance Scoring (DIS) - QI × HI from fundamental matrix
         # v4.0.0: Deterministic Neumann series (default)
         # v3.0.0: Stochastic random walks (legacy, for ablation)
         # =====================================================================
         current_idx = q_len - 1
 
-        if self.use_neumann:
+        if self.combination_mode == "dis":
+            # v4.2.0: Dual-Importance Scoring (DIS)
+            # Computes BOTH Query Importance (QI) and Hub Importance (HI)
+            # from the same fundamental matrix N = (I-Q)^(-1)
+            qi_scores, hi_scores = self._compute_dual_importance_scores(
+                full_attn[:q_len, :q_len].contiguous(),
+                current_idx,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                temperature=self.neumann_temperature,
+            )
+
+            # Rank normalize both
+            qi_rank = self._rank_normalize(qi_scores)
+            hi_rank = self._rank_normalize(hi_scores)
+
+            # v4.2.0: Weighted geometric mean: QI^α × HI^(1-α)
+            # - α = 0.5: Symmetric geometric mean √(QI × HI) (default)
+            # - α > 0.5: Favor query-relevance (better for single-doc QA)
+            # - α < 0.5: Favor hub-centrality (better for multi-hop)
+            alpha = self.dis_alpha
+            combined_scores = (qi_rank + 1e-8) ** alpha * (hi_rank + 1e-8) ** (1 - alpha)
+
+            # Store for debugging (use influence_scores variable for compatibility)
+            influence_scores_full = torch.zeros(
+                full_attn.shape[0], device=full_attn.device, dtype=torch.float32
+            )
+            influence_scores_full[:q_len] = qi_scores  # Store QI as "influence" for debug
+            influence_scores = influence_scores_full
+
+        elif self.use_neumann:
             # v4.0.0: Deterministic influence via Neumann series
             # Computes expected visit counts analytically: N = (I-Q)^(-1)
             influence_scores = self._compute_influence_neumann(
@@ -2160,6 +2337,28 @@ class CircuitKVCluster():
             )
             influence_scores_full[:q_len] = influence_scores
             influence_scores = influence_scores_full
+
+            # =====================================================================
+            # STEP 2b: MAX(H2O, Influence) with Rank Normalization
+            # - H2O = column sums (good for NarrativeQA-style simple retrieval)
+            # - Influence = walker scores (good for HotpotQA-style multi-hop)
+            # - MAX = hedging strategy that works for both
+            # =====================================================================
+            # Compute H2O scores (column sums)
+            h2o_scores = full_attn.sum(dim=0)  # [seq_len]
+
+            # Rank normalize both to [0, 1] (puts them on equal footing)
+            h2o_rank = self._rank_normalize(h2o_scores[:q_len])
+            influence_rank = self._rank_normalize(influence_scores[:q_len])
+
+            # v4.1.0: Configurable combination mode
+            if self.combination_mode == "weighted":
+                # Weighted average: α * H2O + (1-α) * Influence
+                combined_scores = self.h2o_weight * h2o_rank + (1 - self.h2o_weight) * influence_rank
+            else:
+                # MAX combination: keeps token if EITHER force wants it (default)
+                combined_scores = torch.maximum(h2o_rank, influence_rank)
+
         else:
             # v3.0.0 (legacy): Stochastic random walks via CUDA kernel
             self._graph.update_and_step_influence_walker(
@@ -2171,22 +2370,15 @@ class CircuitKVCluster():
             )
             influence_scores = self._graph.get_influence_scores()
 
-        # =====================================================================
-        # STEP 2b: MAX(H2O, Influence) with Rank Normalization
-        # - H2O = column sums (good for NarrativeQA-style simple retrieval)
-        # - Influence = walker scores (good for HotpotQA-style multi-hop)
-        # - MAX = hedging strategy that works for both
-        # v3.0.0: + Instruction Anchor Detection for TREC-like tasks
-        # =====================================================================
-        # Compute H2O scores (column sums)
-        h2o_scores = full_attn.sum(dim=0)  # [seq_len]
+            # Compute H2O scores (column sums)
+            h2o_scores = full_attn.sum(dim=0)  # [seq_len]
 
-        # Rank normalize both to [0, 1] (puts them on equal footing)
-        h2o_rank = self._rank_normalize(h2o_scores[:q_len])
-        influence_rank = self._rank_normalize(influence_scores[:q_len])
+            # Rank normalize both to [0, 1] (puts them on equal footing)
+            h2o_rank = self._rank_normalize(h2o_scores[:q_len])
+            influence_rank = self._rank_normalize(influence_scores[:q_len])
 
-        # MAX combination: keeps token if EITHER force wants it
-        combined_scores = torch.maximum(h2o_rank, influence_rank)
+            # MAX combination
+            combined_scores = torch.maximum(h2o_rank, influence_rank)
 
         # v3.0.0 Breakthrough 2: Instruction Anchor Detection
         # Detect and boost instruction-anchoring tokens for few-shot tasks
@@ -2613,6 +2805,21 @@ def init_circuitkv(self):
         # Debug logging
         if not hasattr(self.config, 'circuitkv_debug'):
             self.config.circuitkv_debug = False
+        # v4.0.0: Deterministic Neumann Series
+        if not hasattr(self.config, 'use_neumann'):
+            self.config.use_neumann = True  # Default: use deterministic Neumann
+        if not hasattr(self.config, 'neumann_iterations'):
+            self.config.neumann_iterations = 10  # Neumann series iterations
+        if not hasattr(self.config, 'neumann_temperature'):
+            self.config.neumann_temperature = 1.0  # Temperature for attention sharpening
+        # v4.1.0: Combination tuning
+        if not hasattr(self.config, 'h2o_weight'):
+            self.config.h2o_weight = 0.5  # Weight for H2O in weighted combination
+        if not hasattr(self.config, 'combination_mode'):
+            self.config.combination_mode = "dis"  # Default: DIS (v4.2.0)
+        # v4.2.0: Dual-Importance Scoring
+        if not hasattr(self.config, 'dis_alpha'):
+            self.config.dis_alpha = 0.5  # QI weight in DIS (0.5 = symmetric)
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -2639,4 +2846,13 @@ def init_circuitkv(self):
         absorb_at_landmarks=self.config.absorb_at_landmarks,
         # Debug
         debug=self.config.circuitkv_debug,
+        # v4.0.0: Deterministic Neumann Series
+        use_neumann=self.config.use_neumann,
+        neumann_iterations=self.config.neumann_iterations,
+        neumann_temperature=self.config.neumann_temperature,
+        # v4.1.0: Combination tuning
+        h2o_weight=self.config.h2o_weight,
+        combination_mode=self.config.combination_mode,
+        # v4.2.0: Dual-Importance Scoring
+        dis_alpha=self.config.dis_alpha,
     )
