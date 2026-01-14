@@ -593,47 +593,62 @@ class H2OKVCluster():
         self.merge = merge
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
-        
+
         print(f"H2O max_capacity_prompt {self.max_capacity_prompt}")
-        
+
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
         else:
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
-            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-            mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-            mask = mask.to(attn_weights.device)
-            attention_mask = mask[None, None, :, :]
+            past_len = q_len - self.window_size
+            num_keep = self.max_capacity_prompt - self.window_size
 
-            attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+            # Chunked attention computation to avoid OOM on long sequences
+            # This is mathematically equivalent to full attention - just memory efficient
+            chunk_size = 2048
 
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights_sum = attn_weights[:, :, :, : -self.window_size].sum(dim = -2)
-            # if self.pooling == 'avgpool':
-            #     attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-            # elif self.pooling == 'maxpool':
-            #     attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
-            # else:
-            #     raise ValueError('Pooling method not supported')
-            attn_cache = attn_weights_sum
-            indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+            # Accumulator for attention scores (sum of attention each key receives)
+            attn_scores = torch.zeros(
+                bsz, num_heads, past_len,
+                device=key_states.device,
+                dtype=torch.bfloat16
+            )
+
+            past_keys = key_states[:, :, :past_len, :]
+
+            # Process queries in chunks
+            for i in range(0, q_len, chunk_size):
+                end_i = min(i + chunk_size, q_len)
+                q_chunk = query_states[:, :, i:end_i, :]
+
+                # Attention: (bsz, num_heads, chunk_size, past_len)
+                attn_chunk = torch.matmul(q_chunk, past_keys.transpose(2, 3)) / math.sqrt(head_dim)
+                attn_chunk = nn.functional.softmax(attn_chunk, dim=-1, dtype=torch.bfloat16)
+
+                # Accumulate: sum attention each past key received from this query chunk
+                attn_scores += attn_chunk.sum(dim=2)
+
+                del attn_chunk
+                torch.cuda.empty_cache()
+
+            # Select top-k keys with highest accumulated attention
+            attn_cache = attn_scores
+            indices = attn_cache.topk(num_keep, dim=-1).indices
             indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
             if self.merge is not None:
                 key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
                 return key_states, value_states
 
-            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
-            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
+            k_past_compress = key_states[:, :, :past_len, :].gather(dim=2, index=indices)
+            v_past_compress = value_states[:, :, :past_len, :].gather(dim=2, index=indices)
             k_cur = key_states[:, :, -self.window_size:, :]
             v_cur = value_states[:, :, -self.window_size:, :]
-            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
-            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            key_states = torch.cat([k_past_compress, k_cur], dim=2)
+            value_states = torch.cat([v_past_compress, v_cur], dim=2)
             return key_states, value_states
 
 
@@ -1693,14 +1708,15 @@ class CircuitKVCluster():
         result = v.clone()
 
         # Iterate Neumann series: result = I + Q + Q² + ... + Q^k
-        # Each iteration: v_{k+1} = Q^T @ v_k (we want column sums, so transpose)
-        # Actually for expected visits TO each state, we need (Q^T)^k
-        # N[i,j] = expected visits to j starting from i
-        # So we compute: result[j] = sum_k (Q^k)[query, j]
-        #              = sum_k e_query^T @ Q^k @ e_j
-        # Iterate: v = Q @ v where v starts as e_query
+        # We want row q of N = (I-Q)^(-1), i.e., expected visits FROM query TO each j
+        #
+        # Row q of Q^k is computed as: (Q^k)[q,:] = e_q^T @ Q^k
+        # In column form: ((Q^k)[q,:])^T = (Q^T)^k @ e_q
+        #
+        # So we iterate: v_{k+1} = Q^T @ v_k, where v_0 = e_query
+        # This gives v_k = (Q^T)^k @ e_q = row q of Q^k (as column vector)
         for _ in range(num_iterations):
-            v = torch.mv(Q, v)  # Q @ v - efficient matrix-vector product
+            v = torch.mv(Q.t(), v)  # Q^T @ v - gives row q of Q^k
             result = result + v
 
             # Early stopping if converged

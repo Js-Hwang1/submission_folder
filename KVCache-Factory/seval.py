@@ -32,12 +32,12 @@ def evaluate_file(filepath, dataset):
     return round(100 * total / len(predictions), 2)
 
 # Adjust this path to match your results directory
-results_dir = "/Users/j/Desktop/results/Llama3-8B-Instruct/Llama3-8B-Instruct-256/meta-llama-3-8b-instruct_SKV_256"
+results_dir = "/Users/j/Desktop/results 2/CKV/meta-llama-3-8b-instruct_2048"
 
 print("CircuitKV Results:")
 print("-" * 40)
 for dataset in sorted(os.listdir(results_dir)):
-    filepath = os.path.join(results_dir, dataset, "snapkv.json")
+    filepath = os.path.join(results_dir, dataset, "circuitkv.json")
     if os.path.exists(filepath):
         score = evaluate_file(filepath, dataset)
         print(f"{dataset:25} {score:6.2f}")
