@@ -29,6 +29,13 @@ from transformers.utils import (
     is_flash_attn_2_available,
 )
 
+# Import _upad_input for transformers 4.44+ (moved to modeling_flash_attention_utils)
+try:
+    from transformers.modeling_flash_attention_utils import _upad_input
+except ImportError:
+    # Fallback: will use self._upad_input from attention class in older versions
+    _upad_input = None
+
 from pyramidkv.pyramidkv_utils import (
     init_pyramidkv,
     init_snapkv,
@@ -140,17 +147,26 @@ def _flash_attention_forward(
 ):
     """
     Flash Attention forward for Qwen2 models.
+    Compatible with transformers 4.44.2+ where _upad_input is a standalone function.
     """
-    if not self._flash_attn_uses_top_left_mask:
+    # Handle _flash_attn_uses_top_left_mask - may not exist in all versions
+    use_top_left_mask = getattr(self, '_flash_attn_uses_top_left_mask', False)
+    if not use_top_left_mask:
         causal = self.is_causal
     else:
         causal = self.is_causal and query_length != 1
 
     if attention_mask is not None:
         batch_size = query_states.shape[0]
-        query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-            query_states, key_states, value_states, attention_mask, query_length
-        )
+        # Use standalone _upad_input (transformers 4.44+) or fallback to method
+        if _upad_input is not None:
+            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = _upad_input(
+                query_states, key_states, value_states, attention_mask, query_length
+            )
+        else:
+            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+                query_states, key_states, value_states, attention_mask, query_length
+            )
 
         cu_seqlens_q, cu_seqlens_k = cu_seq_lens
         max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
@@ -1716,10 +1732,14 @@ def prepare_inputs_for_generation_qwen2_new(
     use_cache=True,
     **kwargs,
 ):
-    if not isinstance(past_key_values, tuple):
-        if len(past_key_values.key_cache) == 0:
+    # Reset kv_seq_len on first call or when cache is empty
+    if past_key_values is not None and not isinstance(past_key_values, tuple):
+        if hasattr(past_key_values, 'key_cache') and len(past_key_values.key_cache) == 0:
             for layer in self.model.layers:
                 layer.self_attn.kv_seq_len = 0
+    elif past_key_values is None:
+        for layer in self.model.layers:
+            layer.self_attn.kv_seq_len = 0
 
     if past_key_values is not None:
         if inputs_embeds is not None:
@@ -1777,7 +1797,8 @@ def prepare_inputs_for_generation_qwen2_new(
 def prepare_inputs_for_generation_qwen2(
     self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
 ):
-    if past_key_values is None or len(past_key_values.key_cache) == 0:
+    # Reset kv_seq_len on first call or when cache is empty
+    if past_key_values is None or (hasattr(past_key_values, 'key_cache') and len(past_key_values.key_cache) == 0):
         for layer in self.model.layers:
             layer.self_attn.kv_seq_len = 0
     if past_key_values is not None:
