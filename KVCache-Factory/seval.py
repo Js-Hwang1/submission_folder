@@ -32,12 +32,12 @@ def evaluate_file(filepath, dataset):
     return round(100 * total / len(predictions), 2)
 
 # Adjust this path to match your results directory
-results_dir = "/Users/j/Desktop/results*/Llama3.1-8B-Instruct/Llama3.1-8B-Instruct_1024/llama-3.1-8b-instruct_PKV_1024"
+results_dir = "/Users/j/Desktop/results*/Llama3-8B-Instruct/Llama3-8B-Instruct-128/meta-llama-3-8b-instruct_SLM_128"
 
 print("CircuitKV Results:")
 print("-" * 40)
 for dataset in sorted(os.listdir(results_dir)):
-    filepath = os.path.join(results_dir, dataset, "pyramidkv.json")
+    filepath = os.path.join(results_dir, dataset, "streamingllm.json")
     if os.path.exists(filepath):
         score = evaluate_file(filepath, dataset)
         print(f"{dataset:25} {score:6.2f}")
