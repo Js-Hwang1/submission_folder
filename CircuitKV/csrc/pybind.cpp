@@ -319,7 +319,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
 
     // Version info
-    m.attr("__version__") = "4.2.0";  // Dual-Importance Scoring (DIS)
+    m.attr("__version__") = "4.3.0";  // Unified Dual-Importance: MAX(HI, QI)
 }
 
 }  // namespace circuit_kv

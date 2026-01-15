@@ -1169,14 +1169,13 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v4.2.0: Dual-Importance Scoring (DIS) via Absorbing Markov Chains.
+    CircuitKV v4.3.0: Unified Dual-Importance via Absorbing Markov Chains.
 
     This class implements importance scoring for KV cache eviction using
     the FUNDAMENTAL MATRIX of absorbing Markov chains.
 
-    v4.2.0 Key Innovation - DUAL-IMPORTANCE SCORING (DIS):
-    Instead of mixing H2O (one-hop) with Influence (multi-hop), we derive
-    BOTH importance signals from the SAME mathematical object:
+    v4.3.0 Key Innovation - UNIFIED IMPORTANCE SCORING:
+    Both importance signals derived from the SAME mathematical object (N):
 
     1. QUERY IMPORTANCE (QI): N[q, j] = expected visits FROM query to j
        - "How important is j for answering THIS specific query?"
@@ -1184,12 +1183,17 @@ class CircuitKVCluster():
 
     2. HUB IMPORTANCE (HI): (1/n) Σᵢ N[i, j] = average expected visits to j
        - "How central is j in the overall information flow network?"
-       - Captures globally important "hub" tokens
+       - Captures globally important "hub" tokens (multi-hop, not one-hop H2O)
 
-    Final Score: DIS[j] = √(QI[j] × HI[j])  (geometric mean)
-    - Requires BOTH query-relevance AND hub-centrality
-    - More principled than MAX (which is OR)
-    - Both signals derived from same theoretical foundation
+    Final Score: MAX(QI_rank, HI_rank)
+    - Keeps token if EITHER query-relevant OR globally central
+    - "OR logic" is more robust than geometric mean's "AND logic"
+    - Both signals from same theory (cleaner than mixing H2O with QI)
+
+    Evolution:
+    - v4.0: MAX(H2O, QI) - H2O from A (one-hop), QI from N (multi-hop)
+    - v4.2: √(QI × HI) - both from N, but geometric mean too selective
+    - v4.3: MAX(HI, QI) - both from N, with robust OR logic ← CURRENT
 
     Mathematical Foundation:
     - Attention matrix A defines transition probabilities P[i,j]
@@ -1198,24 +1202,17 @@ class CircuitKVCluster():
     - Computed via Neumann series: I + Q + Q² + ... + Q^k
 
     Combination Modes (combination_mode parameter):
-    - "dis": Dual-Importance Scoring (v4.2.0) - √(QI × HI)
-    - "max": MAX(H2O_rank, Influence_rank) (v4.0.0)
-    - "weighted": α * H2O + (1-α) * Influence (v4.1.0)
+    - "dis": MAX(HI, QI) - v4.3.0, both from fundamental matrix N
+    - "max": MAX(H2O, QI) - v4.0.0, H2O from attention, QI from N
+    - "weighted": α * H2O + (1-α) * QI - v4.1.0
 
-    Why DIS > MAX:
-    - MAX: Token kept if EITHER H2O OR Influence is high (OR logic)
-    - DIS: Token kept if BOTH QI AND HI are high (AND logic via geom mean)
-    - DIS is more selective but captures genuinely important tokens
-    - Both signals from same theory (no mixing apples with oranges)
-
-    Physics Analogy:
-    - QI = "How much current from query flows through this token?"
-    - HI = "How much current from ALL positions flows through this token?"
-    - DIS = Tokens that are BOTH query-relevant AND globally central
+    Why v4.3 (dis) > v4.0 (max):
+    - v4.0 mixes one-hop (H2O) with multi-hop (QI) - different theories
+    - v4.3 uses multi-hop for BOTH signals - unified theory
+    - HI captures bridge tokens that H2O misses
 
     Configuration:
-    - combination_mode: "dis", "max", or "weighted"
-    - dis_alpha: QI weight in DIS (0.5=symmetric, >0.5=favor QI, <0.5=favor HI)
+    - combination_mode: "dis" (recommended), "max", or "weighted"
     - neumann_iterations: Neumann series iterations (default: 10)
     - neumann_temperature: Attention sharpening (default: 1.0, lower = sharper)
     - sink_size: Absorbing boundary (default: 4)
@@ -2204,12 +2201,12 @@ class CircuitKVCluster():
 
         mode = "Neumann" if self.use_neumann else "RandomWalk"
         if self.combination_mode == "dis":
-            comb = f"DIS(α={self.dis_alpha:.1f})"
+            comb = "MAX(HI,QI)"  # v4.3: Both from fundamental matrix N
         elif self.combination_mode == "weighted":
             comb = f"weighted({self.h2o_weight:.1f})"
         else:
-            comb = "MAX"
-        print(f"CircuitKV v4.2.0 ({mode}, k={self.neumann_iterations}, T={self.neumann_temperature}, {comb}) budget={self.max_capacity_prompt}")
+            comb = "MAX(H2O,QI)"  # v4.0: H2O from A, QI from N
+        print(f"CircuitKV v4.3.0 ({mode}, k={self.neumann_iterations}, T={self.neumann_temperature}, {comb}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2307,12 +2304,10 @@ class CircuitKVCluster():
             qi_rank = self._rank_normalize(qi_scores)
             hi_rank = self._rank_normalize(hi_scores)
 
-            # v4.2.0: Weighted geometric mean: QI^α × HI^(1-α)
-            # - α = 0.5: Symmetric geometric mean √(QI × HI) (default)
-            # - α > 0.5: Favor query-relevance (better for single-doc QA)
-            # - α < 0.5: Favor hub-centrality (better for multi-hop)
-            alpha = self.dis_alpha
-            combined_scores = (qi_rank + 1e-8) ** alpha * (hi_rank + 1e-8) ** (1 - alpha)
+            # v4.3.0: MAX(HI, QI) - both signals from fundamental matrix N
+            # This is the "OR logic" version of DIS - keeps token if EITHER is high
+            # Cleaner than v4.0's MAX(H2O, QI) because both signals are multi-hop
+            combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging (use influence_scores variable for compatibility)
             influence_scores_full = torch.zeros(
