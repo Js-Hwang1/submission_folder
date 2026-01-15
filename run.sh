@@ -44,3 +44,5 @@ echo "=============================================="
 echo "All experiments completed at $(date)"
 echo "=============================================="
 
+scp jungshwang@login.nvwulf.stonybrook.edu:/lustre/nvwulf/scratch/jungshwang/submission_folder/KVCache-Factory/res.tar.gz .
+
