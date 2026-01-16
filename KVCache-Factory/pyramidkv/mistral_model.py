@@ -3412,7 +3412,15 @@ def mistral_flash_attn2_forward_CircuitKV(
     value_states = value_states.transpose(1, 2)
 
     attn_output = _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        q_len,
+        position_ids=position_ids,
+        dropout=dropout_rate,
+        use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        is_causal=self.is_causal,
     )
 
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
