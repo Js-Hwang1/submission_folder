@@ -294,6 +294,10 @@ def main(args):
                 model.model.layers[i].self_attn.config.recent_size = recent_size[i]
                 # CircuitKV debug flag
                 model.model.layers[i].self_attn.config.circuitkv_debug = args.debug
+                # MarkovKV ablation flags
+                model.model.layers[i].self_attn.config.ablate_qi = args.ablate_qi
+                model.model.layers[i].self_attn.config.ablate_hi = args.ablate_hi
+                model.model.layers[i].self_attn.config.combination_mode = args.combination_mode
             
 
         context_length = batch_input_ids.shape[-1]
@@ -392,6 +396,11 @@ if __name__ == "__main__":
     parser.add_argument("--recent_size", type=int, default=32, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="pruning ratio of Key Cache")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for CircuitKV (writes to longbench_CKV_dbg.log)")
+    # MarkovKV Ablation flags (A1: QI vs HI ablation)
+    parser.add_argument("--ablate_qi", action="store_true", help="Disable QI (Query Importance) - use HI only for ablation study")
+    parser.add_argument("--ablate_hi", action="store_true", help="Disable HI (Hub Importance) - use QI only for ablation study")
+    parser.add_argument("--combination_mode", type=str, default="dis", choices=["dis", "max", "weighted", "geometric", "sum"],
+                        help="Score combination mode: dis=MAX(QI,HI), geometric=sqrt(QI*HI), sum=0.5*QI+0.5*HI")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
     parser.add_argument("--gh200_unified_memory", action="store_true",

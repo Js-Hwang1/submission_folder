@@ -1266,6 +1266,9 @@ class CircuitKVCluster():
         combination_mode: str = "max",  # "max", "weighted", or "dis" (v4.2.0: Dual-Importance Scoring)
         # v4.2.0: Dual-Importance Scoring
         dis_alpha: float = 0.5,  # QI weight in DIS (0.5 = symmetric geometric mean)
+        # v4.3.1: Ablation flags for A1 experiment
+        ablate_qi: bool = False,  # If True, use HI only (QI zeroed)
+        ablate_hi: bool = False,  # If True, use QI only (HI zeroed)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1290,6 +1293,9 @@ class CircuitKVCluster():
         self.combination_mode = combination_mode
         # v4.2.0: Dual-Importance Scoring
         self.dis_alpha = dis_alpha
+        # v4.3.1: Ablation flags
+        self.ablate_qi = ablate_qi
+        self.ablate_hi = ablate_hi
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2304,10 +2310,24 @@ class CircuitKVCluster():
             qi_rank = self._rank_normalize(qi_scores)
             hi_rank = self._rank_normalize(hi_scores)
 
-            # v4.3.0: MAX(HI, QI) - both signals from fundamental matrix N
-            # This is the "OR logic" version of DIS - keeps token if EITHER is high
-            # Cleaner than v4.0's MAX(H2O, QI) because both signals are multi-hop
-            combined_scores = torch.maximum(qi_rank, hi_rank)
+            # v4.3.1: Ablation support - zero out one signal for A1 experiment
+            if self.ablate_qi:
+                # HI-only ablation: use only Hub Importance
+                qi_rank = torch.zeros_like(qi_rank)
+            if self.ablate_hi:
+                # QI-only ablation: use only Query Importance
+                hi_rank = torch.zeros_like(hi_rank)
+
+            # v4.3.0: Combination strategies (A2 ablation support)
+            if self.combination_mode == "geometric":
+                # Geometric mean: sqrt(QI * HI) - AND logic (both must be high)
+                combined_scores = torch.sqrt(qi_rank * hi_rank + 1e-8)
+            elif self.combination_mode == "sum":
+                # Weighted sum: 0.5*QI + 0.5*HI
+                combined_scores = 0.5 * qi_rank + 0.5 * hi_rank
+            else:
+                # Default "dis": MAX(HI, QI) - OR logic (keeps if EITHER is high)
+                combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging (use influence_scores variable for compatibility)
             influence_scores_full = torch.zeros(
@@ -2815,6 +2835,11 @@ def init_circuitkv(self):
         # v4.2.0: Dual-Importance Scoring
         if not hasattr(self.config, 'dis_alpha'):
             self.config.dis_alpha = 0.5  # QI weight in DIS (0.5 = symmetric)
+        # v4.3.1: Ablation flags for A1 experiment
+        if not hasattr(self.config, 'ablate_qi'):
+            self.config.ablate_qi = False  # If True, disable QI (use HI only)
+        if not hasattr(self.config, 'ablate_hi'):
+            self.config.ablate_hi = False  # If True, disable HI (use QI only)
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -2850,4 +2875,7 @@ def init_circuitkv(self):
         combination_mode=self.config.combination_mode,
         # v4.2.0: Dual-Importance Scoring
         dis_alpha=self.config.dis_alpha,
+        # v4.3.1: Ablation flags
+        ablate_qi=self.config.ablate_qi,
+        ablate_hi=self.config.ablate_hi,
     )
