@@ -119,6 +119,10 @@ def build_chat(prompt):
     prompt = f"[INST] {prompt} [/INST]"
     return prompt
 
+def build_chat_qwen(prompt):
+    """Build chat template for Qwen2/Qwen2.5 Instruct models."""
+    return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
 
 def get_model_family(model_path):
     """Detect model family from model path."""
@@ -174,10 +178,11 @@ def main(args):
             template = model2prompt[args.dataset]
             prompt = template.format(**example)
 
-            # Apply chat template for Llama 2 models only (matches stable LongBench evaluation)
-            # Note: Llama 3 and other models do NOT get chat template wrapping
+            # Apply chat template based on model family
             if "llama2" in args.model_path.lower():
                 prompt = build_chat(prompt)
+            elif "qwen" in args.model_path.lower():
+                prompt = build_chat_qwen(prompt)
 
             example["prompt"] = prompt
                 
