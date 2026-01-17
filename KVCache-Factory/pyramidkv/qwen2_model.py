@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.models.qwen2.modeling_qwen2 import (
     apply_rotary_pos_emb,
     repeat_kv,
