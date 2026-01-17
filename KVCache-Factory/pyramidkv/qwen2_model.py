@@ -67,40 +67,74 @@ def rotate_half(x):
 def _apply_rotary_pos_emb_compat(q, k, cos, sin, position_ids=None):
     """
     Compatibility wrapper for apply_rotary_pos_emb across transformers versions.
-    Uses the native apply_rotary_pos_emb when possible for maximum compatibility.
-    """
-    # Try native apply_rotary_pos_emb first (most reliable)
-    try:
-        return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-    except (TypeError, RuntimeError):
-        pass
 
-    # Fallback: manual application for edge cases
+    IMPORTANT: In newer transformers (4.40+), when position_embeddings is provided,
+    cos/sin are ALREADY indexed by position_ids. We detect this by checking if
+    cos.shape[-2] == q.shape[2] (seq_len matches). In this case, we should NOT
+    pass position_ids to apply_rotary_pos_emb to avoid double-indexing.
+    """
     q_seq_len = q.shape[2]  # q is [batch, num_heads, seq_len, head_dim]
 
-    # Handle different cos/sin shapes
-    if cos.dim() == 4:
-        # Shape: [batch, 1, seq_len, head_dim] - already indexed
-        pass
-    elif cos.dim() == 3:
-        # Shape: [1, seq_len, head_dim]
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    elif cos.dim() == 2:
-        # Shape: [seq_len, head_dim] - need to index and unsqueeze
-        if position_ids is not None and position_ids.dim() >= 1:
-            # Safely index with bounds checking
+    # Check if cos/sin are already indexed (seq_len dimension matches query seq_len)
+    cos_seq_len = cos.shape[-2] if cos.dim() >= 2 else cos.shape[0]
+    already_indexed = (cos_seq_len == q_seq_len)
+
+    if already_indexed:
+        # cos/sin are already indexed - do NOT pass position_ids
+        try:
+            # Try without position_ids first (correct for pre-indexed cos/sin)
+            return apply_rotary_pos_emb(q, k, cos, sin)
+        except TypeError:
+            try:
+                # Some versions need unsqueeze_dim parameter
+                return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+            except TypeError:
+                pass
+
+        # Manual application for pre-indexed cos/sin
+        if cos.dim() == 2:
+            # [seq_len, head_dim] -> [1, 1, seq_len, head_dim]
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        elif cos.dim() == 3:
+            # [batch, seq_len, head_dim] -> [batch, 1, seq_len, head_dim]
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+        # dim 4: [batch, 1, seq_len, head_dim] - already correct
+
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+    else:
+        # cos/sin need indexing by position_ids
+        try:
+            return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+        except (TypeError, RuntimeError):
+            pass
+
+        # Manual indexing
+        if cos.dim() == 4:
+            cos = cos.squeeze(1).squeeze(0)
+            sin = sin.squeeze(1).squeeze(0)
+        elif cos.dim() == 3:
+            cos = cos.squeeze(0)
+            sin = sin.squeeze(0)
+
+        # Index by position_ids with bounds checking
+        if position_ids is not None:
             max_pos = cos.shape[0]
-            safe_pos_ids = position_ids.clamp(0, max_pos - 1)
-            cos = cos[safe_pos_ids].unsqueeze(1)
-            sin = sin[safe_pos_ids].unsqueeze(1)
+            flat_pos = position_ids.reshape(-1).clamp(0, max_pos - 1)
+            batch_size = position_ids.shape[0]
+            seq_len = position_ids.shape[-1]
+            cos = cos[flat_pos].reshape(batch_size, seq_len, -1).unsqueeze(1)
+            sin = sin[flat_pos].reshape(batch_size, seq_len, -1).unsqueeze(1)
         else:
             cos = cos[:q_seq_len].unsqueeze(0).unsqueeze(0)
             sin = sin[:q_seq_len].unsqueeze(0).unsqueeze(0)
 
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
 
 
 def _get_rotary_emb_compat(rotary_emb, value_states, position_ids):
