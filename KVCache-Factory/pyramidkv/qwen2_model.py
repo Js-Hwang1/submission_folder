@@ -136,6 +136,8 @@ def qwen2_attn_forward_H2O(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -143,7 +145,8 @@ def qwen2_attn_forward_H2O(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -249,6 +252,8 @@ def qwen2_sdpa_attn_forward_H2O(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -256,7 +261,8 @@ def qwen2_sdpa_attn_forward_H2O(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -354,6 +360,8 @@ def qwen2_flash_attn2_forward_H2O(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -361,7 +369,8 @@ def qwen2_flash_attn2_forward_H2O(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -465,6 +474,8 @@ def qwen2_attn_forward_SnapKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -472,7 +483,8 @@ def qwen2_attn_forward_SnapKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -574,6 +586,8 @@ def qwen2_sdpa_attn_forward_SnapKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -581,7 +595,8 @@ def qwen2_sdpa_attn_forward_SnapKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -679,6 +694,8 @@ def qwen2_flash_attn2_forward_SnapKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -686,7 +703,8 @@ def qwen2_flash_attn2_forward_SnapKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -790,6 +808,8 @@ def qwen2_attn_forward_PyramidKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -797,7 +817,8 @@ def qwen2_attn_forward_PyramidKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -899,6 +920,8 @@ def qwen2_sdpa_attn_forward_PyramidKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -906,7 +929,8 @@ def qwen2_sdpa_attn_forward_PyramidKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1004,6 +1028,8 @@ def qwen2_flash_attn2_forward_PyramidKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -1011,7 +1037,8 @@ def qwen2_flash_attn2_forward_PyramidKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1115,6 +1142,8 @@ def qwen2_attn_forward_StreamingLLM(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -1122,7 +1151,8 @@ def qwen2_attn_forward_StreamingLLM(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1224,6 +1254,8 @@ def qwen2_sdpa_attn_forward_StreamingLLM(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -1231,7 +1263,8 @@ def qwen2_sdpa_attn_forward_StreamingLLM(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1329,6 +1362,8 @@ def qwen2_flash_attn2_forward_StreamingLLM(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -1336,7 +1371,8 @@ def qwen2_flash_attn2_forward_StreamingLLM(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1440,6 +1476,8 @@ def qwen2_attn_forward_CircuitKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -1447,7 +1485,8 @@ def qwen2_attn_forward_CircuitKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1549,6 +1588,8 @@ def qwen2_sdpa_attn_forward_CircuitKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -1556,7 +1597,8 @@ def qwen2_sdpa_attn_forward_CircuitKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1654,6 +1696,8 @@ def qwen2_flash_attn2_forward_CircuitKV(
     # otherwise compute with appropriate fallback for Qwen2's rotary_emb
     if position_embeddings is not None:
         cos, sin = position_embeddings
+        # position_embeddings are already indexed by position, don't pass position_ids
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
         # Qwen2's rotary_emb may expect seq_len (int) not position_ids (tensor)
         try:
@@ -1661,7 +1705,8 @@ def qwen2_flash_attn2_forward_CircuitKV(
         except (TypeError, RuntimeError):
             seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
             cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # Need position_ids to index into cos/sin computed from rotary_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
