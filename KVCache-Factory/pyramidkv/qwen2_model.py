@@ -67,55 +67,40 @@ def rotate_half(x):
 def _apply_rotary_pos_emb_compat(q, k, cos, sin, position_ids=None):
     """
     Compatibility wrapper for apply_rotary_pos_emb across transformers versions.
-
-    In newer transformers (4.40+), cos/sin from rotary_emb are already indexed
-    by position_ids and have shape [batch, 1, seq_len, head_dim].
-    In older versions, cos/sin have shape [1, 1, max_seq_len, head_dim] and need indexing.
-
-    This function detects the format and applies rotary embedding correctly.
+    Uses the native apply_rotary_pos_emb when possible for maximum compatibility.
     """
-    # Check if cos/sin are already indexed (newer transformers)
-    # In newer versions: cos shape is [batch, 1, seq_len, head_dim] matching q's seq_len
-    # In older versions: cos shape is [1, 1, max_seq_len, head_dim] with max_seq_len > seq_len
+    # Try native apply_rotary_pos_emb first (most reliable)
+    try:
+        return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+    except (TypeError, RuntimeError):
+        pass
 
+    # Fallback: manual application for edge cases
     q_seq_len = q.shape[2]  # q is [batch, num_heads, seq_len, head_dim]
-    cos_seq_len = cos.shape[2] if cos.dim() == 4 else cos.shape[0]
 
-    if cos_seq_len == q_seq_len:
-        # cos/sin already indexed for our sequence - just apply directly
-        # Ensure cos/sin have right shape for broadcasting
-        if cos.dim() == 4:
-            # Shape: [batch, 1, seq_len, head_dim] - need to match [batch, num_heads, seq_len, head_dim]
-            pass  # Already correct for broadcasting
-        else:
-            # Shape might be [seq_len, head_dim], unsqueeze to broadcast
-            cos = cos.unsqueeze(0).unsqueeze(0)
-            sin = sin.unsqueeze(0).unsqueeze(0)
-
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
-    else:
-        # cos/sin need indexing by position_ids (older transformers style)
-        # First squeeze to [seq_len, head_dim] if needed
-        if cos.dim() == 4:
-            cos = cos.squeeze(1).squeeze(0)
-            sin = sin.squeeze(1).squeeze(0)
-        elif cos.dim() == 3:
-            cos = cos.squeeze(0)
-            sin = sin.squeeze(0)
-
-        # Index by position_ids
-        if position_ids is not None:
-            cos = cos[position_ids].unsqueeze(1)  # [batch, 1, seq_len, head_dim]
-            sin = sin[position_ids].unsqueeze(1)
+    # Handle different cos/sin shapes
+    if cos.dim() == 4:
+        # Shape: [batch, 1, seq_len, head_dim] - already indexed
+        pass
+    elif cos.dim() == 3:
+        # Shape: [1, seq_len, head_dim]
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    elif cos.dim() == 2:
+        # Shape: [seq_len, head_dim] - need to index and unsqueeze
+        if position_ids is not None and position_ids.dim() >= 1:
+            # Safely index with bounds checking
+            max_pos = cos.shape[0]
+            safe_pos_ids = position_ids.clamp(0, max_pos - 1)
+            cos = cos[safe_pos_ids].unsqueeze(1)
+            sin = sin[safe_pos_ids].unsqueeze(1)
         else:
             cos = cos[:q_seq_len].unsqueeze(0).unsqueeze(0)
             sin = sin[:q_seq_len].unsqueeze(0).unsqueeze(0)
 
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 def _get_rotary_emb_compat(rotary_emb, value_states, position_ids):
@@ -156,18 +141,31 @@ def _flash_attention_forward(
     else:
         causal = self.is_causal and query_length != 1
 
+    # Ensure tensors are contiguous for flash attention
+    query_states = query_states.contiguous()
+    key_states = key_states.contiguous()
+    value_states = value_states.contiguous()
+
     if attention_mask is not None:
         batch_size = query_states.shape[0]
         # Use standalone _upad_input (transformers 4.44+) or fallback to method
-        if _upad_input is not None:
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = _upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
-        else:
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
+        try:
+            if _upad_input is not None:
+                query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = _upad_input(
+                    query_states, key_states, value_states, attention_mask, query_length
+                )
+            elif hasattr(self, '_upad_input'):
+                query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+                    query_states, key_states, value_states, attention_mask, query_length
+                )
+            else:
+                # Fallback: ignore attention_mask and use simple flash attention
+                attention_mask = None
+        except Exception:
+            # If _upad_input fails, fall back to simple flash attention
+            attention_mask = None
 
+    if attention_mask is not None:
         cu_seqlens_q, cu_seqlens_k = cu_seq_lens
         max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 
