@@ -4,9 +4,10 @@ Supports: H2O, SnapKV, PyramidKV, StreamingLLM, CircuitKV, and others.
 
 This module provides attention forward replacements for Qwen2 models,
 enabling various KV-cache compression strategies.
+
+NOTE: This implementation follows the same pattern as llama_model.py for maximum compatibility.
 """
 
-import inspect
 import math
 import warnings
 import torch
@@ -14,27 +15,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.qwen2.modeling_qwen2 import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
-from transformers.modeling_attn_mask_utils import (
-    _prepare_4d_causal_attention_mask,
-    _prepare_4d_causal_attention_mask_for_sdpa,
-)
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import (
     logging,
-    is_flash_attn_2_available,
 )
-
-# Import _upad_input for transformers 4.44+ (moved to modeling_flash_attention_utils)
-try:
-    from transformers.modeling_flash_attention_utils import _upad_input
-except ImportError:
-    # Fallback: will use self._upad_input from attention class in older versions
-    _upad_input = None
 
 from pyramidkv.pyramidkv_utils import (
     init_pyramidkv,
@@ -49,116 +38,10 @@ from pyramidkv.pyramidkv_utils import (
 )
 from pyramidkv.pyramidkv_utils import DynamicCacheSplitHeadFlatten
 
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
-    _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 
 logger = logging.get_logger(__name__)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb_compat(q, k, cos, sin, position_ids=None):
-    """
-    Compatibility wrapper for apply_rotary_pos_emb across transformers versions.
-
-    IMPORTANT: In newer transformers (4.40+), when position_embeddings is provided,
-    cos/sin are ALREADY indexed by position_ids. We detect this by checking if
-    cos.shape[-2] == q.shape[2] (seq_len matches). In this case, we should NOT
-    pass position_ids to apply_rotary_pos_emb to avoid double-indexing.
-    """
-    q_seq_len = q.shape[2]  # q is [batch, num_heads, seq_len, head_dim]
-
-    # Check if cos/sin are already indexed (seq_len dimension matches query seq_len)
-    cos_seq_len = cos.shape[-2] if cos.dim() >= 2 else cos.shape[0]
-    already_indexed = (cos_seq_len == q_seq_len)
-
-    if already_indexed:
-        # cos/sin are already indexed - do NOT pass position_ids
-        try:
-            # Try without position_ids first (correct for pre-indexed cos/sin)
-            return apply_rotary_pos_emb(q, k, cos, sin)
-        except TypeError:
-            try:
-                # Some versions need unsqueeze_dim parameter
-                return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
-            except TypeError:
-                pass
-
-        # Manual application for pre-indexed cos/sin
-        if cos.dim() == 2:
-            # [seq_len, head_dim] -> [1, 1, seq_len, head_dim]
-            cos = cos.unsqueeze(0).unsqueeze(0)
-            sin = sin.unsqueeze(0).unsqueeze(0)
-        elif cos.dim() == 3:
-            # [batch, seq_len, head_dim] -> [batch, 1, seq_len, head_dim]
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
-        # dim 4: [batch, 1, seq_len, head_dim] - already correct
-
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
-    else:
-        # cos/sin need indexing by position_ids
-        try:
-            return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-        except (TypeError, RuntimeError):
-            pass
-
-        # Manual indexing
-        if cos.dim() == 4:
-            cos = cos.squeeze(1).squeeze(0)
-            sin = sin.squeeze(1).squeeze(0)
-        elif cos.dim() == 3:
-            cos = cos.squeeze(0)
-            sin = sin.squeeze(0)
-
-        # Index by position_ids with bounds checking
-        if position_ids is not None:
-            max_pos = cos.shape[0]
-            flat_pos = position_ids.reshape(-1).clamp(0, max_pos - 1)
-            batch_size = position_ids.shape[0]
-            seq_len = position_ids.shape[-1]
-            cos = cos[flat_pos].reshape(batch_size, seq_len, -1).unsqueeze(1)
-            sin = sin[flat_pos].reshape(batch_size, seq_len, -1).unsqueeze(1)
-        else:
-            cos = cos[:q_seq_len].unsqueeze(0).unsqueeze(0)
-            sin = sin[:q_seq_len].unsqueeze(0).unsqueeze(0)
-
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
-
-
-def _get_rotary_emb_compat(rotary_emb, value_states, position_ids):
-    """
-    Compatibility wrapper for rotary embedding across transformers versions.
-    Handles API changes between transformers 4.38 and 4.40+.
-    """
-    try:
-        # Try newer API first (transformers 4.40+)
-        return rotary_emb(value_states, position_ids)
-    except (TypeError, RuntimeError) as e:
-        # Fall back to older API or handle edge cases
-        if "Boolean value of Tensor" in str(e):
-            # The issue is seq_len comparison - extract scalar seq_len
-            seq_len = position_ids.shape[-1] if position_ids.dim() > 1 else position_ids.max().item() + 1
-            # Some versions expect (x, seq_len) instead of (x, position_ids)
-            try:
-                return rotary_emb(value_states, seq_len)
-            except TypeError:
-                # If that fails, try with position_ids reshaped
-                if position_ids.dim() == 1:
-                    position_ids = position_ids.unsqueeze(0)
-                return rotary_emb(value_states, position_ids)
-        raise
 
 
 def _flash_attention_forward(
@@ -166,40 +49,20 @@ def _flash_attention_forward(
 ):
     """
     Flash Attention forward for Qwen2 models.
-    Compatible with transformers 4.44.2+ where _upad_input is a standalone function.
+    Follows the same pattern as llama_model.py for maximum compatibility.
     """
-    # Handle _flash_attn_uses_top_left_mask - may not exist in all versions
-    use_top_left_mask = getattr(self, '_flash_attn_uses_top_left_mask', False)
-    if not use_top_left_mask:
+    if not self._flash_attn_uses_top_left_mask:
         causal = self.is_causal
     else:
         causal = self.is_causal and query_length != 1
 
-    # Ensure tensors are contiguous for flash attention
-    query_states = query_states.contiguous()
-    key_states = key_states.contiguous()
-    value_states = value_states.contiguous()
-
+    # Contains at least one padding token in the sequence
     if attention_mask is not None:
         batch_size = query_states.shape[0]
-        # Use standalone _upad_input (transformers 4.44+) or fallback to method
-        try:
-            if _upad_input is not None:
-                query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = _upad_input(
-                    query_states, key_states, value_states, attention_mask, query_length
-                )
-            elif hasattr(self, '_upad_input'):
-                query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                    query_states, key_states, value_states, attention_mask, query_length
-                )
-            else:
-                # Fallback: ignore attention_mask and use simple flash attention
-                attention_mask = None
-        except Exception:
-            # If _upad_input fails, fall back to simple flash attention
-            attention_mask = None
+        query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+            query_states, key_states, value_states, attention_mask, query_length
+        )
 
-    if attention_mask is not None:
         cu_seqlens_q, cu_seqlens_k = cu_seq_lens
         max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 
@@ -269,17 +132,14 @@ def qwen2_attn_forward_H2O(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -375,17 +235,14 @@ def qwen2_sdpa_attn_forward_H2O(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -473,17 +330,14 @@ def qwen2_flash_attn2_forward_H2O(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -577,17 +431,14 @@ def qwen2_attn_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -679,17 +530,14 @@ def qwen2_sdpa_attn_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -777,17 +625,14 @@ def qwen2_flash_attn2_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -881,17 +726,14 @@ def qwen2_attn_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -983,17 +825,14 @@ def qwen2_sdpa_attn_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -1081,17 +920,14 @@ def qwen2_flash_attn2_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -1185,17 +1021,14 @@ def qwen2_attn_forward_StreamingLLM(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -1287,17 +1120,14 @@ def qwen2_sdpa_attn_forward_StreamingLLM(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -1385,17 +1215,14 @@ def qwen2_flash_attn2_forward_StreamingLLM(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -1489,17 +1316,14 @@ def qwen2_attn_forward_CircuitKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -1591,17 +1415,14 @@ def qwen2_sdpa_attn_forward_CircuitKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -1689,17 +1510,14 @@ def qwen2_flash_attn2_forward_CircuitKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    if position_embeddings is None:
-        cos, sin = _get_rotary_emb_compat(self.rotary_emb, value_states, position_ids)
-    else:
-        cos, sin = position_embeddings
-    query_states, key_states = _apply_rotary_pos_emb_compat(query_states, key_states, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
