@@ -132,25 +132,15 @@ def qwen2_attn_forward_H2O(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -252,25 +242,15 @@ def qwen2_sdpa_attn_forward_H2O(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -364,25 +344,15 @@ def qwen2_flash_attn2_forward_H2O(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -482,25 +452,15 @@ def qwen2_attn_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -598,25 +558,15 @@ def qwen2_sdpa_attn_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -710,25 +660,15 @@ def qwen2_flash_attn2_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -828,25 +768,15 @@ def qwen2_attn_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -944,25 +874,15 @@ def qwen2_sdpa_attn_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1056,25 +976,15 @@ def qwen2_flash_attn2_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1174,25 +1084,15 @@ def qwen2_attn_forward_StreamingLLM(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1290,25 +1190,15 @@ def qwen2_sdpa_attn_forward_StreamingLLM(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1402,25 +1292,15 @@ def qwen2_flash_attn2_forward_StreamingLLM(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1520,25 +1400,15 @@ def qwen2_attn_forward_CircuitKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1636,25 +1506,15 @@ def qwen2_sdpa_attn_forward_CircuitKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1748,25 +1608,15 @@ def qwen2_flash_attn2_forward_CircuitKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # Handle rotary embeddings - Qwen2's apply_rotary_pos_emb does NOT accept position_ids
+    # Handle rotary embeddings with version compatibility
     if position_embeddings is not None:
         cos, sin = position_embeddings
     else:
-        # Qwen2's rotary_emb API varies by transformers version:
-        # - Newer: rotary_emb(x, position_ids) returns indexed cos/sin
-        # - Older: rotary_emb(x, seq_len=int) returns full cos/sin, needs manual indexing
-        try:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        except (TypeError, RuntimeError):
-            # Older API: compute with seq_len, then index by position_ids
-            seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-            # Index cos/sin by position_ids since older API returns full sequence
-            if position_ids is not None:
-                cos = cos[position_ids].unsqueeze(1)
-                sin = sin[position_ids].unsqueeze(1)
-    # Qwen2's apply_rotary_pos_emb: (q, k, cos, sin, unsqueeze_dim=1) - NO position_ids
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Older Qwen2 rotary_emb expects seq_len (int), not position_ids (tensor)
+        seq_len = position_ids.max().item() + 1 if position_ids is not None else value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+    # Older Qwen2 apply_rotary_pos_emb requires position_ids for indexing
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
