@@ -2456,17 +2456,22 @@ class CircuitKVCluster():
             h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)  # [bsz, num_heads, non_window_len]
             h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len] - avg over batch
 
-            # Get HI scores (shared across heads) - already computed as part of combined_scores
-            # Extract HI from the dual importance computation
+            # Get importance scores (QI or HI) to broadcast across heads
+            # v4.4.0: Support QI-only mode with per-head eviction
             non_window_len = q_len - self.window_size
-            if self.combination_mode == "dis" and not self.ablate_hi:
-                # hi_scores was computed in _compute_dual_importance_scores
-                # Rank normalize it for combination
-                hi_for_perhead = hi_scores[:non_window_len]  # HI scores for non-window portion
-                hi_rank_perhead = self._rank_normalize(hi_for_perhead)
+
+            if self.ablate_hi and not self.ablate_qi:
+                # QI-ONLY mode: broadcast QI across heads
+                # qi_scores was computed in _compute_dual_importance_scores
+                qi_for_perhead = qi_scores[:non_window_len]
+                importance_rank_perhead = self._rank_normalize(qi_for_perhead)
+            elif not self.ablate_hi and self.combination_mode == "dis":
+                # HI mode (default): broadcast HI across heads
+                hi_for_perhead = hi_scores[:non_window_len]
+                importance_rank_perhead = self._rank_normalize(hi_for_perhead)
             else:
-                # If HI is ablated or not using DIS mode, use zeros
-                hi_rank_perhead = torch.zeros(non_window_len, device=key_states.device)
+                # Both ablated or not using DIS mode, use zeros (pure H2O per-head)
+                importance_rank_perhead = torch.zeros(non_window_len, device=key_states.device)
 
             # Rank normalize per-head H2O scores
             # h2o_per_head: [num_heads, non_window_len]
@@ -2474,11 +2479,11 @@ class CircuitKVCluster():
             for h in range(num_heads):
                 h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
 
-            # Combine: per_head_scores = (1 - hi_weight) * H2O_per_head + hi_weight * HI
-            # HI is broadcast across heads
-            hi_weight = self.per_head_hi_weight
-            hi_broadcast = hi_rank_perhead.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
-            per_head_scores = (1 - hi_weight) * h2o_rank_per_head + hi_weight * hi_broadcast
+            # Combine: per_head_scores = (1 - weight) * H2O_per_head + weight * Importance
+            # Importance (QI or HI) is broadcast across heads
+            importance_weight = self.per_head_hi_weight
+            importance_broadcast = importance_rank_perhead.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
+            per_head_scores = (1 - importance_weight) * h2o_rank_per_head + importance_weight * importance_broadcast
 
             # Apply SnapKV-style avgpool smoothing for spatial coherence
             if self.kernel_size > 1:
