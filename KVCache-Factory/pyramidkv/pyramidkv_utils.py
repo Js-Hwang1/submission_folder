@@ -1269,6 +1269,9 @@ class CircuitKVCluster():
         # v4.3.1: Ablation flags for A1 experiment
         ablate_qi: bool = False,  # If True, use HI only (QI zeroed)
         ablate_hi: bool = False,  # If True, use QI only (HI zeroed)
+        # v4.4.0: Per-head eviction (like SnapKV)
+        per_head_eviction: bool = False,  # If True, each head keeps different tokens
+        per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1296,6 +1299,9 @@ class CircuitKVCluster():
         # v4.3.1: Ablation flags
         self.ablate_qi = ablate_qi
         self.ablate_hi = ablate_hi
+        # v4.4.0: Per-head eviction
+        self.per_head_eviction = per_head_eviction
+        self.per_head_hi_weight = per_head_hi_weight
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2212,7 +2218,13 @@ class CircuitKVCluster():
             comb = f"weighted({self.h2o_weight:.1f})"
         else:
             comb = "MAX(H2O,QI)"  # v4.0: H2O from A, QI from N
-        print(f"CircuitKV v4.3.0 ({mode}, k={self.neumann_iterations}, T={self.neumann_temperature}, {comb}) budget={self.max_capacity_prompt}")
+        evict_mode = "PerHead" if self.per_head_eviction else "Shared"
+        ablation_info = ""
+        if self.ablate_qi:
+            ablation_info = " [HI-only]"
+        elif self.ablate_hi:
+            ablation_info = " [QI-only]"
+        print(f"CircuitKV v4.4.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2244,6 +2256,11 @@ class CircuitKVCluster():
         # v1.0.9: Max-pooling keeps sharp attention patterns from specialized heads
         # that get washed out by averaging (e.g., induction heads for few-shot)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+        # v4.4.0: Save per-head attention for per-head eviction
+        # attn_weights: [bsz, num_heads, window_size, seq_len]
+        attn_weights_per_head = attn_weights  # Keep reference before aggregation
+
         attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
 
         # Build full attention matrix approximation
@@ -2422,42 +2439,144 @@ class CircuitKVCluster():
         scores[:q_len] = combined_scores
 
         # =====================================================================
-        # STEP 3: EVICTION BASED ON MAX(H2O, Influence) SCORES
+        # STEP 3: EVICTION BASED ON SCORES
+        # v4.4.0: Support for per-head eviction (like SnapKV)
         # =====================================================================
-        # Compute keep mask using static budgeting
-        keep_mask = self._get_keep_mask(
-            scores,
-            self.max_capacity_prompt,
-            q_len
-        )
 
-        # Debug logging
-        if self.debug:
-            # Compute H2O scores (column sums) for comparison
-            h2o_scores = full_attn.sum(dim=0)
-            self._log_debug(q_len, h2o_scores, scores, keep_mask, full_attn)
+        if self.per_head_eviction:
+            # =====================================================================
+            # v4.4.0: PER-HEAD EVICTION (each head keeps different tokens)
+            # Key insight: Different attention heads specialize in different patterns.
+            # Forcing all heads to share the same KV cache subset destroys head diversity.
+            # =====================================================================
 
-        # Apply eviction per head
-        # Get indices of tokens to keep (excluding local window which is appended)
-        non_local_mask = keep_mask.clone()
-        non_local_mask[-self.window_size:] = False
-        keep_indices = non_local_mask.nonzero(as_tuple=True)[0]
+            # Compute per-head H2O scores (column sums of attention per head)
+            # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
+            # Sum over window dimension to get importance for each position per head
+            h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)  # [bsz, num_heads, non_window_len]
+            h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len] - avg over batch
 
-        # Number of non-local tokens to keep
-        num_keep = keep_indices.shape[0]
+            # Get HI scores (shared across heads) - already computed as part of combined_scores
+            # Extract HI from the dual importance computation
+            non_window_len = q_len - self.window_size
+            if self.combination_mode == "dis" and not self.ablate_hi:
+                # hi_scores was computed in _compute_dual_importance_scores
+                # Rank normalize it for combination
+                hi_for_perhead = hi_scores[:non_window_len]  # HI scores for non-window portion
+                hi_rank_perhead = self._rank_normalize(hi_for_perhead)
+            else:
+                # If HI is ablated or not using DIS mode, use zeros
+                hi_rank_perhead = torch.zeros(non_window_len, device=key_states.device)
 
-        # Gather selected tokens
-        indices_expanded = keep_indices.view(1, 1, -1, 1).expand(bsz, num_heads, -1, head_dim)
+            # Rank normalize per-head H2O scores
+            # h2o_per_head: [num_heads, non_window_len]
+            h2o_rank_per_head = torch.zeros_like(h2o_per_head)
+            for h in range(num_heads):
+                h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
 
-        k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
-        v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
+            # Combine: per_head_scores = (1 - hi_weight) * H2O_per_head + hi_weight * HI
+            # HI is broadcast across heads
+            hi_weight = self.per_head_hi_weight
+            hi_broadcast = hi_rank_perhead.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
+            per_head_scores = (1 - hi_weight) * h2o_rank_per_head + hi_weight * hi_broadcast
 
-        # Append local window
-        k_cur = key_states[:, :, -self.window_size:, :]
-        v_cur = value_states[:, :, -self.window_size:, :]
+            # Apply SnapKV-style avgpool smoothing for spatial coherence
+            if self.kernel_size > 1:
+                # per_head_scores: [num_heads, non_window_len]
+                per_head_scores_smooth = F.avg_pool1d(
+                    per_head_scores.unsqueeze(0),  # [1, num_heads, non_window_len]
+                    kernel_size=self.kernel_size,
+                    padding=self.kernel_size // 2,
+                    stride=1
+                ).squeeze(0)  # [num_heads, non_window_len]
+                per_head_scores = per_head_scores_smooth
 
-        key_states = torch.cat([k_past_compress, k_cur], dim=2)
-        value_states = torch.cat([v_past_compress, v_cur], dim=2)
+            # Per-head top-k selection
+            # Budget for non-window tokens
+            non_window_budget = self.max_capacity_prompt - self.window_size - self.sink_size
+
+            # Always keep sink tokens (first sink_size)
+            # For the middle portion (between sink and window), do per-head selection
+            middle_len = non_window_len - self.sink_size
+            if middle_len > 0 and non_window_budget > 0:
+                # Get scores for middle portion (excluding sink)
+                middle_scores = per_head_scores[:, self.sink_size:]  # [num_heads, middle_len]
+
+                # Top-k per head
+                num_select = min(non_window_budget, middle_len)
+                _, top_indices_per_head = middle_scores.topk(num_select, dim=-1)  # [num_heads, num_select]
+
+                # Adjust indices to account for sink offset
+                top_indices_per_head = top_indices_per_head + self.sink_size  # [num_heads, num_select]
+
+                # Build full index tensor: sink + selected middle tokens
+                # For each head: [0, 1, ..., sink_size-1, selected_indices...]
+                sink_indices = torch.arange(self.sink_size, device=key_states.device)
+                sink_indices = sink_indices.unsqueeze(0).expand(num_heads, -1)  # [num_heads, sink_size]
+
+                # Concatenate sink + per-head selected indices
+                indices_per_head = torch.cat([sink_indices, top_indices_per_head], dim=-1)  # [num_heads, sink_size + num_select]
+            else:
+                # Edge case: just keep sink
+                indices_per_head = torch.arange(self.sink_size, device=key_states.device)
+                indices_per_head = indices_per_head.unsqueeze(0).expand(num_heads, -1)
+
+            # Sort indices for each head (for gather operation)
+            indices_per_head, _ = indices_per_head.sort(dim=-1)
+
+            # Expand for gather: [bsz, num_heads, num_keep, head_dim]
+            num_keep_per_head = indices_per_head.shape[-1]
+            indices_expanded = indices_per_head.unsqueeze(0).unsqueeze(-1).expand(bsz, -1, -1, head_dim)
+
+            # Gather per-head (different tokens per head)
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded)
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded)
+
+            # Append local window
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+
+            key_states = torch.cat([k_past_compress, k_cur], dim=2)
+            value_states = torch.cat([v_past_compress, v_cur], dim=2)
+
+        else:
+            # =====================================================================
+            # Original shared eviction (same tokens for all heads)
+            # =====================================================================
+            # Compute keep mask using static budgeting
+            keep_mask = self._get_keep_mask(
+                scores,
+                self.max_capacity_prompt,
+                q_len
+            )
+
+            # Debug logging
+            if self.debug:
+                # Compute H2O scores (column sums) for comparison
+                h2o_scores_debug = full_attn.sum(dim=0)
+                self._log_debug(q_len, h2o_scores_debug, scores, keep_mask, full_attn)
+
+            # Apply eviction - shared across all heads
+            # Get indices of tokens to keep (excluding local window which is appended)
+            non_local_mask = keep_mask.clone()
+            non_local_mask[-self.window_size:] = False
+            keep_indices = non_local_mask.nonzero(as_tuple=True)[0]
+
+            # Number of non-local tokens to keep
+            num_keep = keep_indices.shape[0]
+
+            # Gather selected tokens (same indices for all heads)
+            indices_expanded = keep_indices.view(1, 1, -1, 1).expand(bsz, num_heads, -1, head_dim)
+
+            k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
+            v_past_compress = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices_expanded[:, :, :num_keep, :])
+
+            # Append local window
+            k_cur = key_states[:, :, -self.window_size:, :]
+            v_cur = value_states[:, :, -self.window_size:, :]
+
+            key_states = torch.cat([k_past_compress, k_cur], dim=2)
+            value_states = torch.cat([v_past_compress, v_cur], dim=2)
 
         return key_states, value_states
 
@@ -2840,6 +2959,11 @@ def init_circuitkv(self):
             self.config.ablate_qi = False  # If True, disable QI (use HI only)
         if not hasattr(self.config, 'ablate_hi'):
             self.config.ablate_hi = False  # If True, disable HI (use QI only)
+        # v4.4.0: Per-head eviction
+        if not hasattr(self.config, 'per_head_eviction'):
+            self.config.per_head_eviction = False  # If True, each head keeps different tokens
+        if not hasattr(self.config, 'per_head_hi_weight'):
+            self.config.per_head_hi_weight = 0.3  # Weight for HI in per-head combination
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -2878,4 +3002,7 @@ def init_circuitkv(self):
         # v4.3.1: Ablation flags
         ablate_qi=self.config.ablate_qi,
         ablate_hi=self.config.ablate_hi,
+        # v4.4.0: Per-head eviction
+        per_head_eviction=self.config.per_head_eviction,
+        per_head_hi_weight=self.config.per_head_hi_weight,
     )

@@ -303,6 +303,9 @@ def main(args):
                 model.model.layers[i].self_attn.config.ablate_qi = args.ablate_qi
                 model.model.layers[i].self_attn.config.ablate_hi = args.ablate_hi
                 model.model.layers[i].self_attn.config.combination_mode = args.combination_mode
+                # v4.4.0: Per-head eviction
+                model.model.layers[i].self_attn.config.per_head_eviction = args.per_head_eviction
+                model.model.layers[i].self_attn.config.per_head_hi_weight = args.per_head_hi_weight
                 # MarkovKV tuning parameters
                 model.model.layers[i].self_attn.config.neumann_iterations = args.neumann_iterations
                 if args.window_size_override is not None:
@@ -410,6 +413,9 @@ if __name__ == "__main__":
     parser.add_argument("--ablate_hi", action="store_true", help="Disable HI (Hub Importance) - use QI only for ablation study")
     parser.add_argument("--combination_mode", type=str, default="dis", choices=["dis", "max", "weighted", "geometric", "sum"],
                         help="Score combination mode: dis=MAX(QI,HI), geometric=sqrt(QI*HI), sum=0.5*QI+0.5*HI")
+    # v4.4.0: Per-head eviction
+    parser.add_argument("--per_head_eviction", action="store_true", help="Enable per-head eviction (each head keeps different tokens, like SnapKV)")
+    parser.add_argument("--per_head_hi_weight", type=float, default=0.3, help="Weight for HI in per-head combination (0.0 = H2O only, 1.0 = HI only)")
     # MarkovKV tuning parameters
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")
