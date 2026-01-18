@@ -303,6 +303,10 @@ def main(args):
                 model.model.layers[i].self_attn.config.ablate_qi = args.ablate_qi
                 model.model.layers[i].self_attn.config.ablate_hi = args.ablate_hi
                 model.model.layers[i].self_attn.config.combination_mode = args.combination_mode
+                # MarkovKV tuning parameters
+                model.model.layers[i].self_attn.config.neumann_iterations = args.neumann_iterations
+                if args.window_size_override is not None:
+                    model.model.layers[i].self_attn.config.window_size = args.window_size_override
             
 
         context_length = batch_input_ids.shape[-1]
@@ -406,6 +410,9 @@ if __name__ == "__main__":
     parser.add_argument("--ablate_hi", action="store_true", help="Disable HI (Hub Importance) - use QI only for ablation study")
     parser.add_argument("--combination_mode", type=str, default="dis", choices=["dis", "max", "weighted", "geometric", "sum"],
                         help="Score combination mode: dis=MAX(QI,HI), geometric=sqrt(QI*HI), sum=0.5*QI+0.5*HI")
+    # MarkovKV tuning parameters
+    parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
+    parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
     parser.add_argument("--gh200_unified_memory", action="store_true",
