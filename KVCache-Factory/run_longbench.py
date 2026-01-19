@@ -119,6 +119,10 @@ def build_chat(prompt):
     prompt = f"[INST] {prompt} [/INST]"
     return prompt
 
+def build_chat_llama31(prompt):
+    """Build chat template for Llama 3.1/3.3 Instruct models."""
+    return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
 def build_chat_qwen(prompt):
     """Build chat template for Qwen2/Qwen2.5 Instruct models."""
     return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
@@ -179,8 +183,10 @@ def main(args):
             prompt = template.format(**example)
 
             # Apply chat template based on model family
-            if "llama2" in args.model_path.lower():
+            if "llama-2" in args.model_path.lower() or "llama2" in args.model_path.lower():
                 prompt = build_chat(prompt)
+            elif any(x in args.model_path.lower() for x in ["llama-3.1", "llama3.1", "llama-3.3", "llama3.3"]):
+                prompt = build_chat_llama31(prompt)
             elif "qwen" in args.model_path.lower():
                 prompt = build_chat_qwen(prompt)
 

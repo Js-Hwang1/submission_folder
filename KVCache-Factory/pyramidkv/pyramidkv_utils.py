@@ -592,6 +592,37 @@ class H2OKVCluster():
         self.pooling = pooling
         self.merge = merge
 
+    def _chunked_attention_fallback(self, key_states, query_states, value_states, head_dim, chunk_size=4096):
+        """Fallback to chunked attention when full attention causes OOM."""
+        bsz, num_heads, q_len, _ = query_states.shape
+        past_len = q_len - self.window_size
+        num_keep = self.max_capacity_prompt - self.window_size
+
+        # Accumulator for attention scores
+        attn_scores = torch.zeros(
+            bsz, num_heads, past_len,
+            device=key_states.device,
+            dtype=torch.float32
+        )
+
+        past_keys = key_states[:, :, :past_len, :]
+
+        # Process queries in chunks
+        for i in range(0, q_len, chunk_size):
+            end_i = min(i + chunk_size, q_len)
+            q_chunk = query_states[:, :, i:end_i, :]
+
+            attn_chunk = torch.matmul(q_chunk, past_keys.transpose(2, 3)) / math.sqrt(head_dim)
+            attn_chunk = nn.functional.softmax(attn_chunk, dim=-1, dtype=torch.float32)
+            attn_scores += attn_chunk.sum(dim=2)
+
+            del attn_chunk
+            torch.cuda.empty_cache()
+
+        indices = attn_scores.topk(num_keep, dim=-1).indices
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        return indices, past_len
+
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
 
         # check if prefix phase
@@ -604,40 +635,31 @@ class H2OKVCluster():
             return key_states, value_states
         else:
             past_len = q_len - self.window_size
-            num_keep = self.max_capacity_prompt - self.window_size
 
-            # Chunked attention computation to avoid OOM on long sequences
-            # This is mathematically equivalent to full attention - just memory efficient
-            chunk_size = 2048
+            try:
+                # Try full attention first (faster, but requires more VRAM)
+                attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
-            # Accumulator for attention scores (sum of attention each key receives)
-            attn_scores = torch.zeros(
-                bsz, num_heads, past_len,
-                device=key_states.device,
-                dtype=torch.bfloat16
-            )
+                # Apply causal mask
+                mask = torch.full((q_len, q_len), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+                mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+                mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+                causal_mask = mask[None, None, :, :]
+                attn_weights = attn_weights + causal_mask
 
-            past_keys = key_states[:, :, :past_len, :]
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_weights_sum = attn_weights[:, :, :, : -self.window_size].sum(dim=-2)
 
-            # Process queries in chunks
-            for i in range(0, q_len, chunk_size):
-                end_i = min(i + chunk_size, q_len)
-                q_chunk = query_states[:, :, i:end_i, :]
+                indices = attn_weights_sum.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
+                indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-                # Attention: (bsz, num_heads, chunk_size, past_len)
-                attn_chunk = torch.matmul(q_chunk, past_keys.transpose(2, 3)) / math.sqrt(head_dim)
-                attn_chunk = nn.functional.softmax(attn_chunk, dim=-1, dtype=torch.bfloat16)
+                del attn_weights, attn_weights_sum, mask, causal_mask
 
-                # Accumulate: sum attention each past key received from this query chunk
-                attn_scores += attn_chunk.sum(dim=2)
-
-                del attn_chunk
+            except torch.cuda.OutOfMemoryError:
+                # Fallback to chunked attention on OOM
+                print(f"H2O: CUDA OOM at seq_len={q_len}, falling back to chunked attention...")
                 torch.cuda.empty_cache()
-
-            # Select top-k keys with highest accumulated attention
-            attn_cache = attn_scores
-            indices = attn_cache.topk(num_keep, dim=-1).indices
-            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+                indices, past_len = self._chunked_attention_fallback(key_states, query_states, value_states, head_dim)
 
             if self.merge is not None:
                 key_states, value_states = merge_kv(key_states, value_states, indices, self.window_size, self.merge)
