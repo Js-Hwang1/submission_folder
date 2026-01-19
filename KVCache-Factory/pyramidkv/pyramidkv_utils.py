@@ -2456,34 +2456,46 @@ class CircuitKVCluster():
             h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)  # [bsz, num_heads, non_window_len]
             h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len] - avg over batch
 
-            # Get importance scores (QI or HI) to broadcast across heads
-            # v4.4.0: Support QI-only mode with per-head eviction
+            # v4.4.1: Per-head eviction with PURE QI or HI when ablation flags set
+            # No H2O mixing when using ablation - user wants pure importance scores
             non_window_len = q_len - self.window_size
 
             if self.ablate_hi and not self.ablate_qi:
-                # QI-ONLY mode: broadcast QI across heads
-                # qi_scores was computed in _compute_dual_importance_scores
+                # QI-ONLY mode: PURE QI, no H2O mixing
+                # Broadcast QI across all heads (same QI per position for all heads,
+                # but per-head selection will still create diversity via H2O tiebreaking)
                 qi_for_perhead = qi_scores[:non_window_len]
-                importance_rank_perhead = self._rank_normalize(qi_for_perhead)
-            elif not self.ablate_hi and self.combination_mode == "dis":
-                # HI mode (default): broadcast HI across heads
+                qi_rank = self._rank_normalize(qi_for_perhead)
+                per_head_scores = qi_rank.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
+
+            elif not self.ablate_hi and self.ablate_qi:
+                # HI-ONLY mode: PURE HI, no H2O mixing
                 hi_for_perhead = hi_scores[:non_window_len]
-                importance_rank_perhead = self._rank_normalize(hi_for_perhead)
+                hi_rank = self._rank_normalize(hi_for_perhead)
+                per_head_scores = hi_rank.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
+
+            elif self.ablate_hi and self.ablate_qi:
+                # Both ablated: pure H2O per-head (SnapKV-style)
+                h2o_rank_per_head = torch.zeros_like(h2o_per_head)
+                for h in range(num_heads):
+                    h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
+                per_head_scores = h2o_rank_per_head
+
             else:
-                # Both ablated or not using DIS mode, use zeros (pure H2O per-head)
-                importance_rank_perhead = torch.zeros(non_window_len, device=key_states.device)
+                # Default (no ablation): Use MAX(HI, QI) combined with per-head H2O
+                # Rank normalize per-head H2O scores
+                h2o_rank_per_head = torch.zeros_like(h2o_per_head)
+                for h in range(num_heads):
+                    h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
 
-            # Rank normalize per-head H2O scores
-            # h2o_per_head: [num_heads, non_window_len]
-            h2o_rank_per_head = torch.zeros_like(h2o_per_head)
-            for h in range(num_heads):
-                h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
+                # Use combined DIS scores (already MAX of HI, QI)
+                dis_for_perhead = selected_scores[:non_window_len]
+                dis_rank = self._rank_normalize(dis_for_perhead)
+                dis_broadcast = dis_rank.unsqueeze(0).expand(num_heads, -1)
 
-            # Combine: per_head_scores = (1 - weight) * H2O_per_head + weight * Importance
-            # Importance (QI or HI) is broadcast across heads
-            importance_weight = self.per_head_hi_weight
-            importance_broadcast = importance_rank_perhead.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
-            per_head_scores = (1 - importance_weight) * h2o_rank_per_head + importance_weight * importance_broadcast
+                # Combine H2O per-head with DIS (broadcast)
+                importance_weight = self.per_head_hi_weight
+                per_head_scores = (1 - importance_weight) * h2o_rank_per_head + importance_weight * dis_broadcast
 
             # Apply SnapKV-style avgpool smoothing for spatial coherence
             if self.kernel_size > 1:
