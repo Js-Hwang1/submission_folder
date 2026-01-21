@@ -379,29 +379,4 @@ private:
     void init_rng(uint64_t seed);
 };
 
-// =========================================================================
-// Standalone Functions (v4.5.3)
-// =========================================================================
-
-/**
- * Streaming Neumann Series: O(n) memory dual importance computation.
- *
- * Computes both QI (Query Importance) and HI (Hub Importance) without
- * materializing the full [n, n] attention matrix.
- *
- * @param window_attn     Window attention matrix [window_size, seq_len]
- * @param query_idx       Query position (typically seq_len - 1)
- * @param sink_size       Number of absorbing sink tokens
- * @param num_iterations  Neumann series iterations
- * @param temperature     Attention temperature scaling
- * @return Tuple of (qi_scores, hi_scores), each [seq_len]
- */
-std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
-    torch::Tensor window_attn,
-    int query_idx,
-    int sink_size,
-    int num_iterations,
-    float temperature
-);
-
 }  // namespace circuit_kv

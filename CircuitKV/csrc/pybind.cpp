@@ -318,45 +318,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         )pbdoc"
     );
 
-    // =========================================================================
-    // STREAMING NEUMANN (v4.5.3) - O(n) MEMORY DUAL IMPORTANCE
-    // =========================================================================
-    m.def("streaming_neumann_dual", &streaming_neumann_dual,
-        py::arg("window_attn"),
-        py::arg("query_idx"),
-        py::arg("sink_size") = 4,
-        py::arg("num_iterations") = 10,
-        py::arg("temperature") = 1.0f,
-        R"pbdoc(
-        Streaming Neumann Series v4.5.3: O(n) memory dual importance computation.
-
-        Computes BOTH QI (Query Importance) and HI (Hub Importance) WITHOUT
-        materializing the full [n, n] attention matrix.
-
-        Key Innovation:
-            Traditional Neumann requires O(n²) memory for the attention matrix.
-            Streaming Neumann computes Q.t() @ v on-the-fly using:
-            - Window attention [W, n] for recent positions (exact)
-            - Attention-weighted approximation for prefix positions
-
-        Memory Complexity:
-            - Traditional: O(n²) → OOM for 31K+ sequences
-            - Streaming: O(n) → Scales to any sequence length
-
-        Args:
-            window_attn: Window attention matrix [window_size, seq_len], FP32.
-            query_idx: Query position (typically seq_len - 1).
-            sink_size: Number of absorbing sink tokens (default 4).
-            num_iterations: Neumann series iterations (default 10).
-            temperature: Attention temperature scaling (default 1.0).
-
-        Returns:
-            Tuple of (qi_scores, hi_scores), each [seq_len] normalized to [0, 1].
-        )pbdoc"
-    );
-
     // Version info
-    m.attr("__version__") = "4.5.3";  // Streaming Neumann: O(n) memory
+    m.attr("__version__") = "4.3.0";  // Unified Dual-Importance: MAX(HI, QI)
 }
 
 }  // namespace circuit_kv
