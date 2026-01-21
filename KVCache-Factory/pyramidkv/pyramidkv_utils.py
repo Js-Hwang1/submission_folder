@@ -29,14 +29,6 @@ try:
 except ImportError:
     BREAKTHROUGHS_AVAILABLE = False
 
-# v4.5.3: Streaming Neumann CUDA kernel for O(n) memory
-try:
-    from circuit_kv._C import streaming_neumann_dual as _streaming_neumann_cuda
-    STREAMING_NEUMANN_AVAILABLE = True
-except ImportError:
-    _streaming_neumann_cuda = None
-    STREAMING_NEUMANN_AVAILABLE = False
-
 # =============================================================================
 # Module-level debug logging for CircuitKV (singleton pattern)
 # =============================================================================
@@ -1199,26 +1191,12 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v4.5.0: Sparse Attention & Adaptive Normalization.
+    CircuitKV v4.3.0: Unified Dual-Importance via Absorbing Markov Chains.
 
     This class implements importance scoring for KV cache eviction using
     the FUNDAMENTAL MATRIX of absorbing Markov chains.
 
-    v4.5.0 Key Improvements:
-    1. SPARSE ATTENTION: Instead of approximating the prefix attention with H2O
-       heuristics, we sample real attention at multiple positions. This provides
-       anchors of ground truth throughout the sequence, significantly improving
-       the accuracy of the Neumann series computation.
-
-    2. ADAPTIVE NORMALIZATION: Instead of rank normalization (which loses magnitude
-       information), we use percentile normalization with confidence weighting.
-       This preserves the signal strength and allows the more confident signal
-       (QI or HI) to dominate the combination.
-
-    3. SPATIAL SMOOTHING: Apply avgpool smoothing for spatial coherence. Nearby
-       tokens often form coherent units (phrases, entities, code blocks).
-
-    Core Algorithm - UNIFIED IMPORTANCE SCORING (from v4.3):
+    v4.3.0 Key Innovation - UNIFIED IMPORTANCE SCORING:
     Both importance signals derived from the SAME mathematical object (N):
 
     1. QUERY IMPORTANCE (QI): N[q, j] = expected visits FROM query to j
@@ -1229,34 +1207,42 @@ class CircuitKVCluster():
        - "How central is j in the overall information flow network?"
        - Captures globally important "hub" tokens (multi-hop, not one-hop H2O)
 
+    Final Score: MAX(QI_rank, HI_rank)
+    - Keeps token if EITHER query-relevant OR globally central
+    - "OR logic" is more robust than geometric mean's "AND logic"
+    - Both signals from same theory (cleaner than mixing H2O with QI)
+
     Evolution:
     - v4.0: MAX(H2O, QI) - H2O from A (one-hop), QI from N (multi-hop)
     - v4.2: √(QI × HI) - both from N, but geometric mean too selective
-    - v4.3: MAX(HI, QI) - both from N, with robust OR logic
-    - v4.5: Sparse attention + adaptive normalization + spatial smoothing ← CURRENT
+    - v4.3: MAX(HI, QI) - both from N, with robust OR logic ← CURRENT
 
     Mathematical Foundation:
     - Attention matrix A defines transition probabilities P[i,j]
     - Q = transition matrix among transient states (non-sink tokens)
     - N = (I - Q)^{-1} = fundamental matrix of absorbing chain
     - Computed via Neumann series: I + Q + Q² + ... + Q^k
-    - v4.5: Attention matrix now includes REAL attention at sampled positions
+
+    Combination Modes (combination_mode parameter):
+    - "dis": MAX(HI, QI) - v4.3.0, both from fundamental matrix N
+    - "max": MAX(H2O, QI) - v4.0.0, H2O from attention, QI from N
+    - "weighted": α * H2O + (1-α) * QI - v4.1.0
+
+    Why v4.3 (dis) > v4.0 (max):
+    - v4.0 mixes one-hop (H2O) with multi-hop (QI) - different theories
+    - v4.3 uses multi-hop for BOTH signals - unified theory
+    - HI captures bridge tokens that H2O misses
 
     Configuration:
     - combination_mode: "dis" (recommended), "max", or "weighted"
     - neumann_iterations: Neumann series iterations (default: 10)
     - neumann_temperature: Attention sharpening (default: 1.0, lower = sharper)
     - sink_size: Absorbing boundary (default: 4)
-    - use_sparse_attention: Use real attention at sampled positions (default: True)
-    - sparse_sample_ratio: Fraction of prefix to sample (default: 0.1)
-    - normalization_mode: "adaptive", "percentile", or "rank" (default: "adaptive")
-    - use_spatial_smoothing: Apply avgpool smoothing (default: True)
-    - smoothing_kernel_size: Kernel size for smoothing (default: 5)
     """
 
     def __init__(
         self,
-        window_size: int = 64,  # Match SnapKV's window size for fair comparison
+        window_size: int = 32,
         max_capacity_prompt: int = 2048,
         kernel_size: int = 5,
         pooling: str = 'avgpool',
@@ -1306,18 +1292,8 @@ class CircuitKVCluster():
         ablate_qi: bool = False,  # If True, use HI only (QI zeroed)
         ablate_hi: bool = False,  # If True, use QI only (HI zeroed)
         # v4.4.0: Per-head eviction (like SnapKV)
-        per_head_eviction: bool = True,  # v4.5.1: Enabled (bug fixed)
+        per_head_eviction: bool = False,  # If True, each head keeps different tokens
         per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
-        # v4.5.0: Sparse Attention & Improved Normalization
-        # NOTE: After ablation, these features hurt. Defaults revert to v4.3 behavior.
-        use_sparse_attention: bool = False,  # v4.5.3: Disabled - causes OOM on long sequences
-        sparse_sample_ratio: float = 0.02,  # Fraction of prefix positions to sample
-        sparse_min_samples: int = 16,  # Minimum number of samples regardless of ratio
-        normalization_mode: str = "rank",  # "rank" (v4.3), "percentile", or "adaptive"
-        use_spatial_smoothing: bool = False,  # Disabled: blurs important individual tokens
-        smoothing_kernel_size: int = 5,  # Kernel size for spatial smoothing
-        # v4.5.2: Memory efficiency for long sequences
-        max_neumann_context: int = 16384,  # Max context for Neumann (16K = ~1GB attention matrix)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1348,15 +1324,6 @@ class CircuitKVCluster():
         # v4.4.0: Per-head eviction
         self.per_head_eviction = per_head_eviction
         self.per_head_hi_weight = per_head_hi_weight
-        # v4.5.0: Sparse Attention & Improved Normalization
-        self.use_sparse_attention = use_sparse_attention
-        self.sparse_sample_ratio = sparse_sample_ratio
-        self.sparse_min_samples = sparse_min_samples
-        self.normalization_mode = normalization_mode
-        self.use_spatial_smoothing = use_spatial_smoothing
-        self.smoothing_kernel_size = smoothing_kernel_size
-        # v4.5.2: Memory efficiency
-        self.max_neumann_context = max_neumann_context
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1388,7 +1355,6 @@ class CircuitKVCluster():
         self._accumulated_charge = None
         self._h2o_scores = None  # Store H2O scores for MAX combination
         self._prefill_initialized = False
-        self._printed_version = False  # v4.5.0: Print version info only once
 
         # Initialize debug log file
         if self.debug:
@@ -1662,7 +1628,7 @@ class CircuitKVCluster():
             log.flush()
 
     def _lazy_init(self, device, seq_len: int):
-        """Initialize CUDA graph on first use (optional for Neumann-based v4.x)."""
+        """Initialize CUDA graph on first use."""
         if self._graph is None or self._device != device:
             try:
                 from circuit_kv import _C as circuit_kv_cuda
@@ -1676,10 +1642,10 @@ class CircuitKVCluster():
                 )
                 self._device = device
             except ImportError:
-                # v4.5.3: CircuitGraph is only needed for random walker methods
-                # Neumann-based methods (v4.x) work without it
-                self._graph = None
-                self._device = device
+                raise ImportError(
+                    "CircuitKV CUDA extension not found. "
+                    "Install with: pip install -e ./CircuitKV"
+                )
 
     def _rank_normalize(self, scores: torch.Tensor) -> torch.Tensor:
         """
@@ -1699,334 +1665,6 @@ class CircuitKVCluster():
         if n <= 1:
             return torch.ones_like(ranks)
         return ranks / (n - 1)
-
-    def _percentile_normalize(self, scores: torch.Tensor) -> torch.Tensor:
-        """
-        v4.5.0: Percentile normalization that preserves magnitude differences.
-
-        Unlike rank normalization which loses magnitude info, percentile normalization
-        maps scores to [0, 1] while preserving relative differences.
-
-        Args:
-            scores: Raw scores [seq_len]
-
-        Returns:
-            Percentile-normalized scores in [0, 1]
-        """
-        min_val = scores.min()
-        max_val = scores.max()
-        range_val = max_val - min_val
-
-        if range_val < 1e-8:
-            # All scores nearly equal - return uniform
-            return torch.ones_like(scores) * 0.5
-
-        return (scores - min_val) / range_val
-
-    def _adaptive_normalize(
-        self,
-        scores: torch.Tensor,
-    ) -> tuple[torch.Tensor, float]:
-        """
-        v4.5.0: Adaptive normalization with confidence estimation.
-
-        Combines percentile normalization with a confidence measure indicating
-        how spread out the scores are. High confidence means clear ranking;
-        low confidence means ambiguous/uniform scores.
-
-        The confidence can be used to weight signals when combining QI and HI:
-        - If QI has high confidence, it should dominate
-        - If both have low confidence, use equal weighting
-
-        Args:
-            scores: Raw scores [seq_len]
-
-        Returns:
-            Tuple of (normalized_scores, confidence)
-            - normalized_scores: [0, 1] normalized scores
-            - confidence: [0, 1] indicating score spread (1 = very spread, 0 = uniform)
-        """
-        min_val = scores.min()
-        max_val = scores.max()
-        range_val = max_val - min_val
-        mean_val = scores.mean()
-
-        if range_val < 1e-8:
-            return torch.ones_like(scores) * 0.5, 0.0
-
-        # Percentile normalization
-        normalized = (scores - min_val) / range_val
-
-        # Confidence: coefficient of variation (std/mean) clamped to [0, 1]
-        # High CV means scores are spread out (high confidence in ranking)
-        # Note: Keep as tensor operations to avoid GPU-CPU sync
-        std_val = scores.std()
-        cv = std_val / (mean_val.abs() + 1e-8)
-        confidence = torch.clamp(cv, 0.0, 1.0)
-
-        return normalized, confidence
-
-    def _compute_sparse_attention(
-        self,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        window_attn: torch.Tensor,
-        q_len: int,
-        head_dim: int,
-    ) -> torch.Tensor:
-        """
-        v4.5.0: Build attention matrix using sparse sampling for prefix region.
-
-        Instead of approximating the entire prefix with H2O-weighted heuristics,
-        we compute REAL attention at sampled positions and use nearest-neighbor
-        assignment for the rest. This provides anchors of ground truth throughout
-        the sequence, improving the quality of the Neumann series computation.
-
-        Sampling Strategy:
-        - Uniform base sampling for coverage
-        - H2O-guided sampling to capture high-importance positions
-
-        Args:
-            query_states: [bsz, num_heads, seq_len, head_dim]
-            key_states: [bsz, num_heads, seq_len, head_dim]
-            window_attn: [window_size, seq_len] - already computed window attention (averaged)
-            q_len: sequence length
-            head_dim: head dimension for scaling
-
-        Returns:
-            full_attn: [seq_len, seq_len] attention matrix with real sparse samples
-        """
-        device = query_states.device
-        dtype = query_states.dtype
-        bsz = query_states.shape[0]
-        num_heads = query_states.shape[1]
-        n_prefix = q_len - self.window_size
-
-        # Initialize full attention matrix
-        full_attn = torch.zeros(q_len, q_len, device=device, dtype=torch.float32)
-
-        # Fill window portion with real attention (already computed)
-        full_attn[-self.window_size:, :] = window_attn
-
-        if n_prefix <= 0:
-            return full_attn
-
-        # Determine number of samples
-        n_samples = max(self.sparse_min_samples, int(n_prefix * self.sparse_sample_ratio))
-        n_samples = min(n_samples, n_prefix)  # Can't sample more than available
-
-        # Compute H2O scores from window attention for guided sampling
-        h2o_scores = window_attn.sum(dim=0)[:n_prefix]  # [n_prefix]
-
-        # === Sampling Strategy: Hybrid uniform + H2O-guided ===
-        n_uniform = (n_samples + 1) // 2  # Half uniform
-        n_h2o = n_samples - n_uniform      # Half H2O-guided
-
-        # Uniform samples: evenly spaced through prefix
-        if n_uniform > 0:
-            uniform_indices = torch.linspace(0, n_prefix - 1, steps=n_uniform, device=device).long()
-        else:
-            uniform_indices = torch.tensor([], device=device, dtype=torch.long)
-
-        # H2O-guided samples: top positions by H2O score, with spacing
-        if n_h2o > 0 and n_prefix > n_h2o:
-            # Get top H2O positions
-            _, h2o_sorted_idx = h2o_scores.sort(descending=True)
-            # Take every other one to avoid clustering
-            h2o_indices = h2o_sorted_idx[::2][:n_h2o]
-        else:
-            h2o_indices = torch.tensor([], device=device, dtype=torch.long)
-
-        # Combine and deduplicate
-        sample_indices = torch.cat([uniform_indices, h2o_indices])
-        sample_indices = torch.unique(sample_indices, sorted=True)
-        n_actual_samples = sample_indices.shape[0]
-
-        if n_actual_samples == 0:
-            # Fallback: use attention-weighted approximation
-            return self._compute_attention_weighted_approximation(window_attn, q_len, device)
-
-        # === Compute Real Attention for Sampled Positions ===
-        # Extract queries at sampled positions
-        sampled_queries = query_states[:, :, sample_indices, :]  # [bsz, num_heads, n_samples, head_dim]
-
-        # Compute attention scores: sampled queries attend to all keys
-        sampled_attn_logits = torch.matmul(
-            sampled_queries,
-            key_states.transpose(2, 3)
-        ) / math.sqrt(head_dim)  # [bsz, num_heads, n_samples, seq_len]
-
-        # Apply causal mask: each sampled position can only attend to positions <= itself
-        # Create mask: [n_samples, seq_len] where mask[i, j] = True if j > sample_indices[i]
-        sample_positions = sample_indices.unsqueeze(1)  # [n_samples, 1]
-        all_positions = torch.arange(q_len, device=device).unsqueeze(0)  # [1, seq_len]
-        causal_mask = all_positions > sample_positions  # [n_samples, seq_len]
-
-        # Apply mask
-        sampled_attn_logits = sampled_attn_logits.masked_fill(
-            causal_mask.unsqueeze(0).unsqueeze(0),  # [1, 1, n_samples, seq_len]
-            float('-inf')
-        )
-
-        # Softmax to get attention probabilities
-        sampled_attn = F.softmax(sampled_attn_logits, dim=-1, dtype=torch.float32)
-
-        # Average across batch and heads
-        sampled_attn_avg = sampled_attn.mean(dim=(0, 1))  # [n_samples, seq_len]
-
-        # === Fill Full Attention Matrix (Fully Vectorized) ===
-        # First, fill sampled rows with real attention
-        full_attn[sample_indices, :] = sampled_attn_avg
-
-        # For non-sampled prefix positions, use nearest-neighbor from sampled rows
-        # Build mapping: for each prefix position, find nearest sampled position
-        all_prefix_positions = torch.arange(n_prefix, device=device).float()
-        sample_positions_float = sample_indices.float()
-
-        # Compute distances: [n_prefix, n_samples]
-        distances = torch.abs(
-            all_prefix_positions.unsqueeze(1) - sample_positions_float.unsqueeze(0)
-        )
-
-        # Find nearest sample for each position
-        nearest_sample_idx = distances.argmin(dim=1)  # [n_prefix]
-
-        # === Vectorized fill for non-sampled positions ===
-        # Create mask for which positions are sampled vs need interpolation
-        is_sampled = torch.zeros(n_prefix, dtype=torch.bool, device=device)
-        is_sampled[sample_indices[sample_indices < n_prefix]] = True
-        non_sampled_mask = ~is_sampled
-
-        # Get indices of non-sampled positions
-        non_sampled_indices = torch.nonzero(non_sampled_mask, as_tuple=True)[0]
-
-        if non_sampled_indices.numel() > 0:
-            # Get nearest neighbor attention for all non-sampled positions at once
-            # nearest_sample_idx[non_sampled_indices] gives which sample to copy from
-            nn_indices = nearest_sample_idx[non_sampled_indices]  # [num_non_sampled]
-            prefix_attn = sampled_attn_avg[nn_indices]  # [num_non_sampled, seq_len]
-
-            # Create causal mask: position i can only attend to 0..i
-            # non_sampled_indices tells us the actual position in the sequence
-            row_positions = non_sampled_indices.unsqueeze(1)  # [num_non_sampled, 1]
-            col_positions = torch.arange(q_len, device=device).unsqueeze(0)  # [1, seq_len]
-            causal_mask = col_positions > row_positions  # [num_non_sampled, seq_len]
-
-            # Apply causal mask
-            prefix_attn = prefix_attn.masked_fill(causal_mask, 0.0)
-
-            # Renormalize each row to sum to 1
-            row_sums = prefix_attn.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            prefix_attn = prefix_attn / row_sums
-
-            # Fill into full_attn
-            full_attn[non_sampled_indices, :] = prefix_attn
-
-        return full_attn
-
-    def _compute_attention_weighted_approximation(
-        self,
-        window_attn: torch.Tensor,
-        q_len: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Build attention matrix using attention-weighted approximation for prefix.
-
-        For positions outside the window, we approximate the attention pattern
-        using the attention weights as a proxy for transition probabilities.
-        This builds the transition matrix Q for the Markov chain.
-
-        Args:
-            window_attn: [window_size, seq_len] window attention
-            q_len: sequence length
-            device: torch device
-
-        Returns:
-            full_attn: [seq_len, seq_len] approximated attention matrix
-        """
-        full_attn = torch.zeros(q_len, q_len, device=device, dtype=torch.float32)
-
-        # Fill window portion
-        full_attn[-self.window_size:, :] = window_attn
-
-        n_prefix = q_len - self.window_size
-        if n_prefix <= 1:
-            return full_attn
-
-        # H2O scores from window attention
-        h2o_scores = window_attn.sum(dim=0)  # [seq_len]
-        h2o_prefix = h2o_scores[:n_prefix].clone()
-        h2o_prefix = h2o_prefix.clamp(min=1e-6)
-
-        # Build H2O-weighted transition matrix for prefix
-        # P[i,j] = h2o[j] / sum(h2o[0:i]) for j < i
-        cumsum = h2o_prefix.cumsum(dim=0)
-        denom = torch.zeros(n_prefix, device=device, dtype=torch.float32)
-        denom[1:] = cumsum[:-1]
-        denom[0] = 1.0  # Avoid div-by-zero
-
-        h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
-        denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
-
-        h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
-
-        # Apply causal mask
-        causal_mask = torch.tril(
-            torch.ones(n_prefix, n_prefix, device=device, dtype=torch.float32),
-            diagonal=-1
-        )
-        full_attn[:n_prefix, :n_prefix] = h2o_trans * causal_mask
-
-        return full_attn
-
-    def _apply_spatial_smoothing(
-        self,
-        scores: torch.Tensor,
-        kernel_size: int = 5,
-    ) -> torch.Tensor:
-        """
-        v4.5.0: Apply spatial smoothing via average pooling.
-
-        Nearby tokens often form coherent units (phrases, entities, code blocks).
-        Spatial smoothing encourages keeping contiguous regions rather than
-        scattered individual tokens.
-
-        Args:
-            scores: Importance scores [seq_len]
-            kernel_size: Pooling kernel size (default 5)
-
-        Returns:
-            Smoothed scores [seq_len]
-        """
-        if kernel_size <= 1:
-            return scores
-
-        # Reshape for 1D pooling: [1, 1, seq_len]
-        scores_3d = scores.unsqueeze(0).unsqueeze(0)
-
-        # Apply average pooling with same padding
-        padding = kernel_size // 2
-        smoothed = F.avg_pool1d(
-            scores_3d,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=padding
-        )
-
-        # Handle edge case where output size differs due to padding
-        smoothed = smoothed.squeeze()
-        if smoothed.shape[0] != scores.shape[0]:
-            # Truncate or pad to match original size
-            if smoothed.shape[0] > scores.shape[0]:
-                smoothed = smoothed[:scores.shape[0]]
-            else:
-                # Pad with last value (replicate padding)
-                pad_size = scores.shape[0] - smoothed.shape[0]
-                last_val = smoothed[-1:].expand(pad_size)
-                smoothed = torch.cat([smoothed, last_val], dim=0)
-
-        return smoothed
 
     def _compute_influence_neumann(
         self,
@@ -2124,7 +1762,10 @@ class CircuitKVCluster():
         for _ in range(num_iterations):
             v = torch.mv(Q.t(), v)  # Q^T @ v - gives row q of Q^k
             result = result + v
-            # Note: Removed early stopping check - the .item() call caused GPU-CPU sync
+
+            # Early stopping if converged
+            if v.abs().max().item() < 1e-8:
+                break
 
         # =====================================================================
         # STEP 4: Map back to full sequence and normalize
@@ -2243,8 +1884,10 @@ class CircuitKVCluster():
             v_hi = torch.mv(Q.t(), v_hi)
             result_qi = result_qi + v_qi
             result_hi = result_hi + v_hi
-            # Note: Removed early stopping check - the .item() calls caused GPU-CPU sync
-            # 10 iterations is fast enough and avoids the sync overhead
+
+            # Early stopping if both converged
+            if v_qi.abs().max().item() < 1e-8 and v_hi.abs().max().item() < 1e-8:
+                break
 
         # =====================================================================
         # STEP 4: Map back to full sequence
@@ -2258,159 +1901,6 @@ class CircuitKVCluster():
         hi_scores[:sink_size] = result_hi.sum() * 0.01  # Small score for sink
 
         # Normalize each to [0, 1]
-        qi_max = qi_scores.max()
-        if qi_max > 0:
-            qi_scores = qi_scores / qi_max
-
-        hi_max = hi_scores.max()
-        if hi_max > 0:
-            hi_scores = hi_scores / hi_max
-
-        return qi_scores, hi_scores
-
-    def _compute_streaming_neumann_dual(
-        self,
-        window_attn: torch.Tensor,
-        query_idx: int,
-        seq_len: int,
-        sink_size: int = 4,
-        num_iterations: int = 10,
-        temperature: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        v4.5.3: Streaming Neumann Series - O(n) memory instead of O(n²).
-
-        Computes QI and HI WITHOUT materializing the full attention matrix.
-        Uses only:
-        - Window attention: [window_size, seq_len] (already available)
-        - On-the-fly approximation for prefix regions
-
-        This is the KEY innovation for handling long sequences (>16K tokens)
-        without OOM while preserving the Markov chain theoretical foundation.
-
-        Memory Complexity:
-        - Traditional: O(n²) for full attention matrix
-        - Streaming: O(n) for vectors + O(W×n) for window attention
-
-        Args:
-            window_attn: [window_size, seq_len] - attention from window queries
-            query_idx: Query position (typically seq_len - 1)
-            seq_len: Full sequence length
-            sink_size: Number of absorbing sink tokens
-            num_iterations: Neumann series iterations
-            temperature: Attention temperature scaling
-
-        Returns:
-            Tuple of (query_importance, hub_importance), each [seq_len]
-        """
-        device = window_attn.device
-        window_size = window_attn.shape[0]
-        n_transient = seq_len - sink_size
-        n_prefix = seq_len - window_size - sink_size
-
-        # Try CUDA kernel first
-        if STREAMING_NEUMANN_AVAILABLE and window_attn.is_cuda:
-            try:
-                return _streaming_neumann_cuda(
-                    window_attn.contiguous().float(),
-                    query_idx,
-                    sink_size,
-                    num_iterations,
-                    temperature
-                )
-            except Exception as e:
-                print(f"  [v4.5.3] CUDA kernel failed, using Python fallback: {e}")
-
-        # Python fallback implementation
-        # Precompute h2o_scores (column sums) and cumsum
-        h2o_scores = window_attn.sum(dim=0)  # [seq_len]
-
-        # Apply temperature if needed
-        if temperature != 1.0 and temperature > 0:
-            window_attn_scaled = window_attn ** (1.0 / temperature)
-            h2o_scores = window_attn_scaled.sum(dim=0)
-        else:
-            window_attn_scaled = window_attn
-
-        # Cumsum for prefix approximation
-        h2o_prefix = h2o_scores[sink_size:sink_size + n_prefix].clone().clamp(min=1e-8)
-        h2o_cumsum = h2o_prefix.cumsum(dim=0)  # [n_prefix]
-
-        # Window row sums for normalization
-        window_row_sums = window_attn_scaled.sum(dim=1)  # [window_size]
-
-        # Initialize QI (one-hot at query) and HI (uniform)
-        query_transient_idx = query_idx - sink_size
-        v_qi = torch.zeros(n_transient, device=device, dtype=torch.float32)
-        if 0 <= query_transient_idx < n_transient:
-            v_qi[query_transient_idx] = 1.0
-        result_qi = v_qi.clone()
-
-        v_hi = torch.ones(n_transient, device=device, dtype=torch.float32) / n_transient
-        result_hi = v_hi.clone()
-
-        window_start = seq_len - window_size
-
-        # Neumann iterations - compute Q.t() @ v without storing Q
-        for _ in range(num_iterations):
-            v_qi_new = torch.zeros_like(v_qi)
-            v_hi_new = torch.zeros_like(v_hi)
-
-            # For each output position j
-            for j in range(n_transient):
-                j_full = j + sink_size
-                sum_qi = 0.0
-                sum_hi = 0.0
-
-                # Sum over input positions i where v[i] != 0
-                for i in range(n_transient):
-                    if v_qi[i] == 0 and v_hi[i] == 0:
-                        continue
-
-                    i_full = i + sink_size
-
-                    # Get P[i_full, j_full]
-                    if i_full >= window_start:
-                        # Window region: exact attention
-                        window_row = i_full - window_start
-                        attn_ij = window_attn_scaled[window_row, j_full]
-                        row_sum = window_row_sums[window_row]
-                    else:
-                        # Prefix region: approximation
-                        if j_full < i_full:
-                            attn_ij = h2o_scores[j_full]
-                            cumsum_idx = i_full - sink_size - 1
-                            if 0 <= cumsum_idx < n_prefix:
-                                row_sum = h2o_cumsum[cumsum_idx] + 1e-8
-                            else:
-                                row_sum = 1e-8
-                        else:
-                            attn_ij = 0.0
-                            row_sum = 1.0
-
-                    if row_sum > 1e-8 and attn_ij > 0:
-                        P_ij = attn_ij / row_sum
-                        sum_qi += P_ij * v_qi[i].item()
-                        sum_hi += P_ij * v_hi[i].item()
-
-                v_qi_new[j] = sum_qi
-                v_hi_new[j] = sum_hi
-
-            result_qi = result_qi + v_qi_new
-            result_hi = result_hi + v_hi_new
-            v_qi = v_qi_new
-            v_hi = v_hi_new
-
-        # Map back to full sequence
-        qi_scores = torch.zeros(seq_len, device=device, dtype=torch.float32)
-        qi_scores[sink_size:] = result_qi
-        qi_scores[:sink_size] = result_qi.sum() * 0.01
-
-        hi_scores = torch.zeros(seq_len, device=device, dtype=torch.float32)
-        hi_scores[sink_size:] = result_hi
-        hi_scores[:sink_size] = result_hi.sum() * 0.01
-
-        # Normalize to [0, 1]
         qi_max = qi_scores.max()
         if qi_max > 0:
             qi_scores = qi_scores / qi_max
@@ -2756,14 +2246,7 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        # v4.5.3: Streaming Neumann for O(n) memory on long sequences
-        if not self._printed_version:
-            attn_mode = "SparseAttn" if self.use_sparse_attention else "AttnWeighted"
-            norm_mode = self.normalization_mode
-            smooth_info = f" smooth={self.smoothing_kernel_size}" if self.use_spatial_smoothing else ""
-            streaming_info = f" streaming={STREAMING_NEUMANN_AVAILABLE}"
-            print(f"CircuitKV v4.5.3 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}, {attn_mode}, norm={norm_mode}, max_ctx={self.max_neumann_context}{streaming_info}{smooth_info}{ablation_info}) budget={self.max_capacity_prompt}")
-            self._printed_version = True
+        print(f"CircuitKV v4.4.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2802,87 +2285,55 @@ class CircuitKVCluster():
 
         attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
 
-        # =====================================================================
-        # v4.5.0: Build full attention matrix
-        # Two modes:
-        # - Sparse Attention: Sample real attention at prefix positions (accurate)
-        # - H2O Approximation: Use H2O-weighted heuristic (fast, less accurate)
-        # Only use sparse attention for sequences longer than 2x budget (where it matters)
-        # v4.5.2: Memory-efficient path for sequences > max_neumann_context
-        # =====================================================================
+        # Build full attention matrix approximation
+        # For positions outside the window, use uniform causal attention
+        full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
+
+        # Fill the window portion with actual attention
+        full_attn[-self.window_size:, :] = attn_avg
+
+        # For positions outside window, use H2O-WEIGHTED transitions (not uniform)
+        # This guides walkers toward high-attention tokens instead of random backward jumps
         n_prefix = q_len - self.window_size
+        if n_prefix > 1:
+            # Compute H2O scores (column sums) from window attention
+            # This captures how much recent tokens attend to each position
+            h2o_scores = attn_avg.sum(dim=0)  # [seq_len]
+            h2o_prefix = h2o_scores[:n_prefix].clone()
 
-        # v4.5.3: For very long sequences, use STREAMING Neumann (O(n) memory)
-        # Key innovation: compute Neumann series WITHOUT materializing attention matrix
-        use_streaming_neumann = q_len > self.max_neumann_context
+            # Ensure positive scores (add small epsilon to avoid zeros)
+            h2o_prefix = h2o_prefix.clamp(min=1e-6)
 
-        if use_streaming_neumann:
-            # Streaming Neumann: O(n) memory instead of O(n²)
-            # Uses CUDA kernel when available for optimal performance
-            if not hasattr(self, '_streaming_warned'):
-                kernel_status = "CUDA" if STREAMING_NEUMANN_AVAILABLE else "Python"
-                print(f"  [v4.5.3] Long sequence ({q_len} > {self.max_neumann_context}): using streaming Neumann ({kernel_status})")
-                self._streaming_warned = True
+            # For row i, transition prob to j = h2o[j] / sum(h2o[0:i]) for j < i
+            # This creates a valid probability distribution that sums to 1
+            cumsum = h2o_prefix.cumsum(dim=0)  # [n_prefix]
 
-            full_attn = None  # Signal streaming mode - no matrix materialization
-        else:
-            use_sparse_this_call = (
-                self.use_sparse_attention and
-                n_prefix > self.sparse_min_samples * 2  # Only if enough prefix to sample meaningfully
-            )
+            # denom[i] = sum(h2o[0:i]) = cumsum[i-1]
+            denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
+            denom[1:] = cumsum[:-1]
+            denom[0] = 1.0  # Avoid div-by-zero (row 0 masked anyway)
 
-            if use_sparse_this_call:
-                # v4.5.0: Sparse attention with real Q·K^T at sampled positions
-                # This provides anchors of ground truth throughout the prefix,
-                # significantly improving the Neumann series computation quality.
-                full_attn = self._compute_sparse_attention(
-                    query_states=query_states,
-                    key_states=key_states,
-                    window_attn=attn_avg,
-                    q_len=q_len,
-                    head_dim=head_dim,
-                )
-            else:
-                # Attention-weighted approximation for prefix region
-                full_attn = self._compute_attention_weighted_approximation(
-                    window_attn=attn_avg,
-                    q_len=q_len,
-                    device=key_states.device,
-                )
+            # Broadcast to create transition matrix
+            # h2o_expanded[i,j] = h2o[j] for all i
+            h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
+            denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
+
+            # P[i,j] = h2o[j] / sum(h2o[0:i])
+            h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
+
+            # Apply causal mask (only attend to strictly previous positions)
+            mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
+            full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
 
         # =====================================================================
         # STEP 2: Compute Importance Scores
         # v4.2.0: Dual-Importance Scoring (DIS) - QI × HI from fundamental matrix
         # v4.0.0: Deterministic Neumann series (default)
         # v3.0.0: Stochastic random walks (legacy, for ablation)
-        # v4.5.2: Fast path for long sequences (H2O-only, O(n) memory)
         # =====================================================================
         current_idx = q_len - 1
 
-        # v4.5.3: Streaming Neumann for very long sequences - O(n) memory
-        if use_streaming_neumann:
-            # Use streaming Neumann: computes QI and HI without materializing attention matrix
-            # This is the KEY innovation for handling long sequences without OOM
-            qi_scores, hi_scores = self._compute_streaming_neumann_dual(
-                window_attn=attn_avg,  # [window_size, seq_len]
-                query_idx=current_idx,
-                seq_len=q_len,
-                sink_size=self.sink_size,
-                num_iterations=self.neumann_iterations,
-                temperature=self.neumann_temperature,
-            )
-
-            # Rank normalize and combine with MAX
-            qi_rank = self._rank_normalize(qi_scores)
-            hi_rank = self._rank_normalize(hi_scores)
-            combined_scores = torch.maximum(qi_rank, hi_rank)
-
-            # Create influence_scores buffer for compatibility
-            device = key_states.device
-            influence_scores = torch.zeros(q_len, device=device, dtype=torch.float32)
-            influence_scores[:q_len] = qi_scores
-
-        elif self.combination_mode == "dis":
+        if self.combination_mode == "dis":
             # v4.2.0: Dual-Importance Scoring (DIS)
             # Computes BOTH Query Importance (QI) and Hub Importance (HI)
             # from the same fundamental matrix N = (I-Q)^(-1)
@@ -2894,30 +2345,9 @@ class CircuitKVCluster():
                 temperature=self.neumann_temperature,
             )
 
-            # v4.5.0: Configurable normalization mode
-            if self.normalization_mode == "adaptive":
-                # Adaptive normalization with confidence weighting
-                qi_norm, qi_conf = self._adaptive_normalize(qi_scores)
-                hi_norm, hi_conf = self._adaptive_normalize(hi_scores)
-
-                # Use confidence to weight the combination
-                # If one signal has much higher confidence, favor it
-                # Note: qi_conf and hi_conf are tensors (scalars on GPU)
-                total_conf = qi_conf + hi_conf + 1e-8
-                qi_weight = 0.5 + 0.3 * (qi_conf - hi_conf) / total_conf  # Range: [0.2, 0.8]
-                qi_weight = torch.clamp(qi_weight, 0.2, 0.8)
-                hi_weight = 1.0 - qi_weight
-
-                qi_rank = qi_norm
-                hi_rank = hi_norm
-            elif self.normalization_mode == "percentile":
-                # Percentile normalization (preserves magnitude)
-                qi_rank = self._percentile_normalize(qi_scores)
-                hi_rank = self._percentile_normalize(hi_scores)
-            else:
-                # Default: rank normalization (original behavior)
-                qi_rank = self._rank_normalize(qi_scores)
-                hi_rank = self._rank_normalize(hi_scores)
+            # Rank normalize both
+            qi_rank = self._rank_normalize(qi_scores)
+            hi_rank = self._rank_normalize(hi_scores)
 
             # v4.3.1: Ablation support - zero out one signal for A1 experiment
             if self.ablate_qi:
@@ -2928,8 +2358,6 @@ class CircuitKVCluster():
                 hi_rank = torch.zeros_like(hi_rank)
 
             # v4.3.0: Combination strategies (A2 ablation support)
-            # CRITICAL: Always use MAX for "dis" mode regardless of normalization
-            # The weighted average broke v4.5 - OR logic is essential
             if self.combination_mode == "geometric":
                 # Geometric mean: sqrt(QI * HI) - AND logic (both must be high)
                 combined_scores = torch.sqrt(qi_rank * hi_rank + 1e-8)
@@ -2938,7 +2366,6 @@ class CircuitKVCluster():
                 combined_scores = 0.5 * qi_rank + 0.5 * hi_rank
             else:
                 # Default "dis": MAX(HI, QI) - OR logic (keeps if EITHER is high)
-                # This is the key to v4.3's success - DO NOT use weighted average!
                 combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging (use influence_scores variable for compatibility)
@@ -3010,8 +2437,7 @@ class CircuitKVCluster():
         # v3.0.0 Breakthrough 2: Instruction Anchor Detection
         # Detect and boost instruction-anchoring tokens for few-shot tasks
         # NOTE: Heuristic method uses attention patterns, doesn't need tokenizer
-        # v4.5.2: Skip when in fast path (no full_attn matrix available)
-        if self.use_instruction_anchors and not use_fast_path:
+        if self.use_instruction_anchors:
             try:
                 # Detect anchors using attention pattern heuristics
                 self._instruction_anchors = self._detect_instruction_anchors_heuristic(
@@ -3029,17 +2455,6 @@ class CircuitKVCluster():
                     print(f"  [v3.0.0] Detected {len(self._instruction_anchors)} instruction anchors, boosted {num_boosted}")
             except Exception as e:
                 print(f"  [v3.0.0] Anchor detection failed: {e}")
-
-        # =====================================================================
-        # v4.5.0: Spatial Smoothing
-        # Apply avgpool smoothing for spatial coherence - nearby tokens often
-        # form coherent units (phrases, entities, code blocks)
-        # =====================================================================
-        if self.use_spatial_smoothing and self.smoothing_kernel_size > 1:
-            combined_scores = self._apply_spatial_smoothing(
-                combined_scores,
-                kernel_size=self.smoothing_kernel_size,
-            )
 
         # Expand to full buffer size
         scores = torch.zeros_like(influence_scores)
@@ -3096,8 +2511,7 @@ class CircuitKVCluster():
                     h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
 
                 # Use combined DIS scores (already MAX of HI, QI)
-                # BUG FIX: was "selected_scores" which doesn't exist - should be "combined_scores"
-                dis_for_perhead = combined_scores[:non_window_len]
+                dis_for_perhead = selected_scores[:non_window_len]
                 dis_rank = self._rank_normalize(dis_for_perhead)
                 dis_broadcast = dis_rank.unsqueeze(0).expand(num_heads, -1)
 
