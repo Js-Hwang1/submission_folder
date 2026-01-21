@@ -2322,8 +2322,6 @@ class CircuitKVCluster():
                 print(f"  [v4.5.3] CUDA kernel failed, using Python fallback: {e}")
 
         # Python fallback implementation
-        options = torch.TensorOptions().dtype(torch.float32).device(device)
-
         # Precompute h2o_scores (column sums) and cumsum
         h2o_scores = window_attn.sum(dim=0)  # [seq_len]
 
