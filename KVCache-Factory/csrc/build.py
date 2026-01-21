@@ -78,42 +78,6 @@ ext_modules.append(
     )
 )
 
-# Streaming Neumann kernel for CircuitKV v4.5.3
-# Memory-efficient O(n) Neumann series computation
-ext_modules.append(
-    CUDAExtension(
-        name="streaming_neumann_cuda",
-        sources=[
-            "csrc/streaming_neumann.cu",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"] + generator_flag,
-            "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "--use_fast_math",
-                    "-lineinfo",
-                    "--ptxas-options=-v",
-                    "--ptxas-options=-O2",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF_CONVERSIONS__",
-                    "-U__CUDA_NO_HALF2_OPERATORS__",
-                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "--use_fast_math",
-                ]
-                + generator_flag
-                + cc_flag,
-        },
-        include_dirs=[
-            Path(this_dir) / "csrc",
-            Path(this_dir) / "include",
-        ],
-    )
-)
-
 setup(
     name=PACKAGE_NAME,
     packages=find_packages(

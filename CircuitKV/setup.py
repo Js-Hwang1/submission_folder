@@ -25,6 +25,7 @@ def get_extensions():
         "csrc/kernels/landmark_walker.cu",
         "csrc/kernels/landmark_absorbing_walker.cu",  # v0.5.0: Landmark Absorbing
         "csrc/kernels/influence_walker.cu",  # v1.0.0: Causal Influence (VALIDATED BY PoC5)
+        "csrc/kernels/streaming_neumann.cu",  # v4.5.3: O(n) memory Neumann series
     ]
 
     # Include directories (absolute paths required for compiler)

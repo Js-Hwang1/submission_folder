@@ -31,9 +31,10 @@ except ImportError:
 
 # v4.5.3: Streaming Neumann CUDA kernel for O(n) memory
 try:
-    import streaming_neumann_cuda
+    from circuit_kv._C import streaming_neumann_dual as _streaming_neumann_cuda
     STREAMING_NEUMANN_AVAILABLE = True
 except ImportError:
+    _streaming_neumann_cuda = None
     STREAMING_NEUMANN_AVAILABLE = False
 
 # =============================================================================
@@ -2310,7 +2311,7 @@ class CircuitKVCluster():
         # Try CUDA kernel first
         if STREAMING_NEUMANN_AVAILABLE and window_attn.is_cuda:
             try:
-                return streaming_neumann_cuda.streaming_neumann_dual(
+                return _streaming_neumann_cuda(
                     window_attn.contiguous().float(),
                     query_idx,
                     sink_size,

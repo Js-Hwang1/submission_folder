@@ -1,12 +1,3 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <torch/extension.h>
-#include <torch/python.h>
-
-#include "cuda_api.h"
-
 /**
  * Streaming Neumann Series Kernel for CircuitKV v4.5.3
  *
@@ -16,6 +7,13 @@
  * Key insight: We only need window attention [W, n] and approximate
  * prefix attention on-the-fly using attention-weighted heuristic.
  */
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+#include "common.cuh"
+
+namespace circuit_kv {
 
 // Warp-level reduction
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -27,6 +25,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 // Block-level reduction using shared memory
+template<int BLOCK_SIZE>
 __device__ float block_reduce_sum(float val, float* shared) {
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
@@ -36,14 +35,14 @@ __device__ float block_reduce_sum(float val, float* shared) {
     if (lane == 0) shared[wid] = val;
     __syncthreads();
 
-    val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 0.0f;
+    val = (threadIdx.x < BLOCK_SIZE / 32) ? shared[lane] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
 
     return val;
 }
 
 /**
- * Kernel: Compute Q.t() @ v for streaming Neumann iteration
+ * Fused kernel: Compute BOTH QI and HI Neumann iterations simultaneously
  *
  * For each output position j:
  *   v_out[j] = Σᵢ Q[i,j] × v[i]
@@ -53,80 +52,6 @@ __device__ float block_reduce_sum(float val, float* shared) {
  *
  * - Window positions: use exact attention from window_attn
  * - Prefix positions: use attention-weighted approximation
- */
-template<int BLOCK_SIZE = 256>
-__global__ void streaming_qt_times_v_kernel(
-    const float* __restrict__ window_attn,    // [window_size, seq_len] - row-major
-    const float* __restrict__ v,              // [n_transient] - input vector
-    float* __restrict__ v_out,                // [n_transient] - output vector
-    const float* __restrict__ h2o_scores,     // [seq_len] - column sums of window attention
-    const float* __restrict__ h2o_cumsum,     // [n_prefix] - cumulative sum for prefix
-    const float* __restrict__ window_row_sums,// [window_size] - precomputed row sums
-    int seq_len,
-    int window_size,
-    int sink_size,
-    int n_transient,
-    int n_prefix
-) {
-    // Each block handles one output position j
-    int j = blockIdx.x;
-    if (j >= n_transient) return;
-
-    int j_full = j + sink_size;  // Position in full sequence
-
-    __shared__ float shared_mem[32];  // For block reduction
-
-    float local_sum = 0.0f;
-
-    // Process input positions i in parallel across threads
-    for (int i = threadIdx.x; i < n_transient; i += BLOCK_SIZE) {
-        float v_i = v[i];
-        if (v_i == 0.0f) continue;  // Skip zeros
-
-        int i_full = i + sink_size;
-
-        float attn_ij = 0.0f;
-        float row_sum = 1.0f;
-
-        // Check if i is in window region (last window_size positions)
-        int window_start = seq_len - window_size;
-
-        if (i_full >= window_start) {
-            // Window region: use exact attention
-            int window_row = i_full - window_start;
-            attn_ij = window_attn[window_row * seq_len + j_full];
-            row_sum = window_row_sums[window_row];
-        } else {
-            // Prefix region: use attention-weighted approximation
-            // P[i_full, j_full] ≈ h2o[j_full] / cumsum[i_full-1] if j_full < i_full
-            if (j_full < i_full) {
-                attn_ij = h2o_scores[j_full];
-                // cumsum[k] = sum(h2o[0:k+1]), so for positions 0..i_full-1 we use cumsum[i_full-1]
-                int cumsum_idx = i_full - sink_size - 1;  // Index in prefix cumsum
-                if (cumsum_idx >= 0 && cumsum_idx < n_prefix) {
-                    row_sum = h2o_cumsum[cumsum_idx] + 1e-8f;
-                }
-            }
-            // else: j_full >= i_full means causal mask blocks it (attn_ij stays 0)
-        }
-
-        if (row_sum > 1e-8f && attn_ij > 0.0f) {
-            float P_ij = attn_ij / row_sum;
-            local_sum += P_ij * v_i;
-        }
-    }
-
-    // Block-level reduction
-    float total = block_reduce_sum(local_sum, shared_mem);
-
-    if (threadIdx.x == 0) {
-        v_out[j] = total;
-    }
-}
-
-/**
- * Fused kernel: Compute BOTH QI and HI iterations simultaneously
- * This is more efficient than running two separate kernels
  */
 template<int BLOCK_SIZE = 256>
 __global__ void streaming_dual_neumann_kernel(
@@ -161,8 +86,8 @@ __global__ void streaming_dual_neumann_kernel(
         float vqi_i = v_qi[i];
         float vhi_i = v_hi[i];
 
-        // Skip if both are zero
-        if (vqi_i == 0.0f && vhi_i == 0.0f) continue;
+        // Skip if both are zero (or very small)
+        if (fabsf(vqi_i) < 1e-10f && fabsf(vhi_i) < 1e-10f) continue;
 
         int i_full = i + sink_size;
 
@@ -170,10 +95,13 @@ __global__ void streaming_dual_neumann_kernel(
         float row_sum = 1.0f;
 
         if (i_full >= window_start) {
+            // Window region: use exact attention
             int window_row = i_full - window_start;
             attn_ij = window_attn[window_row * seq_len + j_full];
             row_sum = window_row_sums[window_row];
         } else {
+            // Prefix region: use attention-weighted approximation
+            // P[i_full, j_full] ≈ h2o[j_full] / cumsum[i_full-1] if j_full < i_full
             if (j_full < i_full) {
                 attn_ij = h2o_scores[j_full];
                 int cumsum_idx = i_full - sink_size - 1;
@@ -181,6 +109,7 @@ __global__ void streaming_dual_neumann_kernel(
                     row_sum = h2o_cumsum[cumsum_idx] + 1e-8f;
                 }
             }
+            // else: j_full >= i_full means causal mask blocks it (attn_ij stays 0)
         }
 
         if (row_sum > 1e-8f && attn_ij > 0.0f) {
@@ -191,11 +120,11 @@ __global__ void streaming_dual_neumann_kernel(
     }
 
     // Reduction for QI
-    float total_qi = block_reduce_sum(local_qi, shared_qi);
+    float total_qi = block_reduce_sum<BLOCK_SIZE>(local_qi, shared_qi);
     __syncthreads();
 
     // Reduction for HI
-    float total_hi = block_reduce_sum(local_hi, shared_hi);
+    float total_hi = block_reduce_sum<BLOCK_SIZE>(local_hi, shared_hi);
 
     if (threadIdx.x == 0) {
         v_qi_out[j] = total_qi;
@@ -204,7 +133,7 @@ __global__ void streaming_dual_neumann_kernel(
 }
 
 /**
- * Full streaming Neumann series computation
+ * Host function: Full streaming Neumann series computation
  * Computes both QI and HI without materializing the attention matrix
  */
 std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
@@ -214,7 +143,8 @@ std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
     int num_iterations,
     float temperature
 ) {
-    CHECK_INPUT(window_attn);
+    TORCH_CHECK(window_attn.is_cuda(), "window_attn must be a CUDA tensor");
+    TORCH_CHECK(window_attn.is_contiguous(), "window_attn must be contiguous");
 
     auto window_shape = window_attn.sizes();
     int window_size = window_shape[0];
@@ -225,26 +155,32 @@ std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
     auto device = window_attn.device();
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
 
-    // Precompute h2o_scores (column sums of window attention)
-    // h2o_scores[j] = Σ_w window_attn[w, j]
-    torch::Tensor h2o_scores = window_attn.sum(0);  // [seq_len]
-
-    // Precompute h2o_cumsum for prefix region
-    // h2o_cumsum[i] = Σ_{j=0}^{i} h2o_scores[j+sink_size]
-    torch::Tensor h2o_prefix = h2o_scores.slice(0, sink_size, sink_size + n_prefix).contiguous();
-    torch::Tensor h2o_cumsum = h2o_prefix.cumsum(0);  // [n_prefix]
-
-    // Precompute window row sums
-    torch::Tensor window_row_sums = window_attn.sum(1);  // [window_size]
+    // Convert to float32 if needed
+    if (window_attn.dtype() != torch::kFloat32) {
+        window_attn = window_attn.to(torch::kFloat32);
+    }
 
     // Apply temperature if needed
     if (temperature != 1.0f && temperature > 0.0f) {
         window_attn = window_attn.pow(1.0f / temperature);
-        h2o_scores = window_attn.sum(0);
-        h2o_prefix = h2o_scores.slice(0, sink_size, sink_size + n_prefix).contiguous();
-        h2o_cumsum = h2o_prefix.cumsum(0);
-        window_row_sums = window_attn.sum(1);
     }
+
+    // Precompute h2o_scores (column sums of window attention)
+    torch::Tensor h2o_scores = window_attn.sum(0);  // [seq_len]
+
+    // Precompute h2o_cumsum for prefix region
+    torch::Tensor h2o_prefix;
+    torch::Tensor h2o_cumsum;
+    if (n_prefix > 0) {
+        h2o_prefix = h2o_scores.slice(0, sink_size, sink_size + n_prefix).contiguous();
+        h2o_prefix = h2o_prefix.clamp_min(1e-8f);
+        h2o_cumsum = h2o_prefix.cumsum(0);  // [n_prefix]
+    } else {
+        h2o_cumsum = torch::zeros({1}, options);
+    }
+
+    // Precompute window row sums
+    torch::Tensor window_row_sums = window_attn.sum(1);  // [window_size]
 
     // Initialize QI: one-hot at query position
     int query_transient_idx = query_idx - sink_size;
@@ -255,7 +191,7 @@ std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
     torch::Tensor result_qi = v_qi.clone();
 
     // Initialize HI: uniform start
-    torch::Tensor v_hi = torch::ones({n_transient}, options) / n_transient;
+    torch::Tensor v_hi = torch::ones({n_transient}, options) / static_cast<float>(n_transient);
     torch::Tensor result_hi = v_hi.clone();
 
     // Allocate output buffers
@@ -267,8 +203,10 @@ std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
     dim3 grid(n_transient);
     dim3 block(BLOCK_SIZE);
 
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
     for (int iter = 0; iter < num_iterations; iter++) {
-        streaming_dual_neumann_kernel<BLOCK_SIZE><<<grid, block>>>(
+        streaming_dual_neumann_kernel<BLOCK_SIZE><<<grid, block, 0, stream>>>(
             window_attn.data_ptr<float>(),
             v_qi.data_ptr<float>(),
             v_hi.data_ptr<float>(),
@@ -296,11 +234,13 @@ std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
     // Map back to full sequence
     torch::Tensor qi_scores = torch::zeros({seq_len}, options);
     qi_scores.slice(0, sink_size, seq_len).copy_(result_qi);
-    qi_scores.slice(0, 0, sink_size).fill_(result_qi.sum().item<float>() * 0.01f);
+    float qi_sink_val = result_qi.sum().item<float>() * 0.01f;
+    qi_scores.slice(0, 0, sink_size).fill_(qi_sink_val);
 
     torch::Tensor hi_scores = torch::zeros({seq_len}, options);
     hi_scores.slice(0, sink_size, seq_len).copy_(result_hi);
-    hi_scores.slice(0, 0, sink_size).fill_(result_hi.sum().item<float>() * 0.01f);
+    float hi_sink_val = result_hi.sum().item<float>() * 0.01f;
+    hi_scores.slice(0, 0, sink_size).fill_(hi_sink_val);
 
     // Normalize to [0, 1]
     float qi_max = qi_scores.max().item<float>();
@@ -312,8 +252,4 @@ std::tuple<torch::Tensor, torch::Tensor> streaming_neumann_dual(
     return std::make_tuple(qi_scores, hi_scores);
 }
 
-// Python binding
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("streaming_neumann_dual", &streaming_neumann_dual,
-          "Streaming Neumann series for dual importance (QI & HI) computation");
-}
+}  // namespace circuit_kv
