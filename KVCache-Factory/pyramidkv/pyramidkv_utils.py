@@ -49,13 +49,13 @@ def _get_circuitkv_debug_log():
     if not _CIRCUITKV_DEBUG_INITIALIZED:
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
-        _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n")
-        _CIRCUITKV_DEBUG_LOG.write("CircuitKV v4.0.0 Debug Log - Deterministic Neumann Series\n")
-        _CIRCUITKV_DEBUG_LOG.write("=" * 80 + "\n\n")
-        _CIRCUITKV_DEBUG_LOG.write("ALGORITHM: score[j] = max(rank_h2o[j], rank_influence[j])\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - H2O: Column sums (incoming attention)\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - Influence: Neumann series N=(I-Q)^(-1) expected visits\n")
-        _CIRCUITKV_DEBUG_LOG.write("  - MAX: Hedging - keeps token if EITHER method wants it\n\n")
+        _CIRCUITKV_DEBUG_LOG.write("[LOG_HEADER]\n")
+        _CIRCUITKV_DEBUG_LOG.write("version=4.3.0\n")
+        _CIRCUITKV_DEBUG_LOG.write("format=structured\n")
+        _CIRCUITKV_DEBUG_LOG.write("algorithm=MAX(rank(QI), rank(HI))\n")
+        _CIRCUITKV_DEBUG_LOG.write("QI=Query Importance from Neumann N[query_row]\n")
+        _CIRCUITKV_DEBUG_LOG.write("HI=Hub Importance = column_sums(N)\n")
+        _CIRCUITKV_DEBUG_LOG.write("N=Fundamental Matrix (I-Q)^(-1)\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
@@ -1404,120 +1404,147 @@ class CircuitKVCluster():
         self,
         q_len: int,
         h2o_scores: torch.Tensor,
-        landmark_scores: torch.Tensor,
+        combined_scores: torch.Tensor,
         keep_mask: torch.Tensor,
         full_attn: torch.Tensor,
+        qi_scores: torch.Tensor = None,
+        hi_scores: torch.Tensor = None,
     ):
-        """Log detailed debug info for each eviction decision."""
+        """Log structured debug data for AI analysis. Machine-parseable format."""
         if not self.debug:
             return
 
         log = _get_circuitkv_debug_log()
         layer_num = _circuitkv_debug_next_layer()
 
-        # Only log detailed info for layer 0 (to avoid overwhelming output)
         if layer_num == 1:
             sample_num = _circuitkv_debug_next_sample()
             dataset = _CIRCUITKV_CURRENT_DATASET or "unknown"
-
-            # Compute compression ratio
             compression_ratio = 100 * (1 - self.max_capacity_prompt / q_len)
 
-            log.write(f"\n{'='*80}\n")
-            log.write(f"SAMPLE #{sample_num} | dataset={dataset} | seq_len={q_len}\n")
-            log.write(f"{'='*80}\n\n")
-
             # =====================================================================
-            # 0. COMPRESSION OVERVIEW
+            # HEADER
             # =====================================================================
-            log.write(f"📊 COMPRESSION OVERVIEW:\n")
-            log.write(f"  Input tokens:     {q_len:,}\n")
-            log.write(f"  Budget:           {self.max_capacity_prompt:,}\n")
-            log.write(f"  Compression:      {compression_ratio:.1f}% evicted\n")
-            log.write(f"  Sink (force-keep): {self.sink_size} tokens (positions 0-{self.sink_size-1})\n")
-            log.write(f"  Local window:     {self.window_size} tokens (positions {q_len-self.window_size}-{q_len-1})\n")
-            log.write(f"  Competitive slots: {self.max_capacity_prompt - self.sink_size - self.window_size} tokens\n")
-            if compression_ratio > 90:
-                log.write(f"  ⚠️  WARNING: >90% compression - high risk of losing important tokens!\n")
-            log.write("\n")
+            log.write(f"\n[SAMPLE {sample_num}]\n")
+            log.write(f"dataset={dataset}\n")
+            log.write(f"seq_len={q_len}\n")
+            log.write(f"budget={self.max_capacity_prompt}\n")
+            log.write(f"sink={self.sink_size}\n")
+            log.write(f"window={self.window_size}\n")
+            log.write(f"competitive_slots={self.max_capacity_prompt - self.sink_size - self.window_size}\n")
+            log.write(f"compression_pct={compression_ratio:.1f}\n")
+            log.write(f"neumann_k={self.neumann_iterations}\n")
+            log.write(f"temperature={self.neumann_temperature}\n")
+            log.write(f"combination_mode={self.combination_mode}\n\n")
 
-            h2o_cpu = h2o_scores[:q_len].cpu()
-            influence_cpu = landmark_scores[:q_len].cpu()
-
-            # =====================================================================
-            # 1. MAX(H2O, Influence) COMBINATION ANALYSIS
-            # =====================================================================
-            # Rank normalize both
-            h2o_ranks = torch.argsort(torch.argsort(h2o_cpu)).float() / (q_len - 1)
-            influence_ranks = torch.argsort(torch.argsort(influence_cpu)).float() / (q_len - 1)
-            combined_ranks = torch.maximum(h2o_ranks, influence_ranks)
-
-            log.write(f"🔀 MAX(H2O, Influence) COMBINATION:\n")
-
-            # Who dominates?
-            h2o_wins = (h2o_ranks > influence_ranks).sum().item()
-            influence_wins = (influence_ranks > h2o_ranks).sum().item()
-            ties = q_len - h2o_wins - influence_wins
-            log.write(f"  H2O dominates:       {h2o_wins:,} tokens ({100*h2o_wins/q_len:.1f}%)\n")
-            log.write(f"  Influence dominates: {influence_wins:,} tokens ({100*influence_wins/q_len:.1f}%)\n")
-            log.write(f"  Ties:                {ties:,} tokens ({100*ties/q_len:.1f}%)\n")
-
-            # Correlation between H2O and Influence
-            h2o_flat = h2o_cpu.float()
-            inf_flat = influence_cpu.float()
-            if h2o_flat.std() > 0 and inf_flat.std() > 0:
-                corr = torch.corrcoef(torch.stack([h2o_flat, inf_flat]))[0, 1].item()
-                log.write(f"  Correlation (H2O vs Influence): {corr:.3f}\n")
-                if corr > 0.8:
-                    log.write(f"    → High correlation: H2O and Influence agree (redundant?)\n")
-                elif corr < 0.2:
-                    log.write(f"    → Low correlation: H2O and Influence capture different tokens (good!)\n")
-            log.write("\n")
-
-            # =====================================================================
-            # 2. TOP TOKENS BY EACH METHOD
-            # =====================================================================
-            top_k = 15
-            log.write(f"🏆 TOP {top_k} TOKENS BY EACH METHOD:\n\n")
-
-            h2o_topk_vals, h2o_topk_idx = torch.topk(h2o_cpu, min(top_k, q_len))
-            influence_topk_vals, influence_topk_idx = torch.topk(influence_cpu, min(top_k, q_len))
-            combined_topk_vals, combined_topk_idx = torch.topk(combined_ranks, min(top_k, q_len))
-
-            log.write(f"  {'Rank':<5} {'H2O':^25} {'Influence':^25} {'MAX Combined':^25}\n")
-            log.write(f"  {'----':<5} {'-'*25:^25} {'-'*25:^25} {'-'*25:^25}\n")
-            for i in range(min(top_k, q_len)):
-                h2o_pos = h2o_topk_idx[i].item()
-                inf_pos = influence_topk_idx[i].item()
-                comb_pos = combined_topk_idx[i].item()
-                log.write(f"  {i+1:<5} pos={h2o_pos:<5} ({h2o_topk_vals[i]:.3f})   pos={inf_pos:<5} ({influence_topk_vals[i]:.3f})   pos={comb_pos:<5} ({combined_topk_vals[i]:.3f})\n")
-            log.write("\n")
-
-            # Overlap analysis
-            h2o_top_set = set(h2o_topk_idx.tolist())
-            inf_top_set = set(influence_topk_idx.tolist())
-            overlap = h2o_top_set & inf_top_set
-            h2o_only = h2o_top_set - inf_top_set
-            inf_only = inf_top_set - h2o_top_set
-            log.write(f"  Top-{top_k} Overlap Analysis:\n")
-            log.write(f"    Both agree:        {len(overlap)} tokens {sorted(overlap)[:10]}...\n")
-            log.write(f"    H2O only:          {len(h2o_only)} tokens {sorted(h2o_only)[:10]}...\n")
-            log.write(f"    Influence only:    {len(inf_only)} tokens {sorted(inf_only)[:10]}...\n")
-            log.write("\n")
-
-            # =====================================================================
-            # 3. POSITION COVERAGE ANALYSIS (Critical for few-shot/code tasks!)
-            # =====================================================================
+            # Get tensors
+            h2o_cpu = h2o_scores[:q_len].cpu().float()
+            combined_cpu = combined_scores[:q_len].cpu().float()
             kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
             evicted_positions = (~keep_mask).nonzero(as_tuple=True)[0].cpu().tolist()
 
-            log.write(f"📍 POSITION COVERAGE ANALYSIS:\n")
+            # =====================================================================
+            # HI / QI SCORES (if available from DIS mode)
+            # =====================================================================
+            if qi_scores is not None and hi_scores is not None:
+                qi_cpu = qi_scores[:q_len].cpu().float()
+                hi_cpu = hi_scores[:q_len].cpu().float()
 
-            # Divide into segments
+                # Rank normalize
+                qi_ranks = torch.argsort(torch.argsort(qi_cpu)).float() / (q_len - 1)
+                hi_ranks = torch.argsort(torch.argsort(hi_cpu)).float() / (q_len - 1)
+                max_ranks = torch.maximum(qi_ranks, hi_ranks)
+
+                log.write(f"[QI_SCORES] (Query Importance from Neumann N[q,:])\n")
+                log.write(f"qi_mean={qi_cpu.mean().item():.6f}\n")
+                log.write(f"qi_std={qi_cpu.std().item():.6f}\n")
+                log.write(f"qi_min={qi_cpu.min().item():.6f}\n")
+                log.write(f"qi_max={qi_cpu.max().item():.6f}\n")
+                log.write(f"qi_p50={torch.quantile(qi_cpu, 0.5).item():.6f}\n")
+                log.write(f"qi_p95={torch.quantile(qi_cpu, 0.95).item():.6f}\n")
+                log.write(f"qi_zeros={int((qi_cpu == 0).sum().item())}\n")
+
+                log.write(f"\n[HI_SCORES] (Hub Importance = column sums of N)\n")
+                log.write(f"hi_mean={hi_cpu.mean().item():.6f}\n")
+                log.write(f"hi_std={hi_cpu.std().item():.6f}\n")
+                log.write(f"hi_min={hi_cpu.min().item():.6f}\n")
+                log.write(f"hi_max={hi_cpu.max().item():.6f}\n")
+                log.write(f"hi_p50={torch.quantile(hi_cpu, 0.5).item():.6f}\n")
+                log.write(f"hi_p95={torch.quantile(hi_cpu, 0.95).item():.6f}\n")
+                log.write(f"hi_zeros={int((hi_cpu == 0).sum().item())}\n")
+
+                # QI vs HI correlation
+                if qi_cpu.std() > 0 and hi_cpu.std() > 0:
+                    qi_hi_corr = torch.corrcoef(torch.stack([qi_cpu, hi_cpu]))[0, 1].item()
+                    log.write(f"qi_hi_correlation={qi_hi_corr:.4f}\n")
+
+                # Who dominates in MAX(QI, HI)?
+                qi_wins = (qi_ranks > hi_ranks).sum().item()
+                hi_wins = (hi_ranks > qi_ranks).sum().item()
+                ties = q_len - qi_wins - hi_wins
+                log.write(f"qi_dominates_n={qi_wins}\n")
+                log.write(f"hi_dominates_n={hi_wins}\n")
+                log.write(f"ties_n={ties}\n")
+
+                # Top-20 by QI
+                qi_topk_vals, qi_topk_idx = torch.topk(qi_cpu, min(20, q_len))
+                log.write(f"\n[QI_TOP20]\n")
+                for i in range(min(20, q_len)):
+                    pos = qi_topk_idx[i].item()
+                    log.write(f"rank={i+1} pos={pos} qi={qi_cpu[pos].item():.6f} hi={hi_cpu[pos].item():.6f} max_rank={max_ranks[pos].item():.4f}\n")
+
+                # Top-20 by HI
+                hi_topk_vals, hi_topk_idx = torch.topk(hi_cpu, min(20, q_len))
+                log.write(f"\n[HI_TOP20]\n")
+                for i in range(min(20, q_len)):
+                    pos = hi_topk_idx[i].item()
+                    log.write(f"rank={i+1} pos={pos} qi={qi_cpu[pos].item():.6f} hi={hi_cpu[pos].item():.6f} max_rank={max_ranks[pos].item():.4f}\n")
+
+                # Divergence analysis: tokens where QI >> HI or HI >> QI
+                log.write(f"\n[QI_HI_DIVERGENCE] (tokens where one signal >> other)\n")
+                rank_diff = qi_ranks - hi_ranks
+                high_qi_low_hi = (rank_diff > 0.3).nonzero(as_tuple=True)[0][:10]
+                high_hi_low_qi = (rank_diff < -0.3).nonzero(as_tuple=True)[0][:10]
+                log.write(f"high_qi_low_hi_positions={high_qi_low_hi.tolist()}\n")
+                log.write(f"high_hi_low_qi_positions={high_hi_low_qi.tolist()}\n")
+
+            else:
+                # Fallback: use H2O as proxy (non-DIS mode)
+                log.write(f"[H2O_SCORES] (column sums of attention A, not from N)\n")
+                log.write(f"h2o_mean={h2o_cpu.mean().item():.6f}\n")
+                log.write(f"h2o_std={h2o_cpu.std().item():.6f}\n")
+                log.write(f"h2o_min={h2o_cpu.min().item():.6f}\n")
+                log.write(f"h2o_max={h2o_cpu.max().item():.6f}\n")
+                log.write(f"h2o_p50={torch.quantile(h2o_cpu, 0.5).item():.6f}\n")
+                log.write(f"h2o_p95={torch.quantile(h2o_cpu, 0.95).item():.6f}\n")
+
+            # =====================================================================
+            # COMBINED/MAX SCORES
+            # =====================================================================
+            log.write(f"\n[COMBINED_SCORES] (final selection criterion)\n")
+            log.write(f"combined_mean={combined_cpu.mean().item():.6f}\n")
+            log.write(f"combined_std={combined_cpu.std().item():.6f}\n")
+            log.write(f"combined_min={combined_cpu.min().item():.6f}\n")
+            log.write(f"combined_max={combined_cpu.max().item():.6f}\n")
+            log.write(f"combined_p50={torch.quantile(combined_cpu, 0.5).item():.6f}\n")
+            log.write(f"combined_p95={torch.quantile(combined_cpu, 0.95).item():.6f}\n")
+
+            # Top-20 by combined
+            comb_topk_vals, comb_topk_idx = torch.topk(combined_cpu, min(20, q_len))
+            log.write(f"\n[COMBINED_TOP20]\n")
+            for i in range(min(20, q_len)):
+                pos = comb_topk_idx[i].item()
+                log.write(f"rank={i+1} pos={pos} combined={combined_cpu[pos].item():.6f}\n")
+
+            # =====================================================================
+            # POSITION COVERAGE
+            # =====================================================================
+            log.write(f"\n[POSITION_COVERAGE]\n")
+            log.write(f"kept_count={len(kept_positions)}\n")
+            log.write(f"evicted_count={len(evicted_positions)}\n")
+
             n_segments = 10
             segment_size = q_len // n_segments
-            log.write(f"  Coverage by segment (each ~{segment_size} tokens):\n")
-
             segment_coverage = []
             for seg in range(n_segments):
                 seg_start = seg * segment_size
@@ -1526,105 +1553,123 @@ class CircuitKVCluster():
                 total_in_seg = seg_end - seg_start
                 coverage_pct = 100 * kept_in_seg / total_in_seg if total_in_seg > 0 else 0
                 segment_coverage.append(coverage_pct)
+                log.write(f"seg{seg}_range=[{seg_start},{seg_end}] kept={kept_in_seg} coverage_pct={coverage_pct:.1f}\n")
 
-                # Visual bar
-                bar_len = int(coverage_pct / 5)
-                bar = '█' * bar_len + '░' * (20 - bar_len)
-                status = ""
-                if seg == 0:
-                    status = " ← SINK"
-                elif seg == n_segments - 1:
-                    status = " ← QUERY"
-                elif coverage_pct < 5:
-                    status = " ⚠️ LOW COVERAGE!"
-
-                log.write(f"    Seg {seg}: [{seg_start:5d}-{seg_end:5d}] {bar} {coverage_pct:5.1f}% ({kept_in_seg}/{total_in_seg}){status}\n")
-
-            # Coverage warnings
             middle_coverage = sum(segment_coverage[2:8]) / 6
-            if middle_coverage < 10:
-                log.write(f"\n  ⚠️  WARNING: Middle segments have only {middle_coverage:.1f}% coverage!\n")
-                log.write(f"      This may cause failures on few-shot/code tasks that need middle context.\n")
-            log.write("\n")
+            log.write(f"middle_coverage_avg={middle_coverage:.1f}\n")
 
             # =====================================================================
-            # 4. ATTENTION PATTERN ANALYSIS
+            # ATTENTION ANALYSIS
             # =====================================================================
-            log.write(f"👁️  ATTENTION PATTERN ANALYSIS:\n")
-
-            # Attention entropy (how focused vs diffuse)
-            attn_row = full_attn[-1, :q_len]  # Last query's attention
+            log.write(f"\n[ATTENTION_ANALYSIS]\n")
+            attn_row = full_attn[-1, :q_len].cpu()
             attn_row_norm = attn_row / (attn_row.sum() + 1e-8)
             entropy = -(attn_row_norm * torch.log(attn_row_norm + 1e-10)).sum().item()
             max_entropy = math.log(q_len)
-            log.write(f"  Query attention entropy: {entropy:.2f} / {max_entropy:.2f} ({100*entropy/max_entropy:.1f}%)\n")
-            if entropy / max_entropy > 0.9:
-                log.write(f"    → Very diffuse attention (may need more tokens)\n")
-            elif entropy / max_entropy < 0.3:
-                log.write(f"    → Very focused attention (compression may work well)\n")
+            log.write(f"query_attn_entropy={entropy:.4f}\n")
+            log.write(f"max_entropy={max_entropy:.4f}\n")
+            log.write(f"entropy_ratio={entropy/max_entropy:.4f}\n")
 
-            # Where does query attend most?
-            attn_topk_vals, attn_topk_idx = torch.topk(attn_row, min(10, q_len))
-            log.write(f"  Query attends most to positions: {attn_topk_idx.tolist()}\n")
+            attn_topk_vals, attn_topk_idx = torch.topk(attn_row, min(20, q_len))
+            log.write(f"query_top20_attn_positions={attn_topk_idx.tolist()}\n")
 
-            # Check if high-attention tokens are kept
-            attn_top_kept = sum(1 for p in attn_topk_idx.tolist() if p in kept_positions)
-            log.write(f"  Top-10 attended tokens kept: {attn_top_kept}/10\n")
-            if attn_top_kept < 8:
-                log.write(f"    ⚠️  WARNING: Missing {10-attn_top_kept} high-attention tokens!\n")
-            log.write("\n")
+            attn_top_kept = sum(1 for p in attn_topk_idx[:10].tolist() if p in kept_positions)
+            log.write(f"top10_attn_kept={attn_top_kept}\n")
 
-            # =====================================================================
-            # 5. INFLUENCE WALKER DIAGNOSTICS
-            # =====================================================================
-            log.write(f"🚶 INFLUENCE WALKER DIAGNOSTICS:\n")
-            try:
-                raw_visits = self._graph.get_influence_raw_visits()[:q_len].cpu()
-                n_zero = (raw_visits == 0).sum().item()
-                total_visits = raw_visits.sum().item()
-
-                log.write(f"  Total walker visits: {total_visits:,.0f}\n")
-                log.write(f"  Tokens never visited: {n_zero} ({100*n_zero/q_len:.1f}%)\n")
-
-                if n_zero > q_len * 0.8:
-                    log.write(f"    ⚠️  WARNING: >80% of tokens never visited!\n")
-                    log.write(f"        Walkers may not be reaching middle/early positions.\n")
-
-                # Visit distribution by quartile
-                q1_visits = raw_visits[:q_len//4].sum().item()
-                q2_visits = raw_visits[q_len//4:q_len//2].sum().item()
-                q3_visits = raw_visits[q_len//2:3*q_len//4].sum().item()
-                q4_visits = raw_visits[3*q_len//4:].sum().item()
-
-                log.write(f"  Visit distribution by quartile:\n")
-                log.write(f"    Q1 (early):  {q1_visits:8.0f} ({100*q1_visits/max(total_visits,1):5.1f}%)\n")
-                log.write(f"    Q2:          {q2_visits:8.0f} ({100*q2_visits/max(total_visits,1):5.1f}%)\n")
-                log.write(f"    Q3:          {q3_visits:8.0f} ({100*q3_visits/max(total_visits,1):5.1f}%)\n")
-                log.write(f"    Q4 (query):  {q4_visits:8.0f} ({100*q4_visits/max(total_visits,1):5.1f}%)\n")
-
-            except Exception as e:
-                log.write(f"  [Error getting raw visits: {e}]\n")
-            log.write("\n")
+            total_attn_mass = attn_row.sum().item()
+            kept_attn_mass = sum(attn_row[p].item() for p in kept_positions if p < q_len)
+            log.write(f"total_attn_mass={total_attn_mass:.6f}\n")
+            log.write(f"kept_attn_mass={kept_attn_mass:.6f}\n")
+            log.write(f"kept_attn_pct={100*kept_attn_mass/max(total_attn_mass,1e-8):.1f}\n")
 
             # =====================================================================
-            # 6. EVICTION DECISION SUMMARY
+            # SNAPKV COMPARISON
             # =====================================================================
-            log.write(f"📋 EVICTION SUMMARY:\n")
-            log.write(f"  Kept: {len(kept_positions)} tokens\n")
-            log.write(f"  Evicted: {len(evicted_positions)} tokens\n")
+            log.write(f"\n[SNAPKV_COMPARISON]\n")
+            snapkv_budget = self.max_capacity_prompt - self.window_size - self.sink_size
+            middle_start = self.sink_size
+            middle_end = q_len - self.window_size
 
-            # Top regrettable evictions (high combined score but evicted)
-            evicted_with_scores = [(pos, combined_ranks[pos].item(), h2o_ranks[pos].item(), influence_ranks[pos].item())
-                                   for pos in evicted_positions]
+            if snapkv_budget > 0 and middle_end > middle_start:
+                snapkv_scores = h2o_cpu.clone()
+                if len(snapkv_scores) > 5:
+                    snapkv_scores_smooth = F.avg_pool1d(
+                        snapkv_scores.unsqueeze(0).unsqueeze(0),
+                        kernel_size=5, padding=2, stride=1
+                    ).squeeze()
+                else:
+                    snapkv_scores_smooth = snapkv_scores
+
+                snapkv_middle = snapkv_scores_smooth[middle_start:middle_end]
+                _, snapkv_topk_idx = torch.topk(snapkv_middle, min(snapkv_budget, len(snapkv_middle)))
+                snapkv_selected = set((snapkv_topk_idx + middle_start).tolist())
+                circuitkv_middle = set(p for p in kept_positions if middle_start <= p < middle_end)
+
+                overlap = circuitkv_middle & snapkv_selected
+                only_ckv = circuitkv_middle - snapkv_selected
+                only_snap = snapkv_selected - circuitkv_middle
+
+                log.write(f"snapkv_would_select={len(snapkv_selected)}\n")
+                log.write(f"circuitkv_selected={len(circuitkv_middle)}\n")
+                log.write(f"overlap={len(overlap)}\n")
+                log.write(f"only_circuitkv={len(only_ckv)}\n")
+                log.write(f"only_snapkv={len(only_snap)}\n")
+                log.write(f"overlap_pct={100*len(overlap)/max(len(snapkv_selected),1):.1f}\n")
+
+                if len(only_ckv) > 0:
+                    log.write(f"circuitkv_only_positions={sorted(only_ckv)[:20]}\n")
+                if len(only_snap) > 0:
+                    log.write(f"snapkv_only_positions={sorted(only_snap)[:20]}\n")
+
+            # =====================================================================
+            # EVICTION DETAILS
+            # =====================================================================
+            log.write(f"\n[TOP_EVICTIONS] (highest-scored tokens that were evicted)\n")
+            evicted_with_scores = [(pos, combined_cpu[pos].item()) for pos in evicted_positions if pos < q_len]
             evicted_with_scores.sort(key=lambda x: x[1], reverse=True)
+            for pos, score in evicted_with_scores[:20]:
+                region = "early" if pos < q_len//4 else "mid" if pos < 3*q_len//4 else "late"
+                log.write(f"pos={pos} combined={score:.6f} region={region}\n")
 
-            log.write(f"\n  🔥 TOP 15 POTENTIALLY REGRETTABLE EVICTIONS:\n")
-            log.write(f"  {'Pos':<6} {'Combined':<10} {'H2O Rank':<10} {'Inf Rank':<10} {'Region':<15}\n")
-            for pos, comb, h2o_r, inf_r in evicted_with_scores[:15]:
-                region = "early" if pos < q_len//4 else "middle" if pos < 3*q_len//4 else "late"
-                log.write(f"  {pos:<6} {comb:<10.3f} {h2o_r:<10.3f} {inf_r:<10.3f} {region:<15}\n")
+            # =====================================================================
+            # SCORE DISCRIMINATION
+            # =====================================================================
+            log.write(f"\n[SCORE_DISCRIMINATION]\n")
+            kept_scores = torch.tensor([combined_cpu[p].item() for p in kept_positions if p < q_len])
+            evicted_scores = torch.tensor([combined_cpu[p].item() for p in evicted_positions if p < q_len])
 
-            log.write("\n" + "-"*80 + "\n")
+            if len(kept_scores) > 0 and len(evicted_scores) > 0:
+                log.write(f"kept_mean={kept_scores.mean().item():.6f}\n")
+                log.write(f"evicted_mean={evicted_scores.mean().item():.6f}\n")
+                log.write(f"score_gap={kept_scores.mean().item() - evicted_scores.mean().item():.6f}\n")
+                log.write(f"kept_min={kept_scores.min().item():.6f}\n")
+                log.write(f"evicted_max={evicted_scores.max().item():.6f}\n")
+
+                if evicted_scores.max() > kept_scores.min():
+                    n_bad_evict = (evicted_scores > kept_scores.min()).sum().item()
+                    log.write(f"score_overlap_count={n_bad_evict}\n")
+                else:
+                    log.write(f"score_overlap_count=0\n")
+
+            # =====================================================================
+            # ISSUE FLAGS
+            # =====================================================================
+            log.write(f"\n[ISSUE_FLAGS]\n")
+            issues = []
+            if middle_coverage < 10:
+                issues.append("LOW_MIDDLE_COVERAGE")
+            if attn_top_kept < 7:
+                issues.append("MISSING_HIGH_ATTN_TOKENS")
+            if kept_attn_mass / max(total_attn_mass, 1e-8) < 0.7:
+                issues.append("LOW_ATTN_MASS_CAPTURED")
+            if qi_scores is not None and hi_scores is not None:
+                if qi_wins > 0.8 * q_len:
+                    issues.append("QI_OVER_DOMINATES")
+                if hi_wins > 0.8 * q_len:
+                    issues.append("HI_OVER_DOMINATES")
+            log.write(f"issues={issues}\n")
+
+            log.write(f"\n{'='*60}\n\n")
             log.flush()
 
     def _lazy_init(self, device, seq_len: int):
@@ -2593,7 +2638,10 @@ class CircuitKVCluster():
             if self.debug:
                 # Compute H2O scores (column sums) for comparison
                 h2o_scores_debug = full_attn.sum(dim=0)
-                self._log_debug(q_len, h2o_scores_debug, scores, keep_mask, full_attn)
+                # Pass HI and QI if available (from DIS mode)
+                qi_debug = locals().get('qi_scores', None)
+                hi_debug = locals().get('hi_scores', None)
+                self._log_debug(q_len, h2o_scores_debug, scores, keep_mask, full_attn, qi_debug, hi_debug)
 
             # Apply eviction - shared across all heads
             # Get indices of tokens to keep (excluding local window which is appended)
