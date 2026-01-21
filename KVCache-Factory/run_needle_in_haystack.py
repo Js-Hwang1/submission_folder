@@ -287,13 +287,13 @@ class LLMNeedleHaystackTester:
         prompt = self.generate_prompt(context)
         test_start_time = time.time()
         
-        if(self.model_provider in ["LLaMA3", "Mistral"]):
+        if(self.model_provider in ["LLaMA3", "Mistral", "Qwen"]):
 
             prompt = self.enc(prompt, return_tensors="pt")
             input_ids = prompt['input_ids'].to(self.model_to_test.device)
-            
+
             output_ids = self.model_to_test.generate(
-                input_ids, 
+                input_ids,
                 output_attentions=False,
                 max_new_tokens=30,
                 num_beams=1,

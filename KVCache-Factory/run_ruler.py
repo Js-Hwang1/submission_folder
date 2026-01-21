@@ -10,8 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List
 
 
-context_length_list = [4096]
-# context_length_list = [4096, 8192, 16384]
+context_length_list = [4096, 8192, 16384]
 
 datasets = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
             "niah_multiquery", "niah_multivalue", "cwe", "fwe", "vt"]

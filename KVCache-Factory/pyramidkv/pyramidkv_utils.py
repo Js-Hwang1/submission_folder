@@ -1191,12 +1191,26 @@ def init_headkv(self):
 
 class CircuitKVCluster():
     """
-    CircuitKV v4.3.0: Unified Dual-Importance via Absorbing Markov Chains.
+    CircuitKV v4.5.0: Sparse Attention & Adaptive Normalization.
 
     This class implements importance scoring for KV cache eviction using
     the FUNDAMENTAL MATRIX of absorbing Markov chains.
 
-    v4.3.0 Key Innovation - UNIFIED IMPORTANCE SCORING:
+    v4.5.0 Key Improvements:
+    1. SPARSE ATTENTION: Instead of approximating the prefix attention with H2O
+       heuristics, we sample real attention at multiple positions. This provides
+       anchors of ground truth throughout the sequence, significantly improving
+       the accuracy of the Neumann series computation.
+
+    2. ADAPTIVE NORMALIZATION: Instead of rank normalization (which loses magnitude
+       information), we use percentile normalization with confidence weighting.
+       This preserves the signal strength and allows the more confident signal
+       (QI or HI) to dominate the combination.
+
+    3. SPATIAL SMOOTHING: Apply avgpool smoothing for spatial coherence. Nearby
+       tokens often form coherent units (phrases, entities, code blocks).
+
+    Core Algorithm - UNIFIED IMPORTANCE SCORING (from v4.3):
     Both importance signals derived from the SAME mathematical object (N):
 
     1. QUERY IMPORTANCE (QI): N[q, j] = expected visits FROM query to j
@@ -1207,42 +1221,34 @@ class CircuitKVCluster():
        - "How central is j in the overall information flow network?"
        - Captures globally important "hub" tokens (multi-hop, not one-hop H2O)
 
-    Final Score: MAX(QI_rank, HI_rank)
-    - Keeps token if EITHER query-relevant OR globally central
-    - "OR logic" is more robust than geometric mean's "AND logic"
-    - Both signals from same theory (cleaner than mixing H2O with QI)
-
     Evolution:
     - v4.0: MAX(H2O, QI) - H2O from A (one-hop), QI from N (multi-hop)
     - v4.2: √(QI × HI) - both from N, but geometric mean too selective
-    - v4.3: MAX(HI, QI) - both from N, with robust OR logic ← CURRENT
+    - v4.3: MAX(HI, QI) - both from N, with robust OR logic
+    - v4.5: Sparse attention + adaptive normalization + spatial smoothing ← CURRENT
 
     Mathematical Foundation:
     - Attention matrix A defines transition probabilities P[i,j]
     - Q = transition matrix among transient states (non-sink tokens)
     - N = (I - Q)^{-1} = fundamental matrix of absorbing chain
     - Computed via Neumann series: I + Q + Q² + ... + Q^k
-
-    Combination Modes (combination_mode parameter):
-    - "dis": MAX(HI, QI) - v4.3.0, both from fundamental matrix N
-    - "max": MAX(H2O, QI) - v4.0.0, H2O from attention, QI from N
-    - "weighted": α * H2O + (1-α) * QI - v4.1.0
-
-    Why v4.3 (dis) > v4.0 (max):
-    - v4.0 mixes one-hop (H2O) with multi-hop (QI) - different theories
-    - v4.3 uses multi-hop for BOTH signals - unified theory
-    - HI captures bridge tokens that H2O misses
+    - v4.5: Attention matrix now includes REAL attention at sampled positions
 
     Configuration:
     - combination_mode: "dis" (recommended), "max", or "weighted"
     - neumann_iterations: Neumann series iterations (default: 10)
     - neumann_temperature: Attention sharpening (default: 1.0, lower = sharper)
     - sink_size: Absorbing boundary (default: 4)
+    - use_sparse_attention: Use real attention at sampled positions (default: True)
+    - sparse_sample_ratio: Fraction of prefix to sample (default: 0.1)
+    - normalization_mode: "adaptive", "percentile", or "rank" (default: "adaptive")
+    - use_spatial_smoothing: Apply avgpool smoothing (default: True)
+    - smoothing_kernel_size: Kernel size for smoothing (default: 5)
     """
 
     def __init__(
         self,
-        window_size: int = 32,
+        window_size: int = 64,  # Match SnapKV's window size for fair comparison
         max_capacity_prompt: int = 2048,
         kernel_size: int = 5,
         pooling: str = 'avgpool',
@@ -1294,6 +1300,13 @@ class CircuitKVCluster():
         # v4.4.0: Per-head eviction (like SnapKV)
         per_head_eviction: bool = False,  # If True, each head keeps different tokens
         per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
+        # v4.5.0: Sparse Attention & Improved Normalization
+        use_sparse_attention: bool = True,  # Use real attention at sampled positions instead of H2O approximation
+        sparse_sample_ratio: float = 0.1,  # Fraction of prefix positions to sample (0.1 = 10%)
+        sparse_min_samples: int = 32,  # Minimum number of samples regardless of ratio
+        normalization_mode: str = "adaptive",  # "rank", "percentile", or "adaptive"
+        use_spatial_smoothing: bool = True,  # Apply avgpool smoothing for spatial coherence
+        smoothing_kernel_size: int = 5,  # Kernel size for spatial smoothing
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1324,6 +1337,13 @@ class CircuitKVCluster():
         # v4.4.0: Per-head eviction
         self.per_head_eviction = per_head_eviction
         self.per_head_hi_weight = per_head_hi_weight
+        # v4.5.0: Sparse Attention & Improved Normalization
+        self.use_sparse_attention = use_sparse_attention
+        self.sparse_sample_ratio = sparse_sample_ratio
+        self.sparse_min_samples = sparse_min_samples
+        self.normalization_mode = normalization_mode
+        self.use_spatial_smoothing = use_spatial_smoothing
+        self.smoothing_kernel_size = smoothing_kernel_size
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1665,6 +1685,327 @@ class CircuitKVCluster():
         if n <= 1:
             return torch.ones_like(ranks)
         return ranks / (n - 1)
+
+    def _percentile_normalize(self, scores: torch.Tensor) -> torch.Tensor:
+        """
+        v4.5.0: Percentile normalization that preserves magnitude differences.
+
+        Unlike rank normalization which loses magnitude info, percentile normalization
+        maps scores to [0, 1] while preserving relative differences.
+
+        Args:
+            scores: Raw scores [seq_len]
+
+        Returns:
+            Percentile-normalized scores in [0, 1]
+        """
+        min_val = scores.min()
+        max_val = scores.max()
+        range_val = max_val - min_val
+
+        if range_val < 1e-8:
+            # All scores nearly equal - return uniform
+            return torch.ones_like(scores) * 0.5
+
+        return (scores - min_val) / range_val
+
+    def _adaptive_normalize(
+        self,
+        scores: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
+        """
+        v4.5.0: Adaptive normalization with confidence estimation.
+
+        Combines percentile normalization with a confidence measure indicating
+        how spread out the scores are. High confidence means clear ranking;
+        low confidence means ambiguous/uniform scores.
+
+        The confidence can be used to weight signals when combining QI and HI:
+        - If QI has high confidence, it should dominate
+        - If both have low confidence, use equal weighting
+
+        Args:
+            scores: Raw scores [seq_len]
+
+        Returns:
+            Tuple of (normalized_scores, confidence)
+            - normalized_scores: [0, 1] normalized scores
+            - confidence: [0, 1] indicating score spread (1 = very spread, 0 = uniform)
+        """
+        min_val = scores.min()
+        max_val = scores.max()
+        range_val = max_val - min_val
+        mean_val = scores.mean()
+
+        if range_val < 1e-8:
+            return torch.ones_like(scores) * 0.5, 0.0
+
+        # Percentile normalization
+        normalized = (scores - min_val) / range_val
+
+        # Confidence: coefficient of variation (std/mean) clamped to [0, 1]
+        # High CV means scores are spread out (high confidence in ranking)
+        std_val = scores.std()
+        if mean_val.abs() < 1e-8:
+            confidence = 0.0
+        else:
+            cv = (std_val / mean_val.abs()).item()
+            # Map CV to [0, 1]: CV of 0 -> conf 0, CV of 1+ -> conf ~1
+            confidence = min(1.0, cv)
+
+        return normalized, confidence
+
+    def _compute_sparse_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        window_attn: torch.Tensor,
+        q_len: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        """
+        v4.5.0: Build attention matrix using sparse sampling for prefix region.
+
+        Instead of approximating the entire prefix with H2O-weighted heuristics,
+        we compute REAL attention at sampled positions and use nearest-neighbor
+        assignment for the rest. This provides anchors of ground truth throughout
+        the sequence, improving the quality of the Neumann series computation.
+
+        Sampling Strategy:
+        - Uniform base sampling for coverage
+        - H2O-guided sampling to capture high-importance positions
+
+        Args:
+            query_states: [bsz, num_heads, seq_len, head_dim]
+            key_states: [bsz, num_heads, seq_len, head_dim]
+            window_attn: [window_size, seq_len] - already computed window attention (averaged)
+            q_len: sequence length
+            head_dim: head dimension for scaling
+
+        Returns:
+            full_attn: [seq_len, seq_len] attention matrix with real sparse samples
+        """
+        device = query_states.device
+        dtype = query_states.dtype
+        bsz = query_states.shape[0]
+        num_heads = query_states.shape[1]
+        n_prefix = q_len - self.window_size
+
+        # Initialize full attention matrix
+        full_attn = torch.zeros(q_len, q_len, device=device, dtype=torch.float32)
+
+        # Fill window portion with real attention (already computed)
+        full_attn[-self.window_size:, :] = window_attn
+
+        if n_prefix <= 0:
+            return full_attn
+
+        # Determine number of samples
+        n_samples = max(self.sparse_min_samples, int(n_prefix * self.sparse_sample_ratio))
+        n_samples = min(n_samples, n_prefix)  # Can't sample more than available
+
+        # Compute H2O scores from window attention for guided sampling
+        h2o_scores = window_attn.sum(dim=0)[:n_prefix]  # [n_prefix]
+
+        # === Sampling Strategy: Hybrid uniform + H2O-guided ===
+        n_uniform = (n_samples + 1) // 2  # Half uniform
+        n_h2o = n_samples - n_uniform      # Half H2O-guided
+
+        # Uniform samples: evenly spaced through prefix
+        if n_uniform > 0:
+            uniform_indices = torch.linspace(0, n_prefix - 1, steps=n_uniform, device=device).long()
+        else:
+            uniform_indices = torch.tensor([], device=device, dtype=torch.long)
+
+        # H2O-guided samples: top positions by H2O score, with spacing
+        if n_h2o > 0 and n_prefix > n_h2o:
+            # Get top H2O positions
+            _, h2o_sorted_idx = h2o_scores.sort(descending=True)
+            # Take every other one to avoid clustering
+            h2o_indices = h2o_sorted_idx[::2][:n_h2o]
+        else:
+            h2o_indices = torch.tensor([], device=device, dtype=torch.long)
+
+        # Combine and deduplicate
+        sample_indices = torch.cat([uniform_indices, h2o_indices])
+        sample_indices = torch.unique(sample_indices, sorted=True)
+        n_actual_samples = sample_indices.shape[0]
+
+        if n_actual_samples == 0:
+            # Fallback: use H2O approximation (current behavior)
+            return self._compute_h2o_approximate_attention(window_attn, q_len, device)
+
+        # === Compute Real Attention for Sampled Positions ===
+        # Extract queries at sampled positions
+        sampled_queries = query_states[:, :, sample_indices, :]  # [bsz, num_heads, n_samples, head_dim]
+
+        # Compute attention scores: sampled queries attend to all keys
+        sampled_attn_logits = torch.matmul(
+            sampled_queries,
+            key_states.transpose(2, 3)
+        ) / math.sqrt(head_dim)  # [bsz, num_heads, n_samples, seq_len]
+
+        # Apply causal mask: each sampled position can only attend to positions <= itself
+        # Create mask: [n_samples, seq_len] where mask[i, j] = True if j > sample_indices[i]
+        sample_positions = sample_indices.unsqueeze(1)  # [n_samples, 1]
+        all_positions = torch.arange(q_len, device=device).unsqueeze(0)  # [1, seq_len]
+        causal_mask = all_positions > sample_positions  # [n_samples, seq_len]
+
+        # Apply mask
+        sampled_attn_logits = sampled_attn_logits.masked_fill(
+            causal_mask.unsqueeze(0).unsqueeze(0),  # [1, 1, n_samples, seq_len]
+            float('-inf')
+        )
+
+        # Softmax to get attention probabilities
+        sampled_attn = F.softmax(sampled_attn_logits, dim=-1, dtype=torch.float32)
+
+        # Average across batch and heads
+        sampled_attn_avg = sampled_attn.mean(dim=(0, 1))  # [n_samples, seq_len]
+
+        # === Fill Full Attention Matrix ===
+        # First, fill sampled rows with real attention
+        full_attn[sample_indices, :] = sampled_attn_avg
+
+        # For non-sampled prefix positions, use nearest-neighbor from sampled rows
+        # Build mapping: for each prefix position, find nearest sampled position
+        all_prefix_positions = torch.arange(n_prefix, device=device).float()
+        sample_positions_float = sample_indices.float()
+
+        # Compute distances: [n_prefix, n_samples]
+        distances = torch.abs(
+            all_prefix_positions.unsqueeze(1) - sample_positions_float.unsqueeze(0)
+        )
+
+        # Find nearest sample for each position
+        nearest_sample_idx = distances.argmin(dim=1)  # [n_prefix]
+
+        # For non-sampled positions, copy from nearest sample and apply correct causal mask
+        sample_indices_set = set(sample_indices.tolist())
+
+        for pos in range(n_prefix):
+            if pos in sample_indices_set:
+                continue  # Already has real attention
+
+            # Get nearest sampled attention row
+            nearest_idx = nearest_sample_idx[pos].item()
+            nearest_attn = sampled_attn_avg[nearest_idx].clone()
+
+            # Apply causal mask for this position (can only attend to 0..pos)
+            nearest_attn[pos + 1:] = 0.0
+
+            # Renormalize to sum to 1
+            row_sum = nearest_attn[:pos + 1].sum()
+            if row_sum > 1e-8:
+                nearest_attn[:pos + 1] /= row_sum
+            else:
+                # Fallback: uniform attention
+                nearest_attn[:pos + 1] = 1.0 / (pos + 1)
+
+            full_attn[pos, :] = nearest_attn
+
+        return full_attn
+
+    def _compute_h2o_approximate_attention(
+        self,
+        window_attn: torch.Tensor,
+        q_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Fallback: Build attention matrix using H2O-weighted approximation.
+
+        This is the original v4.3 approach - used as fallback when sparse
+        sampling is disabled or fails.
+
+        Args:
+            window_attn: [window_size, seq_len] window attention
+            q_len: sequence length
+            device: torch device
+
+        Returns:
+            full_attn: [seq_len, seq_len] approximated attention matrix
+        """
+        full_attn = torch.zeros(q_len, q_len, device=device, dtype=torch.float32)
+
+        # Fill window portion
+        full_attn[-self.window_size:, :] = window_attn
+
+        n_prefix = q_len - self.window_size
+        if n_prefix <= 1:
+            return full_attn
+
+        # H2O scores from window attention
+        h2o_scores = window_attn.sum(dim=0)  # [seq_len]
+        h2o_prefix = h2o_scores[:n_prefix].clone()
+        h2o_prefix = h2o_prefix.clamp(min=1e-6)
+
+        # Build H2O-weighted transition matrix for prefix
+        # P[i,j] = h2o[j] / sum(h2o[0:i]) for j < i
+        cumsum = h2o_prefix.cumsum(dim=0)
+        denom = torch.zeros(n_prefix, device=device, dtype=torch.float32)
+        denom[1:] = cumsum[:-1]
+        denom[0] = 1.0  # Avoid div-by-zero
+
+        h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
+        denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
+
+        h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
+
+        # Apply causal mask
+        causal_mask = torch.tril(
+            torch.ones(n_prefix, n_prefix, device=device, dtype=torch.float32),
+            diagonal=-1
+        )
+        full_attn[:n_prefix, :n_prefix] = h2o_trans * causal_mask
+
+        return full_attn
+
+    def _apply_spatial_smoothing(
+        self,
+        scores: torch.Tensor,
+        kernel_size: int = 5,
+    ) -> torch.Tensor:
+        """
+        v4.5.0: Apply spatial smoothing via average pooling.
+
+        Nearby tokens often form coherent units (phrases, entities, code blocks).
+        Spatial smoothing encourages keeping contiguous regions rather than
+        scattered individual tokens.
+
+        Args:
+            scores: Importance scores [seq_len]
+            kernel_size: Pooling kernel size (default 5)
+
+        Returns:
+            Smoothed scores [seq_len]
+        """
+        if kernel_size <= 1:
+            return scores
+
+        # Reshape for 1D pooling: [1, 1, seq_len]
+        scores_3d = scores.unsqueeze(0).unsqueeze(0)
+
+        # Apply average pooling with same padding
+        padding = kernel_size // 2
+        smoothed = F.avg_pool1d(
+            scores_3d,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding
+        )
+
+        # Handle edge case where output size differs due to padding
+        smoothed = smoothed.squeeze()
+        if smoothed.shape[0] != scores.shape[0]:
+            # Truncate or pad to match original size
+            if smoothed.shape[0] > scores.shape[0]:
+                smoothed = smoothed[:scores.shape[0]]
+            else:
+                pad_size = scores.shape[0] - smoothed.shape[0]
+                smoothed = F.pad(smoothed, (0, pad_size), value=smoothed[-1].item())
+
+        return smoothed
 
     def _compute_influence_neumann(
         self,
@@ -2246,7 +2587,11 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        print(f"CircuitKV v4.4.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
+        # v4.5.0 feature flags
+        attn_mode = "SparseAttn" if self.use_sparse_attention else "H2OApprox"
+        norm_mode = self.normalization_mode
+        smooth_info = f" smooth={self.smoothing_kernel_size}" if self.use_spatial_smoothing else ""
+        print(f"CircuitKV v4.5.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}, {attn_mode}, norm={norm_mode}{smooth_info}{ablation_info}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2285,45 +2630,30 @@ class CircuitKVCluster():
 
         attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
 
-        # Build full attention matrix approximation
-        # For positions outside the window, use uniform causal attention
-        full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
-
-        # Fill the window portion with actual attention
-        full_attn[-self.window_size:, :] = attn_avg
-
-        # For positions outside window, use H2O-WEIGHTED transitions (not uniform)
-        # This guides walkers toward high-attention tokens instead of random backward jumps
-        n_prefix = q_len - self.window_size
-        if n_prefix > 1:
-            # Compute H2O scores (column sums) from window attention
-            # This captures how much recent tokens attend to each position
-            h2o_scores = attn_avg.sum(dim=0)  # [seq_len]
-            h2o_prefix = h2o_scores[:n_prefix].clone()
-
-            # Ensure positive scores (add small epsilon to avoid zeros)
-            h2o_prefix = h2o_prefix.clamp(min=1e-6)
-
-            # For row i, transition prob to j = h2o[j] / sum(h2o[0:i]) for j < i
-            # This creates a valid probability distribution that sums to 1
-            cumsum = h2o_prefix.cumsum(dim=0)  # [n_prefix]
-
-            # denom[i] = sum(h2o[0:i]) = cumsum[i-1]
-            denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
-            denom[1:] = cumsum[:-1]
-            denom[0] = 1.0  # Avoid div-by-zero (row 0 masked anyway)
-
-            # Broadcast to create transition matrix
-            # h2o_expanded[i,j] = h2o[j] for all i
-            h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
-            denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
-
-            # P[i,j] = h2o[j] / sum(h2o[0:i])
-            h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
-
-            # Apply causal mask (only attend to strictly previous positions)
-            mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
-            full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
+        # =====================================================================
+        # v4.5.0: Build full attention matrix
+        # Two modes:
+        # - Sparse Attention: Sample real attention at prefix positions (accurate)
+        # - H2O Approximation: Use H2O-weighted heuristic (fast, less accurate)
+        # =====================================================================
+        if self.use_sparse_attention:
+            # v4.5.0: Sparse attention with real Q·K^T at sampled positions
+            # This provides anchors of ground truth throughout the prefix,
+            # significantly improving the Neumann series computation quality.
+            full_attn = self._compute_sparse_attention(
+                query_states=query_states,
+                key_states=key_states,
+                window_attn=attn_avg,
+                q_len=q_len,
+                head_dim=head_dim,
+            )
+        else:
+            # Legacy: H2O-weighted approximation for prefix
+            full_attn = self._compute_h2o_approximate_attention(
+                window_attn=attn_avg,
+                q_len=q_len,
+                device=key_states.device,
+            )
 
         # =====================================================================
         # STEP 2: Compute Importance Scores
@@ -2345,9 +2675,29 @@ class CircuitKVCluster():
                 temperature=self.neumann_temperature,
             )
 
-            # Rank normalize both
-            qi_rank = self._rank_normalize(qi_scores)
-            hi_rank = self._rank_normalize(hi_scores)
+            # v4.5.0: Configurable normalization mode
+            if self.normalization_mode == "adaptive":
+                # Adaptive normalization with confidence weighting
+                qi_norm, qi_conf = self._adaptive_normalize(qi_scores)
+                hi_norm, hi_conf = self._adaptive_normalize(hi_scores)
+
+                # Use confidence to weight the combination
+                # If one signal has much higher confidence, favor it
+                total_conf = qi_conf + hi_conf + 1e-8
+                qi_weight = 0.5 + 0.3 * (qi_conf - hi_conf) / total_conf  # Range: [0.2, 0.8]
+                qi_weight = max(0.2, min(0.8, qi_weight))  # Clamp
+                hi_weight = 1.0 - qi_weight
+
+                qi_rank = qi_norm
+                hi_rank = hi_norm
+            elif self.normalization_mode == "percentile":
+                # Percentile normalization (preserves magnitude)
+                qi_rank = self._percentile_normalize(qi_scores)
+                hi_rank = self._percentile_normalize(hi_scores)
+            else:
+                # Default: rank normalization (original behavior)
+                qi_rank = self._rank_normalize(qi_scores)
+                hi_rank = self._rank_normalize(hi_scores)
 
             # v4.3.1: Ablation support - zero out one signal for A1 experiment
             if self.ablate_qi:
@@ -2364,6 +2714,9 @@ class CircuitKVCluster():
             elif self.combination_mode == "sum":
                 # Weighted sum: 0.5*QI + 0.5*HI
                 combined_scores = 0.5 * qi_rank + 0.5 * hi_rank
+            elif self.normalization_mode == "adaptive":
+                # v4.5.0: Confidence-weighted combination
+                combined_scores = qi_weight * qi_rank + hi_weight * hi_rank
             else:
                 # Default "dis": MAX(HI, QI) - OR logic (keeps if EITHER is high)
                 combined_scores = torch.maximum(qi_rank, hi_rank)
@@ -2455,6 +2808,17 @@ class CircuitKVCluster():
                     print(f"  [v3.0.0] Detected {len(self._instruction_anchors)} instruction anchors, boosted {num_boosted}")
             except Exception as e:
                 print(f"  [v3.0.0] Anchor detection failed: {e}")
+
+        # =====================================================================
+        # v4.5.0: Spatial Smoothing
+        # Apply avgpool smoothing for spatial coherence - nearby tokens often
+        # form coherent units (phrases, entities, code blocks)
+        # =====================================================================
+        if self.use_spatial_smoothing and self.smoothing_kernel_size > 1:
+            combined_scores = self._apply_spatial_smoothing(
+                combined_scores,
+                kernel_size=self.smoothing_kernel_size,
+            )
 
         # Expand to full buffer size
         scores = torch.zeros_like(influence_scores)
