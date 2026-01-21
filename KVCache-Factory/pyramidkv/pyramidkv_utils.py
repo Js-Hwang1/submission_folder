@@ -1302,8 +1302,8 @@ class CircuitKVCluster():
         per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
         # v4.5.0: Sparse Attention & Improved Normalization
         use_sparse_attention: bool = True,  # Use real attention at sampled positions instead of H2O approximation
-        sparse_sample_ratio: float = 0.1,  # Fraction of prefix positions to sample (0.1 = 10%)
-        sparse_min_samples: int = 32,  # Minimum number of samples regardless of ratio
+        sparse_sample_ratio: float = 0.02,  # Fraction of prefix positions to sample (0.02 = 2%)
+        sparse_min_samples: int = 16,  # Minimum number of samples regardless of ratio
         normalization_mode: str = "adaptive",  # "rank", "percentile", or "adaptive"
         use_spatial_smoothing: bool = True,  # Apply avgpool smoothing for spatial coherence
         smoothing_kernel_size: int = 5,  # Kernel size for spatial smoothing
@@ -1375,6 +1375,7 @@ class CircuitKVCluster():
         self._accumulated_charge = None
         self._h2o_scores = None  # Store H2O scores for MAX combination
         self._prefill_initialized = False
+        self._printed_version = False  # v4.5.0: Print version info only once
 
         # Initialize debug log file
         if self.debug:
@@ -1745,13 +1746,10 @@ class CircuitKVCluster():
 
         # Confidence: coefficient of variation (std/mean) clamped to [0, 1]
         # High CV means scores are spread out (high confidence in ranking)
+        # Note: Keep as tensor operations to avoid GPU-CPU sync
         std_val = scores.std()
-        if mean_val.abs() < 1e-8:
-            confidence = 0.0
-        else:
-            cv = (std_val / mean_val.abs()).item()
-            # Map CV to [0, 1]: CV of 0 -> conf 0, CV of 1+ -> conf ~1
-            confidence = min(1.0, cv)
+        cv = std_val / (mean_val.abs() + 1e-8)
+        confidence = torch.clamp(cv, 0.0, 1.0)
 
         return normalized, confidence
 
@@ -1863,7 +1861,7 @@ class CircuitKVCluster():
         # Average across batch and heads
         sampled_attn_avg = sampled_attn.mean(dim=(0, 1))  # [n_samples, seq_len]
 
-        # === Fill Full Attention Matrix ===
+        # === Fill Full Attention Matrix (Fully Vectorized) ===
         # First, fill sampled rows with real attention
         full_attn[sample_indices, :] = sampled_attn_avg
 
@@ -1880,29 +1878,36 @@ class CircuitKVCluster():
         # Find nearest sample for each position
         nearest_sample_idx = distances.argmin(dim=1)  # [n_prefix]
 
-        # For non-sampled positions, copy from nearest sample and apply correct causal mask
-        sample_indices_set = set(sample_indices.tolist())
+        # === Vectorized fill for non-sampled positions ===
+        # Create mask for which positions are sampled vs need interpolation
+        is_sampled = torch.zeros(n_prefix, dtype=torch.bool, device=device)
+        is_sampled[sample_indices[sample_indices < n_prefix]] = True
+        non_sampled_mask = ~is_sampled
 
-        for pos in range(n_prefix):
-            if pos in sample_indices_set:
-                continue  # Already has real attention
+        # Get indices of non-sampled positions
+        non_sampled_indices = torch.nonzero(non_sampled_mask, as_tuple=True)[0]
 
-            # Get nearest sampled attention row
-            nearest_idx = nearest_sample_idx[pos].item()
-            nearest_attn = sampled_attn_avg[nearest_idx].clone()
+        if non_sampled_indices.numel() > 0:
+            # Get nearest neighbor attention for all non-sampled positions at once
+            # nearest_sample_idx[non_sampled_indices] gives which sample to copy from
+            nn_indices = nearest_sample_idx[non_sampled_indices]  # [num_non_sampled]
+            prefix_attn = sampled_attn_avg[nn_indices]  # [num_non_sampled, seq_len]
 
-            # Apply causal mask for this position (can only attend to 0..pos)
-            nearest_attn[pos + 1:] = 0.0
+            # Create causal mask: position i can only attend to 0..i
+            # non_sampled_indices tells us the actual position in the sequence
+            row_positions = non_sampled_indices.unsqueeze(1)  # [num_non_sampled, 1]
+            col_positions = torch.arange(q_len, device=device).unsqueeze(0)  # [1, seq_len]
+            causal_mask = col_positions > row_positions  # [num_non_sampled, seq_len]
 
-            # Renormalize to sum to 1
-            row_sum = nearest_attn[:pos + 1].sum()
-            if row_sum > 1e-8:
-                nearest_attn[:pos + 1] /= row_sum
-            else:
-                # Fallback: uniform attention
-                nearest_attn[:pos + 1] = 1.0 / (pos + 1)
+            # Apply causal mask
+            prefix_attn = prefix_attn.masked_fill(causal_mask, 0.0)
 
-            full_attn[pos, :] = nearest_attn
+            # Renormalize each row to sum to 1
+            row_sums = prefix_attn.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            prefix_attn = prefix_attn / row_sums
+
+            # Fill into full_attn
+            full_attn[non_sampled_indices, :] = prefix_attn
 
         return full_attn
 
@@ -2002,8 +2007,10 @@ class CircuitKVCluster():
             if smoothed.shape[0] > scores.shape[0]:
                 smoothed = smoothed[:scores.shape[0]]
             else:
+                # Pad with last value (replicate padding)
                 pad_size = scores.shape[0] - smoothed.shape[0]
-                smoothed = F.pad(smoothed, (0, pad_size), value=smoothed[-1].item())
+                last_val = smoothed[-1:].expand(pad_size)
+                smoothed = torch.cat([smoothed, last_val], dim=0)
 
         return smoothed
 
@@ -2103,10 +2110,7 @@ class CircuitKVCluster():
         for _ in range(num_iterations):
             v = torch.mv(Q.t(), v)  # Q^T @ v - gives row q of Q^k
             result = result + v
-
-            # Early stopping if converged
-            if v.abs().max().item() < 1e-8:
-                break
+            # Note: Removed early stopping check - the .item() call caused GPU-CPU sync
 
         # =====================================================================
         # STEP 4: Map back to full sequence and normalize
@@ -2225,10 +2229,8 @@ class CircuitKVCluster():
             v_hi = torch.mv(Q.t(), v_hi)
             result_qi = result_qi + v_qi
             result_hi = result_hi + v_hi
-
-            # Early stopping if both converged
-            if v_qi.abs().max().item() < 1e-8 and v_hi.abs().max().item() < 1e-8:
-                break
+            # Note: Removed early stopping check - the .item() calls caused GPU-CPU sync
+            # 10 iterations is fast enough and avoids the sync overhead
 
         # =====================================================================
         # STEP 4: Map back to full sequence
@@ -2587,11 +2589,13 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        # v4.5.0 feature flags
-        attn_mode = "SparseAttn" if self.use_sparse_attention else "H2OApprox"
-        norm_mode = self.normalization_mode
-        smooth_info = f" smooth={self.smoothing_kernel_size}" if self.use_spatial_smoothing else ""
-        print(f"CircuitKV v4.5.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}, {attn_mode}, norm={norm_mode}{smooth_info}{ablation_info}) budget={self.max_capacity_prompt}")
+        # v4.5.0 feature flags - print only once to avoid log spam
+        if not self._printed_version:
+            attn_mode = "SparseAttn" if self.use_sparse_attention else "H2OApprox"
+            norm_mode = self.normalization_mode
+            smooth_info = f" smooth={self.smoothing_kernel_size}" if self.use_spatial_smoothing else ""
+            print(f"CircuitKV v4.5.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}, {attn_mode}, norm={norm_mode}{smooth_info}{ablation_info}) budget={self.max_capacity_prompt}")
+            self._printed_version = True
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2635,8 +2639,15 @@ class CircuitKVCluster():
         # Two modes:
         # - Sparse Attention: Sample real attention at prefix positions (accurate)
         # - H2O Approximation: Use H2O-weighted heuristic (fast, less accurate)
+        # Only use sparse attention for sequences longer than 2x budget (where it matters)
         # =====================================================================
-        if self.use_sparse_attention:
+        n_prefix = q_len - self.window_size
+        use_sparse_this_call = (
+            self.use_sparse_attention and
+            n_prefix > self.sparse_min_samples * 2  # Only if enough prefix to sample meaningfully
+        )
+
+        if use_sparse_this_call:
             # v4.5.0: Sparse attention with real Q·K^T at sampled positions
             # This provides anchors of ground truth throughout the prefix,
             # significantly improving the Neumann series computation quality.
@@ -2683,9 +2694,10 @@ class CircuitKVCluster():
 
                 # Use confidence to weight the combination
                 # If one signal has much higher confidence, favor it
+                # Note: qi_conf and hi_conf are tensors (scalars on GPU)
                 total_conf = qi_conf + hi_conf + 1e-8
                 qi_weight = 0.5 + 0.3 * (qi_conf - hi_conf) / total_conf  # Range: [0.2, 0.8]
-                qi_weight = max(0.2, min(0.8, qi_weight))  # Clamp
+                qi_weight = torch.clamp(qi_weight, 0.2, 0.8)
                 hi_weight = 1.0 - qi_weight
 
                 qi_rank = qi_norm
