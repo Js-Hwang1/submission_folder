@@ -39,7 +39,7 @@ def get_cuda_bare_metal_version(cuda_dir):
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-# cuda module
+# cuda module - original API
 ext_modules.append(
     CUDAExtension(
         # package name for import
@@ -74,6 +74,42 @@ ext_modules.append(
             Path(this_dir) / "csrc",
             Path(this_dir) / "include",
             # Path(this_dir) / "some" / "thing" / "more",
+        ],
+    )
+)
+
+# Streaming Neumann kernel for CircuitKV v4.5.3
+# Memory-efficient O(n) Neumann series computation
+ext_modules.append(
+    CUDAExtension(
+        name="streaming_neumann_cuda",
+        sources=[
+            "csrc/streaming_neumann.cu",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"] + generator_flag,
+            "nvcc": [
+                    "-O3",
+                    "-std=c++17",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "--use_fast_math",
+                    "-lineinfo",
+                    "--ptxas-options=-v",
+                    "--ptxas-options=-O2",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--use_fast_math",
+                ]
+                + generator_flag
+                + cc_flag,
+        },
+        include_dirs=[
+            Path(this_dir) / "csrc",
+            Path(this_dir) / "include",
         ],
     )
 )
