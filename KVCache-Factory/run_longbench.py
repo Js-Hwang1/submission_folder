@@ -183,9 +183,13 @@ def main(args):
             prompt = template.format(**example)
 
             # Apply chat template based on model family
+            # Skip chat template for few-shot tasks on Llama 3.1/3.3 (they work better in completion mode)
+            is_fewshot_task = args.dataset in ["trec", "samsum"]
+            is_llama31 = any(x in args.model_path.lower() for x in ["llama-3.1", "llama3.1", "llama-3.3", "llama3.3"])
+
             if "llama-2" in args.model_path.lower() or "llama2" in args.model_path.lower():
                 prompt = build_chat(prompt)
-            elif any(x in args.model_path.lower() for x in ["llama-3.1", "llama3.1", "llama-3.3", "llama3.3"]):
+            elif is_llama31 and not is_fewshot_task:
                 prompt = build_chat_llama31(prompt)
             elif "qwen" in args.model_path.lower():
                 prompt = build_chat_qwen(prompt)
