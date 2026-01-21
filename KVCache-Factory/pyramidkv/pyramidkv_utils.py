@@ -1301,11 +1301,12 @@ class CircuitKVCluster():
         per_head_eviction: bool = False,  # If True, each head keeps different tokens
         per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
         # v4.5.0: Sparse Attention & Improved Normalization
-        use_sparse_attention: bool = True,  # Use real attention at sampled positions instead of H2O approximation
-        sparse_sample_ratio: float = 0.02,  # Fraction of prefix positions to sample (0.02 = 2%)
+        # NOTE: After ablation, these features hurt. Defaults revert to v4.3 behavior.
+        use_sparse_attention: bool = False,  # Disabled: NN interpolation worse than H2O approx
+        sparse_sample_ratio: float = 0.02,  # Fraction of prefix positions to sample
         sparse_min_samples: int = 16,  # Minimum number of samples regardless of ratio
-        normalization_mode: str = "adaptive",  # "rank", "percentile", or "adaptive"
-        use_spatial_smoothing: bool = True,  # Apply avgpool smoothing for spatial coherence
+        normalization_mode: str = "rank",  # "rank" (v4.3), "percentile", or "adaptive"
+        use_spatial_smoothing: bool = False,  # Disabled: blurs important individual tokens
         smoothing_kernel_size: int = 5,  # Kernel size for spatial smoothing
     ):
         self.window_size = window_size
@@ -2589,12 +2590,12 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        # v4.5.0 feature flags - print only once to avoid log spam
+        # v4.5.1: Fixed defaults (reverted to v4.3 behavior) + per-head bug fix
         if not self._printed_version:
             attn_mode = "SparseAttn" if self.use_sparse_attention else "H2OApprox"
             norm_mode = self.normalization_mode
             smooth_info = f" smooth={self.smoothing_kernel_size}" if self.use_spatial_smoothing else ""
-            print(f"CircuitKV v4.5.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}, {attn_mode}, norm={norm_mode}{smooth_info}{ablation_info}) budget={self.max_capacity_prompt}")
+            print(f"CircuitKV v4.5.1 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}, {attn_mode}, norm={norm_mode}{smooth_info}{ablation_info}) budget={self.max_capacity_prompt}")
             self._printed_version = True
 
         # If sequence is shorter than budget, no eviction needed
@@ -2720,17 +2721,17 @@ class CircuitKVCluster():
                 hi_rank = torch.zeros_like(hi_rank)
 
             # v4.3.0: Combination strategies (A2 ablation support)
+            # CRITICAL: Always use MAX for "dis" mode regardless of normalization
+            # The weighted average broke v4.5 - OR logic is essential
             if self.combination_mode == "geometric":
                 # Geometric mean: sqrt(QI * HI) - AND logic (both must be high)
                 combined_scores = torch.sqrt(qi_rank * hi_rank + 1e-8)
             elif self.combination_mode == "sum":
                 # Weighted sum: 0.5*QI + 0.5*HI
                 combined_scores = 0.5 * qi_rank + 0.5 * hi_rank
-            elif self.normalization_mode == "adaptive":
-                # v4.5.0: Confidence-weighted combination
-                combined_scores = qi_weight * qi_rank + hi_weight * hi_rank
             else:
                 # Default "dis": MAX(HI, QI) - OR logic (keeps if EITHER is high)
+                # This is the key to v4.3's success - DO NOT use weighted average!
                 combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging (use influence_scores variable for compatibility)
@@ -2887,7 +2888,8 @@ class CircuitKVCluster():
                     h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
 
                 # Use combined DIS scores (already MAX of HI, QI)
-                dis_for_perhead = selected_scores[:non_window_len]
+                # BUG FIX: was "selected_scores" which doesn't exist - should be "combined_scores"
+                dis_for_perhead = combined_scores[:non_window_len]
                 dis_rank = self._rank_normalize(dis_for_perhead)
                 dis_broadcast = dis_rank.unsqueeze(0).expand(num_heads, -1)
 
