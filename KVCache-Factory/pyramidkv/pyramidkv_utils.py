@@ -1310,7 +1310,7 @@ class CircuitKVCluster():
         per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
         # v4.5.0: Sparse Attention & Improved Normalization
         # NOTE: After ablation, these features hurt. Defaults revert to v4.3 behavior.
-        use_sparse_attention: bool = True,  # v4.5.1: Enabled with MAX combination (fixed)
+        use_sparse_attention: bool = False,  # v4.5.3: Disabled - causes OOM on long sequences
         sparse_sample_ratio: float = 0.02,  # Fraction of prefix positions to sample
         sparse_min_samples: int = 16,  # Minimum number of samples regardless of ratio
         normalization_mode: str = "rank",  # "rank" (v4.3), "percentile", or "adaptive"
@@ -1662,7 +1662,7 @@ class CircuitKVCluster():
             log.flush()
 
     def _lazy_init(self, device, seq_len: int):
-        """Initialize CUDA graph on first use."""
+        """Initialize CUDA graph on first use (optional for Neumann-based v4.x)."""
         if self._graph is None or self._device != device:
             try:
                 from circuit_kv import _C as circuit_kv_cuda
@@ -1676,10 +1676,10 @@ class CircuitKVCluster():
                 )
                 self._device = device
             except ImportError:
-                raise ImportError(
-                    "CircuitKV CUDA extension not found. "
-                    "Install with: pip install -e ./CircuitKV"
-                )
+                # v4.5.3: CircuitGraph is only needed for random walker methods
+                # Neumann-based methods (v4.x) work without it
+                self._graph = None
+                self._device = device
 
     def _rank_normalize(self, scores: torch.Tensor) -> torch.Tensor:
         """
