@@ -422,8 +422,8 @@ if __name__ == "__main__":
     # MarkovKV Ablation flags (A1: QI vs HI ablation)
     parser.add_argument("--ablate_qi", action="store_true", help="Disable QI (Query Importance) - use HI only for ablation study")
     parser.add_argument("--ablate_hi", action="store_true", help="Disable HI (Hub Importance) - use QI only for ablation study")
-    parser.add_argument("--combination_mode", type=str, default="dis", choices=["dis", "max", "weighted", "geometric", "sum", "union"],
-                        help="Score combination mode: union=Union(QI,HI) [v5.0], dis=MAX(QI,HI), geometric=sqrt(QI*HI), sum=0.5*QI+0.5*HI")
+    parser.add_argument("--combination_mode", type=str, default="dis", choices=["dis", "max", "weighted", "geometric", "sum", "union", "union_da"],
+                        help="Score combination mode: union_da=Union(QI*DA,HI*DA) [v5.1], union=Union(QI,HI) [v5.0], dis=MAX(QI,HI)")
     parser.add_argument("--qi_ratio", type=float, default=0.5, help="Ratio of budget for QI in Union mode (0.5 = 50%% QI, 50%% HI)")
     # v4.4.0: Per-head eviction
     parser.add_argument("--per_head_eviction", action="store_true", help="Enable per-head eviction (each head keeps different tokens, like SnapKV)")

@@ -2387,7 +2387,9 @@ class CircuitKVCluster():
 
         mode = "Neumann" if self.use_neumann else "RandomWalk"
         if self.combination_mode == "union":
-            comb = f"Union(QI:{self.qi_ratio:.0%},HI:{1-self.qi_ratio:.0%})"  # v5.0: Union selection
+            comb = f"Union(QI:{self.qi_ratio:.0%},HI:{1-self.qi_ratio:.0%})"  # v5.0: Union selection (no DA)
+        elif self.combination_mode == "union_da":
+            comb = f"Union_DA(QI:{self.qi_ratio:.0%},HI:{1-self.qi_ratio:.0%})"  # v5.1: Union + DA weighting
         elif self.combination_mode == "dis":
             comb = "MAX(HI,QI)"  # v4.3: Both from fundamental matrix N
         elif self.combination_mode == "weighted":
@@ -2400,8 +2402,8 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        version = "v5.0.0" if self.combination_mode == "union" else "v4.5.0"
-        da_note = "" if self.combination_mode == "union" else ", DA-weighted"
+        version = "v5.1.0" if self.combination_mode == "union_da" else ("v5.0.0" if self.combination_mode == "union" else "v4.5.0")
+        da_note = ", DA-weighted" if self.combination_mode not in ["union"] else ""
         print(f"CircuitKV {version} ({mode}, k={self.neumann_iterations}, {comb}{da_note}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
@@ -2511,6 +2513,42 @@ class CircuitKVCluster():
             # This is only used for debug logging, not for selection
             qi_rank = self._rank_normalize(qi_scores)
             hi_rank = self._rank_normalize(hi_scores)
+            combined_scores = torch.maximum(qi_rank, hi_rank)
+
+            # Store for debugging
+            influence_scores_full = torch.zeros(
+                full_attn.shape[0], device=full_attn.device, dtype=torch.float32
+            )
+            influence_scores_full[:q_len] = qi_scores
+            influence_scores = influence_scores_full
+
+        elif self.combination_mode == "union_da":
+            # v5.1.0: Union Selection WITH DA weighting
+            # Same as union but multiply by Direct Attention to preserve query relevance.
+            # This keeps the attention grounding that helped v4.5.0 on TREC/classification.
+            qi_scores, hi_scores = self._compute_dual_importance_scores(
+                full_attn[:q_len, :q_len].contiguous(),
+                current_idx,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                temperature=self.neumann_temperature,
+            )
+
+            # Compute Direct Attention (DA) - what the window actually attends to
+            da_scores = full_attn[-self.window_size:, :q_len].sum(dim=0)
+            da_scores = da_scores.clamp(min=1e-8)
+
+            # Weight QI and HI by DA before union selection
+            qi_weighted = qi_scores * da_scores
+            hi_weighted = hi_scores * da_scores
+
+            # Store DA-weighted scores for union selection
+            self._qi_scores_for_union = qi_weighted
+            self._hi_scores_for_union = hi_weighted
+
+            # For compatibility with scoring path
+            qi_rank = self._rank_normalize(qi_weighted)
+            hi_rank = self._rank_normalize(hi_weighted)
             combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging
@@ -2774,8 +2812,9 @@ class CircuitKVCluster():
             # Original shared eviction (same tokens for all heads)
             # =====================================================================
             # Compute keep mask using static budgeting
-            if self.combination_mode == "union":
-                # v5.0.0: Union selection - use stored QI and HI scores
+            if self.combination_mode in ["union", "union_da"]:
+                # v5.0.0/v5.1.0: Union selection - use stored QI and HI scores
+                # For union_da, these are already DA-weighted
                 keep_mask = self._get_union_keep_mask(
                     self._qi_scores_for_union,
                     self._hi_scores_for_union,
