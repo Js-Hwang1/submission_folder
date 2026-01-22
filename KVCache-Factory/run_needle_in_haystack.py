@@ -196,9 +196,9 @@ class LLMNeedleHaystackTester:
 
                 
                 if self.method.lower() == "pyramidkv":
-                    window_sizes = 8
-                elif self.method.lower() in ["snapkv","streamingllm","h2o","cam"]:
-                    window_sizes = 32
+                    window_sizes = 64  # Match SnapKV/PyramidKV default (was 8)
+                elif self.method.lower() in ["snapkv","streamingllm","h2o","cam","circuitkv"]:
+                    window_sizes = 64  # Match SnapKV/PyramidKV default (was 32)
                     
                 kernel_sizes = 7
                 pooling = "maxpool"
