@@ -1289,6 +1289,8 @@ class CircuitKVCluster():
         combination_mode: str = "max",  # "max", "weighted", or "dis" (v4.2.0: Dual-Importance Scoring)
         # v4.2.0: Dual-Importance Scoring
         dis_alpha: float = 0.5,  # QI weight in DIS (0.5 = symmetric geometric mean)
+        # v5.0.0: Union Selection
+        qi_ratio: float = 0.5,  # Ratio of budget for QI in Union mode (0.5 = 50% QI, 50% HI)
         # v4.3.1: Ablation flags for A1 experiment
         ablate_qi: bool = False,  # If True, use HI only (QI zeroed)
         ablate_hi: bool = False,  # If True, use QI only (HI zeroed)
@@ -1319,6 +1321,8 @@ class CircuitKVCluster():
         self.combination_mode = combination_mode
         # v4.2.0: Dual-Importance Scoring
         self.dis_alpha = dis_alpha
+        # v5.0.0: Union Selection
+        self.qi_ratio = qi_ratio
         # v4.3.1: Ablation flags
         self.ablate_qi = ablate_qi
         self.ablate_hi = ablate_hi
@@ -2062,6 +2066,108 @@ class CircuitKVCluster():
 
         return anchors
 
+    def _get_union_keep_mask(
+        self,
+        qi_scores: torch.Tensor,
+        hi_scores: torch.Tensor,
+        budget: int,
+        seq_len: int,
+        qi_ratio: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        v5.0.0: Union Selection - guarantee coverage from both QI and HI.
+
+        Split budget between QI and HI, take union of top tokens from each.
+        This ensures we keep tokens important by EITHER metric without
+        dilution from multiplication.
+
+        Key insight: QI and HI capture DIFFERENT tokens:
+        - QI → late-position tokens (81% late) on paths FROM query
+        - HI → early-position tokens (67% early) that are global hubs
+
+        By taking union, we guarantee coverage from both perspectives.
+
+        Args:
+            qi_scores: Query Importance scores [seq_len]
+            hi_scores: Hub Importance scores [seq_len]
+            budget: Total tokens to keep
+            seq_len: Current sequence length
+            qi_ratio: Fraction of budget for QI (default 0.5)
+
+        Returns:
+            Boolean mask [seq_len] where True = keep
+        """
+        device = qi_scores.device
+
+        # 1. Handle Budget (always static in LongBench)
+        target_count = int(budget)
+
+        # 2. Safety Constraints: Always keep Sink + Local
+        min_required = self.sink_size + self.window_size
+        if target_count < min_required:
+            target_count = min_required
+
+        # 3. Initialize mask with forced keep (Sink + Local)
+        mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        mask[:self.sink_size] = True  # Keep Sink
+
+        local_start = max(self.sink_size, seq_len - self.window_size)
+        mask[local_start:] = True  # Keep Local
+
+        current_kept = mask.sum().item()
+        remaining_budget = max(0, target_count - current_kept)
+
+        if remaining_budget <= 0:
+            return mask
+
+        # 4. Compute QI and HI budgets
+        qi_budget = int(remaining_budget * qi_ratio)
+        hi_budget = remaining_budget - qi_budget
+
+        # 5. Get candidates (exclude already kept positions)
+        candidate_mask = ~mask
+        candidate_indices = candidate_mask.nonzero(as_tuple=True)[0]
+
+        if len(candidate_indices) == 0:
+            return mask
+
+        # Get scores for candidates only
+        qi_candidate = qi_scores[candidate_indices]
+        hi_candidate = hi_scores[candidate_indices]
+
+        # 6. Select top-k by QI
+        qi_k = min(qi_budget, len(candidate_indices))
+        _, qi_top_local = torch.topk(qi_candidate, qi_k)
+        qi_selected = set(candidate_indices[qi_top_local].cpu().tolist())
+
+        # 7. Select top-k by HI
+        hi_k = min(hi_budget, len(candidate_indices))
+        _, hi_top_local = torch.topk(hi_candidate, hi_k)
+        hi_selected = set(candidate_indices[hi_top_local].cpu().tolist())
+
+        # 8. Take union
+        union_selected = qi_selected | hi_selected
+
+        # 9. Fill remaining slots if overlap exists (use HI for filling)
+        if len(union_selected) < remaining_budget:
+            # Get more candidates from HI (next best after already selected)
+            shortfall = remaining_budget - len(union_selected)
+            hi_all_k = min(len(candidate_indices), hi_budget + shortfall + qi_budget)
+            _, hi_extended_local = torch.topk(hi_candidate, hi_all_k)
+            hi_extended = candidate_indices[hi_extended_local].cpu().tolist()
+
+            for idx in hi_extended:
+                if idx not in union_selected:
+                    union_selected.add(idx)
+                    if len(union_selected) >= remaining_budget:
+                        break
+
+        # 10. Apply selection to mask
+        for idx in union_selected:
+            mask[idx] = True
+
+        return mask
+
     def _get_keep_mask(self, scores: torch.Tensor, budget: int, seq_len: int) -> torch.Tensor:
         """
         Get a boolean mask indicating which tokens to keep.
@@ -2280,7 +2386,9 @@ class CircuitKVCluster():
         bsz, num_heads, q_len, head_dim = query_states.shape
 
         mode = "Neumann" if self.use_neumann else "RandomWalk"
-        if self.combination_mode == "dis":
+        if self.combination_mode == "union":
+            comb = f"Union(QI:{self.qi_ratio:.0%},HI:{1-self.qi_ratio:.0%})"  # v5.0: Union selection
+        elif self.combination_mode == "dis":
             comb = "MAX(HI,QI)"  # v4.3: Both from fundamental matrix N
         elif self.combination_mode == "weighted":
             comb = f"weighted({self.h2o_weight:.1f})"
@@ -2292,7 +2400,9 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        print(f"CircuitKV v4.5.0 ({mode}, k={self.neumann_iterations}, {comb}, DA-weighted, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
+        version = "v5.0.0" if self.combination_mode == "union" else "v4.5.0"
+        da_note = "" if self.combination_mode == "union" else ", DA-weighted"
+        print(f"CircuitKV {version} ({mode}, k={self.neumann_iterations}, {comb}{da_note}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2379,7 +2489,38 @@ class CircuitKVCluster():
         # =====================================================================
         current_idx = q_len - 1
 
-        if self.combination_mode == "dis":
+        if self.combination_mode == "union":
+            # v5.0.0: Union Selection - guarantee coverage from both QI and HI
+            # Key insight: QI and HI capture DIFFERENT tokens (0.589 correlation)
+            # - QI → late-position tokens (81% late) on paths FROM query
+            # - HI → early-position tokens (67% early) that are global hubs
+            # By taking union, we guarantee coverage from both perspectives.
+            qi_scores, hi_scores = self._compute_dual_importance_scores(
+                full_attn[:q_len, :q_len].contiguous(),
+                current_idx,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                temperature=self.neumann_temperature,
+            )
+
+            # Store QI and HI for union selection (called in STEP 3)
+            self._qi_scores_for_union = qi_scores
+            self._hi_scores_for_union = hi_scores
+
+            # For compatibility with scoring path, use MAX(rank(QI), rank(HI))
+            # This is only used for debug logging, not for selection
+            qi_rank = self._rank_normalize(qi_scores)
+            hi_rank = self._rank_normalize(hi_scores)
+            combined_scores = torch.maximum(qi_rank, hi_rank)
+
+            # Store for debugging
+            influence_scores_full = torch.zeros(
+                full_attn.shape[0], device=full_attn.device, dtype=torch.float32
+            )
+            influence_scores_full[:q_len] = qi_scores
+            influence_scores = influence_scores_full
+
+        elif self.combination_mode == "dis":
             # v4.5.0: Attention-Weighted Dual-Importance Scoring
             # QI and HI from fundamental matrix N, weighted by Direct Attention (DA)
             # This ensures tokens need BOTH structural importance AND query relevance
@@ -2633,11 +2774,21 @@ class CircuitKVCluster():
             # Original shared eviction (same tokens for all heads)
             # =====================================================================
             # Compute keep mask using static budgeting
-            keep_mask = self._get_keep_mask(
-                scores,
-                self.max_capacity_prompt,
-                q_len
-            )
+            if self.combination_mode == "union":
+                # v5.0.0: Union selection - use stored QI and HI scores
+                keep_mask = self._get_union_keep_mask(
+                    self._qi_scores_for_union,
+                    self._hi_scores_for_union,
+                    self.max_capacity_prompt,
+                    q_len,
+                    qi_ratio=self.qi_ratio,
+                )
+            else:
+                keep_mask = self._get_keep_mask(
+                    scores,
+                    self.max_capacity_prompt,
+                    q_len
+                )
 
             # Debug logging
             if self.debug:
@@ -3056,6 +3207,9 @@ def init_circuitkv(self):
             self.config.per_head_eviction = False  # If True, each head keeps different tokens
         if not hasattr(self.config, 'per_head_hi_weight'):
             self.config.per_head_hi_weight = 0.3  # Weight for HI in per-head combination
+        # v5.0.0: Union Selection
+        if not hasattr(self.config, 'qi_ratio'):
+            self.config.qi_ratio = 0.5  # Ratio of budget for QI in Union mode
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -3097,4 +3251,6 @@ def init_circuitkv(self):
         # v4.4.0: Per-head eviction
         per_head_eviction=self.config.per_head_eviction,
         per_head_hi_weight=self.config.per_head_hi_weight,
+        # v5.0.0: Union Selection
+        qi_ratio=self.config.qi_ratio,
     )
