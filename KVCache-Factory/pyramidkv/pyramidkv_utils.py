@@ -50,11 +50,12 @@ def _get_circuitkv_debug_log():
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
         _CIRCUITKV_DEBUG_LOG.write("[LOG_HEADER]\n")
-        _CIRCUITKV_DEBUG_LOG.write("version=4.3.0\n")
+        _CIRCUITKV_DEBUG_LOG.write("version=4.5.0\n")
         _CIRCUITKV_DEBUG_LOG.write("format=structured\n")
-        _CIRCUITKV_DEBUG_LOG.write("algorithm=MAX(rank(QI), rank(HI))\n")
+        _CIRCUITKV_DEBUG_LOG.write("algorithm=MAX(rank(QI*DA), rank(HI*DA))\n")
         _CIRCUITKV_DEBUG_LOG.write("QI=Query Importance from Neumann N[query_row]\n")
         _CIRCUITKV_DEBUG_LOG.write("HI=Hub Importance = column_sums(N)\n")
+        _CIRCUITKV_DEBUG_LOG.write("DA=Direct Attention = column_sums(window_attention)\n")
         _CIRCUITKV_DEBUG_LOG.write("N=Fundamental Matrix (I-Q)^(-1)\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
@@ -2291,7 +2292,7 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        print(f"CircuitKV v4.4.0 ({mode}, k={self.neumann_iterations}, {comb}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
+        print(f"CircuitKV v4.5.0 ({mode}, k={self.neumann_iterations}, {comb}, DA-weighted, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -2379,9 +2380,9 @@ class CircuitKVCluster():
         current_idx = q_len - 1
 
         if self.combination_mode == "dis":
-            # v4.2.0: Dual-Importance Scoring (DIS)
-            # Computes BOTH Query Importance (QI) and Hub Importance (HI)
-            # from the same fundamental matrix N = (I-Q)^(-1)
+            # v4.5.0: Attention-Weighted Dual-Importance Scoring
+            # QI and HI from fundamental matrix N, weighted by Direct Attention (DA)
+            # This ensures tokens need BOTH structural importance AND query relevance
             qi_scores, hi_scores = self._compute_dual_importance_scores(
                 full_attn[:q_len, :q_len].contiguous(),
                 current_idx,
@@ -2390,9 +2391,21 @@ class CircuitKVCluster():
                 temperature=self.neumann_temperature,
             )
 
-            # Rank normalize both
-            qi_rank = self._rank_normalize(qi_scores)
-            hi_rank = self._rank_normalize(hi_scores)
+            # v4.5.0: Compute Direct Attention (DA) - what the window actually attends to
+            # This is the ground truth signal for query relevance
+            da_scores = full_attn[-self.window_size:, :q_len].sum(dim=0)  # [q_len]
+            da_scores = da_scores.clamp(min=1e-8)  # Avoid zeros
+
+            # v4.5.0: Weight QI and HI by DA before rank normalization
+            # Interpretation: "structural importance × query relevance"
+            # - High QI but low DA (early tokens) → weighted down
+            # - High DA but low QI (middle tokens) → need HI to save them
+            qi_weighted = qi_scores * da_scores
+            hi_weighted = hi_scores * da_scores
+
+            # Rank normalize the weighted scores
+            qi_rank = self._rank_normalize(qi_weighted)
+            hi_rank = self._rank_normalize(hi_weighted)
 
             # v4.3.1: Ablation support - zero out one signal for A1 experiment
             if self.ablate_qi:
@@ -2402,16 +2415,8 @@ class CircuitKVCluster():
                 # QI-only ablation: use only Query Importance
                 hi_rank = torch.zeros_like(hi_rank)
 
-            # v4.3.0: Combination strategies (A2 ablation support)
-            if self.combination_mode == "geometric":
-                # Geometric mean: sqrt(QI * HI) - AND logic (both must be high)
-                combined_scores = torch.sqrt(qi_rank * hi_rank + 1e-8)
-            elif self.combination_mode == "sum":
-                # Weighted sum: 0.5*QI + 0.5*HI
-                combined_scores = 0.5 * qi_rank + 0.5 * hi_rank
-            else:
-                # Default "dis": MAX(HI, QI) - OR logic (keeps if EITHER is high)
-                combined_scores = torch.maximum(qi_rank, hi_rank)
+            # v4.5.0: MAX of attention-weighted Markov signals
+            combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging (use influence_scores variable for compatibility)
             influence_scores_full = torch.zeros(
