@@ -2487,10 +2487,15 @@ class CircuitKVCluster():
                 qi_k = 0  # Disabled
 
             if self.use_gaussian or self.smooth_hi_only or (qi_k != hi_k and (qi_k > 1 or hi_k > 1)):
-                # v6.2.0: Asymmetric Gaussian Smoothing
-                version = "v6.2.0"
+                # v6.2.0: Asymmetric Gaussian, v6.3.0: Deep Field (extended boundary)
                 kernel_type = "gauss" if self.use_gaussian else "box"
-                da_note = f", {kernel_type}(QI={qi_k if qi_k > 0 else 'raw'}, HI={hi_k})"
+                if self.sink_size > 4 or self.neumann_iterations > 10:
+                    # v6.3.0: Deep Field - extended absorbing boundary
+                    version = "v6.3.0"
+                    da_note = f", {kernel_type}(QI={qi_k if qi_k > 0 else 'raw'}, HI={hi_k}), sink={self.sink_size}"
+                else:
+                    version = "v6.2.0"
+                    da_note = f", {kernel_type}(QI={qi_k if qi_k > 0 else 'raw'}, HI={hi_k})"
             elif self.smoothing_kernel > 1:
                 version = "v6.1.0"
                 da_note = f", smooth={self.smoothing_kernel}"

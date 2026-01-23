@@ -327,6 +327,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.gaussian_sigma = args.gaussian_sigma
                 # MarkovKV tuning parameters
                 model.model.layers[i].self_attn.config.neumann_iterations = args.neumann_iterations
+                model.model.layers[i].self_attn.config.sink_size = args.sink_size
                 if args.window_size_override is not None:
                     model.model.layers[i].self_attn.config.window_size = args.window_size_override
             
@@ -446,6 +447,7 @@ if __name__ == "__main__":
     parser.add_argument("--gaussian_sigma", type=float, default=1.0, help="Sigma for Gaussian kernel (QI uses sigma*0.5 for tighter smoothing)")
     # MarkovKV tuning parameters
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
+    parser.add_argument("--sink_size", type=int, default=4, help="Absorbing boundary size (first N tokens always kept). Increase for multi-hop tasks.")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
