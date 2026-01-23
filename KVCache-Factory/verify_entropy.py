@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
 Entropy-Aware Markov Construction PoC (v6.5.0)
 

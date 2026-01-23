@@ -1305,6 +1305,9 @@ class CircuitKVCluster():
         qi_kernel_size: int = 0,  # Separate kernel size for QI (0=use smoothing_kernel, -1=raw)
         hi_kernel_size: int = 0,  # Separate kernel size for HI (0=use smoothing_kernel)
         gaussian_sigma: float = 1.0,  # Sigma for Gaussian kernel
+        # v6.5.0: Entropy-Aware Head Selection
+        entropy_aware: bool = False,  # If True, use sharpest heads for QI, all heads for HI
+        top_k_heads: int = 8,  # Number of sharpest (lowest entropy) heads for QI
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1345,6 +1348,9 @@ class CircuitKVCluster():
         self.qi_kernel_size = qi_kernel_size
         self.hi_kernel_size = hi_kernel_size
         self.gaussian_sigma = gaussian_sigma
+        # v6.5.0: Entropy-Aware Head Selection
+        self.entropy_aware = entropy_aware
+        self.top_k_heads = top_k_heads
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1400,6 +1406,33 @@ class CircuitKVCluster():
         self._accumulated_charge = None
         self._h2o_scores = None
         self._prefill_initialized = False
+
+    def _compute_head_entropy(self, attn_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """
+        v6.5.0: Compute entropy per attention head.
+
+        Sharp heads (low entropy) have focused attention on specific tokens,
+        which is characteristic of induction heads that carry multi-hop reasoning.
+
+        Args:
+            attn_weights: [bsz, num_heads, window_size, seq_len] - softmax attention
+            eps: Small value to avoid log(0)
+
+        Returns:
+            entropy: [num_heads] - entropy per head (lower = sharper)
+        """
+        # CRITICAL: Convert to float32 to avoid NaN from float16 log operations
+        attn_f32 = attn_weights.float()
+        attn_clamped = attn_f32.clamp(min=eps)
+        log_attn = torch.log(attn_clamped)
+
+        # H = -sum(p * log(p)) for each query position
+        entropy_per_query = -(attn_clamped * log_attn).sum(dim=-1)  # [bsz, num_heads, window_size]
+
+        # Average entropy across batch and query positions
+        entropy_per_head = entropy_per_query.mean(dim=(0, 2))  # [num_heads]
+
+        return entropy_per_head
 
     def _init_debug_log(self):
         """Initialize debug log (uses module-level singleton)."""
@@ -1912,19 +1945,23 @@ class CircuitKVCluster():
         sink_size: int = 4,
         num_iterations: int = 10,
         temperature: float = 1.0,
+        attention_for_hi: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         v4.2.0: Dual-Importance Scoring (DIS) via Absorbing Markov Chain.
+        v6.5.0: Added entropy-aware mode with separate attention for HI.
 
-        Computes TWO importance scores from the SAME fundamental matrix N:
+        Computes TWO importance scores from the fundamental matrix N:
 
         1. QUERY IMPORTANCE (QI): N[q, j] = expected visits to j FROM query
            - "How important is j for answering THIS specific query?"
            - Captures query-relevant tokens on the path to sink
+           - v6.5.0: Uses sharp-head attention (if entropy_aware)
 
         2. HUB IMPORTANCE (HI): (1/n) Σᵢ N[i, j] = avg expected visits to j
            - "How central is j in the overall information flow network?"
            - Captures globally important "hub" tokens
+           - v6.5.0: Uses all-head attention (if entropy_aware)
 
         Mathematical Foundation:
         - N = (I - Q)^{-1} is the fundamental matrix of absorbing Markov chain
@@ -1945,11 +1982,12 @@ class CircuitKVCluster():
         - Requires BOTH properties - more selective than MAX
 
         Args:
-            attention: Causal attention matrix [seq_len, seq_len]
+            attention: Causal attention matrix [seq_len, seq_len] - used for QI
             query_idx: Source position (typically seq_len - 1)
             sink_size: First sink_size tokens are absorbing (default 4)
             num_iterations: Neumann series iterations (default 10)
             temperature: Attention sharpening (default 1.0, lower = sharper)
+            attention_for_hi: Optional separate attention matrix for HI (v6.5.0 entropy-aware)
 
         Returns:
             Tuple of (query_importance, hub_importance), each [seq_len]
@@ -1977,7 +2015,19 @@ class CircuitKVCluster():
         # STEP 2: Extract Q (transient-to-transient transitions)
         # =====================================================================
         n_transient = n - sink_size
-        Q = P[sink_size:, sink_size:].contiguous()  # [n_transient, n_transient]
+        Q = P[sink_size:, sink_size:].contiguous()  # [n_transient, n_transient] - used for QI
+
+        # v6.5.0: Build separate Q_hi for HI if entropy-aware attention provided
+        if attention_for_hi is not None:
+            if temperature != 1.0 and temperature > 0:
+                attn_hi_scaled = attention_for_hi ** (1.0 / temperature)
+            else:
+                attn_hi_scaled = attention_for_hi
+            row_sums_hi = attn_hi_scaled.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            P_hi = attn_hi_scaled / row_sums_hi
+            Q_hi = P_hi[sink_size:, sink_size:].contiguous()
+        else:
+            Q_hi = Q  # Default: same Q for both
 
         # Query position in transient space
         query_transient_idx = query_idx - sink_size
@@ -1987,8 +2037,8 @@ class CircuitKVCluster():
 
         # =====================================================================
         # STEP 3: Parallel Neumann series for BOTH QI and HI
-        # QI: Start from e_query (one-hot at query position)
-        # HI: Start from uniform (1/n_transient) for average over all starts
+        # QI: Start from e_query (one-hot at query position) - uses Q (sharp heads)
+        # HI: Start from uniform (1/n_transient) for average over all starts - uses Q_hi (all heads)
         # =====================================================================
         # Initialize Query Importance vector
         v_qi = torch.zeros(n_transient, device=device, dtype=torch.float32)
@@ -1999,10 +2049,10 @@ class CircuitKVCluster():
         v_hi = torch.ones(n_transient, device=device, dtype=torch.float32) / n_transient
         result_hi = v_hi.clone()
 
-        # Iterate both in parallel
+        # Iterate both in parallel (with potentially different Q matrices)
         for _ in range(num_iterations):
             v_qi = torch.mv(Q.t(), v_qi)
-            v_hi = torch.mv(Q.t(), v_hi)
+            v_hi = torch.mv(Q_hi.t(), v_hi)  # v6.5.0: Use Q_hi for HI
             result_qi = result_qi + v_qi
             result_hi = result_hi + v_hi
 
@@ -2546,9 +2596,36 @@ class CircuitKVCluster():
         # attn_weights: [bsz, num_heads, window_size, seq_len]
         attn_weights_per_head = attn_weights  # Keep reference before aggregation
 
-        attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
+        # =====================================================================
+        # v6.5.0: Entropy-Aware Head Selection
+        # Sharp heads (low entropy) are used for QI, all heads for HI
+        # =====================================================================
+        full_attn_hi = None  # Will be set if entropy_aware=True
 
-        # Build full attention matrix approximation
+        if self.entropy_aware:
+            # Compute entropy per head (lower = sharper attention)
+            head_entropy = self._compute_head_entropy(attn_weights)  # [num_heads]
+            num_heads = head_entropy.shape[0]
+
+            # Select top-K sharpest heads (lowest entropy)
+            k = min(self.top_k_heads, num_heads)
+            _, sharp_head_indices = torch.topk(head_entropy, k, largest=False)
+
+            # attn_avg_qi: Max-pool over sharp heads only (for QI)
+            attn_sharp_heads = attn_weights[:, sharp_head_indices, :, :]  # [bsz, k, window, seq]
+            attn_avg_qi = attn_sharp_heads.max(dim=1).values.mean(dim=0)  # [window, seq]
+
+            # attn_avg_hi: Max-pool over all heads (for HI) - current behavior
+            attn_avg_hi = attn_weights.max(dim=1).values.mean(dim=0)  # [window, seq]
+
+            # Use sharp-head attention for the main flow (QI matrix)
+            attn_avg = attn_avg_qi
+        else:
+            # Default: use all heads for both QI and HI
+            attn_avg = attn_weights.max(dim=1).values.mean(dim=0)  # Max over heads, avg over batch
+            attn_avg_hi = None
+
+        # Build full attention matrix approximation (used for QI)
         # For positions outside the window, use uniform causal attention
         full_attn = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
 
@@ -2558,35 +2635,30 @@ class CircuitKVCluster():
         # For positions outside window, use H2O-WEIGHTED transitions (not uniform)
         # This guides walkers toward high-attention tokens instead of random backward jumps
         n_prefix = q_len - self.window_size
-        if n_prefix > 1:
-            # Compute H2O scores (column sums) from window attention
-            # This captures how much recent tokens attend to each position
-            h2o_scores = attn_avg.sum(dim=0)  # [seq_len]
-            h2o_prefix = h2o_scores[:n_prefix].clone()
 
-            # Ensure positive scores (add small epsilon to avoid zeros)
-            h2o_prefix = h2o_prefix.clamp(min=1e-6)
-
-            # For row i, transition prob to j = h2o[j] / sum(h2o[0:i]) for j < i
-            # This creates a valid probability distribution that sums to 1
-            cumsum = h2o_prefix.cumsum(dim=0)  # [n_prefix]
-
-            # denom[i] = sum(h2o[0:i]) = cumsum[i-1]
-            denom = torch.zeros(n_prefix, device=key_states.device, dtype=torch.float32)
+        def _build_prefix_transitions(h2o_source, device):
+            """Helper to build H2O-weighted prefix transitions."""
+            h2o_scores = h2o_source.sum(dim=0)  # [seq_len]
+            h2o_prefix = h2o_scores[:n_prefix].clone().clamp(min=1e-6)
+            cumsum = h2o_prefix.cumsum(dim=0)
+            denom = torch.zeros(n_prefix, device=device, dtype=torch.float32)
             denom[1:] = cumsum[:-1]
-            denom[0] = 1.0  # Avoid div-by-zero (row 0 masked anyway)
-
-            # Broadcast to create transition matrix
-            # h2o_expanded[i,j] = h2o[j] for all i
+            denom[0] = 1.0
             h2o_expanded = h2o_prefix.unsqueeze(0).expand(n_prefix, n_prefix)
             denom_expanded = denom.unsqueeze(1).expand(n_prefix, n_prefix)
-
-            # P[i,j] = h2o[j] / sum(h2o[0:i])
             h2o_trans = h2o_expanded / (denom_expanded + 1e-8)
+            mask = torch.tril(torch.ones(n_prefix, n_prefix, device=device, dtype=torch.float32), diagonal=-1)
+            return h2o_trans * mask
 
-            # Apply causal mask (only attend to strictly previous positions)
-            mask = torch.tril(torch.ones(n_prefix, n_prefix, device=key_states.device, dtype=torch.float32), diagonal=-1)
-            full_attn[:n_prefix, :n_prefix] = h2o_trans * mask
+        if n_prefix > 1:
+            full_attn[:n_prefix, :n_prefix] = _build_prefix_transitions(attn_avg, key_states.device)
+
+        # v6.5.0: Build separate full_attn_hi for HI if entropy_aware
+        if self.entropy_aware and attn_avg_hi is not None:
+            full_attn_hi = torch.zeros(q_len, q_len, device=key_states.device, dtype=torch.float32)
+            full_attn_hi[-self.window_size:, :] = attn_avg_hi
+            if n_prefix > 1:
+                full_attn_hi[:n_prefix, :n_prefix] = _build_prefix_transitions(attn_avg_hi, key_states.device)
 
         # =====================================================================
         # STEP 2: Compute Importance Scores
@@ -2608,6 +2680,7 @@ class CircuitKVCluster():
                 sink_size=self.sink_size,
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
+                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
             )
 
             # Store QI and HI for union selection (called in STEP 3)
@@ -2637,6 +2710,7 @@ class CircuitKVCluster():
                 sink_size=self.sink_size,
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
+                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
             )
 
             # Compute Direct Attention (DA) - what the window actually attends to
@@ -2674,6 +2748,7 @@ class CircuitKVCluster():
                 sink_size=self.sink_size,
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
+                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
             )
 
             # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
@@ -3441,4 +3516,7 @@ def init_circuitkv(self):
         qi_kernel_size=self.config.qi_kernel_size,
         hi_kernel_size=self.config.hi_kernel_size,
         gaussian_sigma=self.config.gaussian_sigma,
+        # v6.5.0: Entropy-Aware Head Selection
+        entropy_aware=getattr(self.config, 'entropy_aware', False),
+        top_k_heads=getattr(self.config, 'top_k_heads', 8),
     )

@@ -331,6 +331,9 @@ def main(args):
                 model.model.layers[i].self_attn.config.neumann_iterations = args.neumann_iterations
                 model.model.layers[i].self_attn.config.sink_size = args.sink_size
                 model.model.layers[i].self_attn.config.neumann_temperature = args.neumann_temperature
+                # v6.5.0: Entropy-aware head selection
+                model.model.layers[i].self_attn.config.entropy_aware = args.entropy_aware
+                model.model.layers[i].self_attn.config.top_k_heads = args.top_k_heads
                 if args.window_size_override is not None:
                     model.model.layers[i].self_attn.config.window_size = args.window_size_override
             
@@ -452,6 +455,9 @@ if __name__ == "__main__":
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
     parser.add_argument("--sink_size", type=int, default=4, help="Absorbing boundary size (first N tokens always kept). Increase for multi-hop tasks.")
     parser.add_argument("--neumann_temperature", type=float, default=1.0, help="Temperature for transition sharpening (<1.0 = sharper, prevents signal diffusion)")
+    # v6.5.0: Entropy-aware head selection
+    parser.add_argument("--entropy_aware", action="store_true", help="v6.5.0: Use entropy-aware head selection (sharp heads for QI, all heads for HI)")
+    parser.add_argument("--top_k_heads", type=int, default=8, help="Number of sharpest (lowest entropy) heads to use for QI when --entropy_aware is set")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
