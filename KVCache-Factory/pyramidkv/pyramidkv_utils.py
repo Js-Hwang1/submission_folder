@@ -1286,7 +1286,7 @@ class CircuitKVCluster():
         neumann_temperature: float = 1.0,  # Temperature for attention sharpening (lower = sharper)
         # v4.1.0: Combination tuning
         h2o_weight: float = 0.5,  # Weight for H2O in combination (0.5 = equal, >0.5 = favor H2O)
-        combination_mode: str = "max",  # "max", "weighted", or "dis" (v4.2.0: Dual-Importance Scoring)
+        combination_mode: str = "dis",  # "dis" (default, no DA), "max", "weighted", "union", "union_da"
         # v4.2.0: Dual-Importance Scoring
         dis_alpha: float = 0.5,  # QI weight in DIS (0.5 = symmetric geometric mean)
         # v5.0.0: Union Selection
@@ -2402,8 +2402,18 @@ class CircuitKVCluster():
             ablation_info = " [HI-only]"
         elif self.ablate_hi:
             ablation_info = " [QI-only]"
-        version = "v5.1.0" if self.combination_mode == "union_da" else ("v5.0.0" if self.combination_mode == "union" else "v4.5.0")
-        da_note = ", DA-weighted" if self.combination_mode not in ["union"] else ""
+        if self.combination_mode == "union_da":
+            version = "v5.1.0"
+            da_note = ", DA-weighted"
+        elif self.combination_mode == "union":
+            version = "v5.0.0"
+            da_note = ""
+        elif self.combination_mode == "dis":
+            version = "v6.0.0"
+            da_note = ""  # v6.0.0: NO DA weighting (pure Markov)
+        else:
+            version = "v4.5.0"
+            da_note = ", DA-weighted"
         print(f"CircuitKV {version} ({mode}, k={self.neumann_iterations}, {comb}{da_note}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
 
         # If sequence is shorter than budget, no eviction needed
@@ -2559,9 +2569,10 @@ class CircuitKVCluster():
             influence_scores = influence_scores_full
 
         elif self.combination_mode == "dis":
-            # v4.5.0: Attention-Weighted Dual-Importance Scoring
-            # QI and HI from fundamental matrix N, weighted by Direct Attention (DA)
-            # This ensures tokens need BOTH structural importance AND query relevance
+            # v6.0.0: Pure Dual-Importance Scoring (NO DA weighting)
+            # QI and HI from fundamental matrix N, combined via MAX(rank)
+            # Analysis shows DA weighting HURTS performance: 42.24 (with DA) vs 42.42 (without DA)
+            # DA hurts multi-hop QA (multifieldqa -1.06, narrativeqa -0.89) and retrieval tasks
             qi_scores, hi_scores = self._compute_dual_importance_scores(
                 full_attn[:q_len, :q_len].contiguous(),
                 current_idx,
@@ -2570,21 +2581,10 @@ class CircuitKVCluster():
                 temperature=self.neumann_temperature,
             )
 
-            # v4.5.0: Compute Direct Attention (DA) - what the window actually attends to
-            # This is the ground truth signal for query relevance
-            da_scores = full_attn[-self.window_size:, :q_len].sum(dim=0)  # [q_len]
-            da_scores = da_scores.clamp(min=1e-8)  # Avoid zeros
-
-            # v4.5.0: Weight QI and HI by DA before rank normalization
-            # Interpretation: "structural importance × query relevance"
-            # - High QI but low DA (early tokens) → weighted down
-            # - High DA but low QI (middle tokens) → need HI to save them
-            qi_weighted = qi_scores * da_scores
-            hi_weighted = hi_scores * da_scores
-
-            # Rank normalize the weighted scores
-            qi_rank = self._rank_normalize(qi_weighted)
-            hi_rank = self._rank_normalize(hi_weighted)
+            # v6.0.0: Direct rank normalization WITHOUT DA weighting
+            # Pure Markov chain signals preserve transitive reasoning paths
+            qi_rank = self._rank_normalize(qi_scores)
+            hi_rank = self._rank_normalize(hi_scores)
 
             # v4.3.1: Ablation support - zero out one signal for A1 experiment
             if self.ablate_qi:
@@ -2594,7 +2594,7 @@ class CircuitKVCluster():
                 # QI-only ablation: use only Query Importance
                 hi_rank = torch.zeros_like(hi_rank)
 
-            # v4.5.0: MAX of attention-weighted Markov signals
+            # v6.0.0: MAX of pure Markov signals (no DA)
             combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging (use influence_scores variable for compatibility)
@@ -3232,7 +3232,7 @@ def init_circuitkv(self):
         if not hasattr(self.config, 'h2o_weight'):
             self.config.h2o_weight = 0.5  # Weight for H2O in weighted combination
         if not hasattr(self.config, 'combination_mode'):
-            self.config.combination_mode = "dis"  # Default: DIS (v4.2.0)
+            self.config.combination_mode = "dis"  # Default: DIS v6.0.0 (no DA, pure Markov)
         # v4.2.0: Dual-Importance Scoring
         if not hasattr(self.config, 'dis_alpha'):
             self.config.dis_alpha = 0.5  # QI weight in DIS (0.5 = symmetric)
