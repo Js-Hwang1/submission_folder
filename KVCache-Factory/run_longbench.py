@@ -319,6 +319,12 @@ def main(args):
                 model.model.layers[i].self_attn.config.per_head_hi_weight = args.per_head_hi_weight
                 # v6.1.0: Smoothing kernel
                 model.model.layers[i].self_attn.config.smoothing_kernel = args.smoothing_kernel
+                # v6.2.0: Asymmetric Gaussian Smoothing
+                model.model.layers[i].self_attn.config.smooth_hi_only = args.smooth_hi_only
+                model.model.layers[i].self_attn.config.use_gaussian = args.use_gaussian
+                model.model.layers[i].self_attn.config.qi_kernel_size = args.qi_kernel_size
+                model.model.layers[i].self_attn.config.hi_kernel_size = args.hi_kernel_size
+                model.model.layers[i].self_attn.config.gaussian_sigma = args.gaussian_sigma
                 # MarkovKV tuning parameters
                 model.model.layers[i].self_attn.config.neumann_iterations = args.neumann_iterations
                 if args.window_size_override is not None:
@@ -432,6 +438,12 @@ if __name__ == "__main__":
     parser.add_argument("--per_head_hi_weight", type=float, default=0.3, help="Weight for HI in per-head combination (0.0 = H2O only, 1.0 = HI only)")
     # v6.1.0: Smoothing kernel
     parser.add_argument("--smoothing_kernel", type=int, default=0, help="Smoothing kernel size (0=disabled, 5=recommended). Preserves phrase structure by promoting neighbors of important tokens.")
+    # v6.2.0: Asymmetric Gaussian Smoothing
+    parser.add_argument("--smooth_hi_only", action="store_true", help="Only smooth HI (keep QI sharp for precision on code/classification)")
+    parser.add_argument("--use_gaussian", action="store_true", help="Use Gaussian kernel instead of boxcar (preserves center spike while lifting neighbors)")
+    parser.add_argument("--qi_kernel_size", type=int, default=0, help="Kernel size for QI smoothing (0=use smoothing_kernel, -1=raw/no smoothing)")
+    parser.add_argument("--hi_kernel_size", type=int, default=0, help="Kernel size for HI smoothing (0=use smoothing_kernel)")
+    parser.add_argument("--gaussian_sigma", type=float, default=1.0, help="Sigma for Gaussian kernel (QI uses sigma*0.5 for tighter smoothing)")
     # MarkovKV tuning parameters
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")

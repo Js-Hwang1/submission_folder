@@ -1299,6 +1299,12 @@ class CircuitKVCluster():
         per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
         # v6.1.0: Smoothing Kernel for phrase preservation
         smoothing_kernel: int = 0,  # Kernel size for score smoothing (0=disabled, 5=recommended)
+        # v6.2.0: Asymmetric Gaussian Smoothing
+        smooth_hi_only: bool = False,  # If True, only smooth HI (keep QI sharp for precision)
+        use_gaussian: bool = False,  # If True, use Gaussian kernel instead of boxcar
+        qi_kernel_size: int = 0,  # Separate kernel size for QI (0=use smoothing_kernel, -1=raw)
+        hi_kernel_size: int = 0,  # Separate kernel size for HI (0=use smoothing_kernel)
+        gaussian_sigma: float = 1.0,  # Sigma for Gaussian kernel
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1333,6 +1339,12 @@ class CircuitKVCluster():
         self.per_head_hi_weight = per_head_hi_weight
         # v6.1.0: Smoothing Kernel
         self.smoothing_kernel = smoothing_kernel
+        # v6.2.0: Asymmetric Gaussian Smoothing
+        self.smooth_hi_only = smooth_hi_only
+        self.use_gaussian = use_gaussian
+        self.qi_kernel_size = qi_kernel_size
+        self.hi_kernel_size = hi_kernel_size
+        self.gaussian_sigma = gaussian_sigma
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1720,9 +1732,9 @@ class CircuitKVCluster():
             return torch.ones_like(ranks)
         return ranks / (n - 1)
 
-    def _apply_smoothing(self, scores: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    def _apply_smoothing(self, scores: torch.Tensor, kernel_size: int, use_gaussian: bool = False, sigma: float = 1.0) -> torch.Tensor:
         """
-        v6.1.0: Apply 1D smoothing kernel to preserve phrase structure.
+        v6.2.0: Apply 1D smoothing kernel to preserve phrase structure.
 
         The "Token Isolation" Problem:
         - Raw Markov scores spike on individual important tokens
@@ -1732,11 +1744,16 @@ class CircuitKVCluster():
         Solution: Low-pass filter (1D convolution) that promotes neighbors of important tokens.
         If token j is important, tokens j-1 and j+1 get boosted to "survival status."
 
-        This approximates SnapKV's window pooling behavior without rigid boundaries.
+        v6.2.0 Upgrade: Gaussian kernel option
+        - Boxcar: [0.2, 0.2, 0.2, 0.2, 0.2] - flattens the spike (80% penalty to center)
+        - Gaussian: [0.1, 0.2, 0.4, 0.2, 0.1] - center stays dominant, neighbors get lift
+        Gaussian preserves PRECISION while adding COHERENCE.
 
         Args:
             scores: Raw importance scores [seq_len]
             kernel_size: Size of smoothing window (odd recommended: 3, 5, 7)
+            use_gaussian: If True, use Gaussian kernel; if False, use boxcar (default)
+            sigma: Standard deviation for Gaussian kernel (default 1.0)
 
         Returns:
             Smoothed scores [seq_len] preserving phrase structure
@@ -1751,8 +1768,16 @@ class CircuitKVCluster():
         # Reshape for Conv1d: [batch=1, channel=1, length=n]
         scores_3d = scores.view(1, 1, -1)
 
-        # Create boxcar (averaging) kernel
-        weight = torch.ones(1, 1, kernel_size, device=scores.device, dtype=scores.dtype) / kernel_size
+        if use_gaussian:
+            # v6.2.0: Gaussian kernel - preserves center spike while lifting neighbors
+            # kernel[i] = exp(-(i - center)^2 / (2*sigma^2))
+            x = torch.arange(kernel_size, device=scores.device, dtype=scores.dtype) - (kernel_size - 1) / 2
+            weight = torch.exp(-x**2 / (2 * sigma**2))
+            weight = weight / weight.sum()  # Normalize to sum to 1
+            weight = weight.view(1, 1, -1)
+        else:
+            # v6.1.0: Boxcar (averaging) kernel
+            weight = torch.ones(1, 1, kernel_size, device=scores.device, dtype=scores.dtype) / kernel_size
 
         # Padding to preserve length (phase-aligned output)
         padding = kernel_size // 2
@@ -2455,8 +2480,18 @@ class CircuitKVCluster():
             version = "v5.0.0"
             da_note = ""
         elif self.combination_mode == "dis":
-            # v6.0.0: No DA, v6.1.0: With smoothing kernel
-            if self.smoothing_kernel > 1:
+            # v6.0.0: No DA, v6.1.0: With smoothing, v6.2.0: Asymmetric Gaussian
+            qi_k = self.qi_kernel_size if self.qi_kernel_size != 0 else self.smoothing_kernel
+            hi_k = self.hi_kernel_size if self.hi_kernel_size != 0 else self.smoothing_kernel
+            if self.smooth_hi_only:
+                qi_k = 0  # Disabled
+
+            if self.use_gaussian or self.smooth_hi_only or (qi_k != hi_k and (qi_k > 1 or hi_k > 1)):
+                # v6.2.0: Asymmetric Gaussian Smoothing
+                version = "v6.2.0"
+                kernel_type = "gauss" if self.use_gaussian else "box"
+                da_note = f", {kernel_type}(QI={qi_k if qi_k > 0 else 'raw'}, HI={hi_k})"
+            elif self.smoothing_kernel > 1:
                 version = "v6.1.0"
                 da_note = f", smooth={self.smoothing_kernel}"
             else:
@@ -2632,13 +2667,37 @@ class CircuitKVCluster():
                 temperature=self.neumann_temperature,
             )
 
-            # v6.1.0: Apply smoothing kernel to preserve phrase structure
-            # The "Token Isolation" Problem: Raw scores spike on individual tokens,
-            # but we need to keep syntactic neighbors for LLM reasoning.
-            # Smoothing promotes neighbors of important tokens to survival status.
-            if self.smoothing_kernel > 1:
-                qi_scores = self._apply_smoothing(qi_scores, self.smoothing_kernel)
-                hi_scores = self._apply_smoothing(hi_scores, self.smoothing_kernel)
+            # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
+            #
+            # The "Frequency Separation" Hypothesis:
+            # - QI (Query Importance) = "High Frequency" signal: finds precise needles (keywords, code tokens)
+            # - HI (Hub Importance) = "Low Frequency" signal: captures broad context/topics
+            #
+            # Strategy: "Sharp QI, Smooth HI"
+            # - Sharp QI: Preserves exact matches for Code/Classification (RepoBench, TREC)
+            # - Smooth HI: Captures phrase context for Summarization/Narrative (GovReport, NarrativeQA)
+            #
+            # Gaussian vs Boxcar:
+            # - Boxcar [0.2, 0.2, 0.2, 0.2, 0.2]: Flattens spike (80% penalty to center)
+            # - Gaussian [0.1, 0.2, 0.4, 0.2, 0.1]: Center stays dominant, neighbors get lift
+
+            # Determine effective kernel sizes (asymmetric smoothing)
+            qi_k = self.qi_kernel_size if self.qi_kernel_size != 0 else self.smoothing_kernel
+            hi_k = self.hi_kernel_size if self.hi_kernel_size != 0 else self.smoothing_kernel
+
+            # Handle smooth_hi_only flag (legacy compatibility)
+            if self.smooth_hi_only and qi_k > 1:
+                qi_k = 0  # Disable QI smoothing
+
+            # Apply asymmetric smoothing
+            if qi_k > 1:
+                # QI: Tight smoothing (or raw) for precision
+                qi_sigma = self.gaussian_sigma * 0.5 if self.use_gaussian else 1.0  # Tighter sigma for QI
+                qi_scores = self._apply_smoothing(qi_scores, qi_k, use_gaussian=self.use_gaussian, sigma=qi_sigma)
+
+            if hi_k > 1:
+                # HI: Wider smoothing for context preservation
+                hi_scores = self._apply_smoothing(hi_scores, hi_k, use_gaussian=self.use_gaussian, sigma=self.gaussian_sigma)
 
             # v6.0.0: Direct rank normalization WITHOUT DA weighting
             # Pure Markov chain signals preserve transitive reasoning paths
@@ -3311,6 +3370,17 @@ def init_circuitkv(self):
         # v6.1.0: Smoothing Kernel
         if not hasattr(self.config, 'smoothing_kernel'):
             self.config.smoothing_kernel = 0  # 0=disabled, 5=recommended for phrase preservation
+        # v6.2.0: Asymmetric Gaussian Smoothing
+        if not hasattr(self.config, 'smooth_hi_only'):
+            self.config.smooth_hi_only = False  # If True, only smooth HI (keep QI sharp)
+        if not hasattr(self.config, 'use_gaussian'):
+            self.config.use_gaussian = False  # If True, use Gaussian kernel instead of boxcar
+        if not hasattr(self.config, 'qi_kernel_size'):
+            self.config.qi_kernel_size = 0  # 0=use smoothing_kernel, -1=raw/no smoothing
+        if not hasattr(self.config, 'hi_kernel_size'):
+            self.config.hi_kernel_size = 0  # 0=use smoothing_kernel
+        if not hasattr(self.config, 'gaussian_sigma'):
+            self.config.gaussian_sigma = 1.0  # Sigma for Gaussian kernel
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -3356,4 +3426,10 @@ def init_circuitkv(self):
         qi_ratio=self.config.qi_ratio,
         # v6.1.0: Smoothing Kernel
         smoothing_kernel=self.config.smoothing_kernel,
+        # v6.2.0: Asymmetric Gaussian Smoothing
+        smooth_hi_only=self.config.smooth_hi_only,
+        use_gaussian=self.config.use_gaussian,
+        qi_kernel_size=self.config.qi_kernel_size,
+        hi_kernel_size=self.config.hi_kernel_size,
+        gaussian_sigma=self.config.gaussian_sigma,
     )
