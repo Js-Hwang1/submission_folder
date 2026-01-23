@@ -451,6 +451,25 @@ def format_prompt(sample: Dict, dataset_name: str) -> str:
 # Main Analysis
 # ============================================================================
 
+class AttentionCaptureHook:
+    """Hook to capture attention weights from a single layer (memory-efficient)."""
+
+    def __init__(self):
+        self.attention = None
+
+    def __call__(self, module, args, kwargs, output):  # noqa: ARG002
+        # output is (hidden_states, attn_weights, past_key_value) when output_attentions=True
+        if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+            # Clone and detach to avoid holding computation graph
+            self.attention = output[1].detach()
+        return output
+
+    def clear(self):
+        if self.attention is not None:
+            del self.attention
+        self.attention = None
+
+
 @torch.no_grad()
 def analyze_sample(
     model,
@@ -458,15 +477,24 @@ def analyze_sample(
     sample: Dict,
     dataset_name: str,
     config: EntropyConfig,
+    attention_hook: AttentionCaptureHook,
+    _target_layer_idx: int,  # Used for documentation; hook already registered
 ) -> Dict:
     """
     Analyze a single sample, comparing baseline vs entropy-aware approach.
 
     Returns detailed diagnostics about attention patterns and token selection.
+
+    MEMORY FIX: Uses a hook to capture attention from ONLY the target layer,
+    instead of output_attentions=True which stores ALL layers.
     """
     # Format and tokenize
     prompt = format_prompt(sample, dataset_name)
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=8192)
+
+    # Truncate to reasonable length to avoid OOM
+    # We need enough context for multi-hop but not so much we OOM
+    max_len = 4096  # Reduced from 8192 for memory safety
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_len)
     input_ids = inputs.input_ids.to(model.device)
     seq_len = input_ids.shape[1]
 
@@ -477,23 +505,42 @@ def analyze_sample(
             'seq_len': seq_len,
         }
 
-    # Forward pass to get attention weights
-    outputs = model(
-        input_ids,
-        output_attentions=True,
-        use_cache=False,
-    )
+    # Clear previous attention capture
+    attention_hook.clear()
 
-    # Get attention from middle layer (layer 16 for 32-layer model)
-    n_layers = len(outputs.attentions)
-    mid_layer = n_layers // 2
+    # Forward pass - hook captures attention from target layer only
+    # We enable output_attentions but the hook captures before it accumulates
+    try:
+        _ = model(
+            input_ids,
+            output_attentions=True,  # Needed for hook to receive attention
+            use_cache=False,
+        )
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return {
+            'skipped': True,
+            'reason': f'OOM at seq_len={seq_len}',
+            'seq_len': seq_len,
+        }
 
-    # attentions[layer]: [bsz, num_heads, seq_len, seq_len]
-    attn = outputs.attentions[mid_layer]
+    # Get captured attention from hook
+    if attention_hook.attention is None:
+        return {
+            'skipped': True,
+            'reason': 'Hook failed to capture attention',
+            'seq_len': seq_len,
+        }
+
+    attn = attention_hook.attention  # [bsz, num_heads, seq_len, seq_len]
 
     # Extract window portion for analysis
     window_size = min(config.window_size, seq_len)
     attn_window = attn[:, :, -window_size:, :]  # [bsz, heads, window, seq_len]
+
+    # Clear to free memory
+    attention_hook.clear()
+    torch.cuda.empty_cache()
 
     # Baseline (v6.2.0): All heads
     qi_baseline, hi_baseline = baseline_importance(attn_window, seq_len, config)
@@ -580,6 +627,17 @@ def main():
     )
     model.eval()
 
+    # Set up attention capture hook on middle layer
+    # Qwen2.5-7B has 28 layers, so middle is layer 14
+    n_layers = len(model.model.layers)
+    target_layer_idx = n_layers // 2
+    print(f"Capturing attention from layer {target_layer_idx} of {n_layers}")
+
+    attention_hook = AttentionCaptureHook()
+    hook_handle = model.model.layers[target_layer_idx].self_attn.register_forward_hook(
+        attention_hook, with_kwargs=True
+    )
+
     # Datasets to analyze
     datasets_to_test = [
         ("musique", "Multi-hop QA (TARGET - should improve)"),
@@ -604,7 +662,10 @@ def main():
         entropy_stats = defaultdict(list)
 
         for i, sample in enumerate(tqdm(samples, desc=f"Analyzing {dataset_name}")):
-            result = analyze_sample(model, tokenizer, sample, dataset_name, config)
+            result = analyze_sample(
+                model, tokenizer, sample, dataset_name, config,
+                attention_hook, target_layer_idx
+            )
             results.append(result)
 
             if not result['skipped']:
@@ -686,6 +747,9 @@ Next Steps:
   implement entropy_aware_P in pyramidkv_utils.py for full benchmark.
 - Run v6.5.0 on H200 with full LongBench.
 """)
+
+    # Cleanup
+    hook_handle.remove()
 
 
 if __name__ == "__main__":
