@@ -1727,7 +1727,12 @@ class CircuitKVCluster():
             log.flush()
 
     def _lazy_init(self, device, seq_len: int):
-        """Initialize CUDA graph on first use."""
+        """Initialize CUDA graph on first use (only needed for random walk mode)."""
+        # v6.5.0: Skip CUDA graph init when using Neumann series (pure PyTorch path)
+        if self.use_neumann:
+            self._device = device
+            return
+
         if self._graph is None or self._device != device:
             try:
                 from circuit_kv import _C as circuit_kv_cuda
