@@ -317,6 +317,8 @@ def main(args):
                 # v4.4.0: Per-head eviction
                 model.model.layers[i].self_attn.config.per_head_eviction = args.per_head_eviction
                 model.model.layers[i].self_attn.config.per_head_hi_weight = args.per_head_hi_weight
+                # v6.1.0: Smoothing kernel
+                model.model.layers[i].self_attn.config.smoothing_kernel = args.smoothing_kernel
                 # MarkovKV tuning parameters
                 model.model.layers[i].self_attn.config.neumann_iterations = args.neumann_iterations
                 if args.window_size_override is not None:
@@ -428,6 +430,8 @@ if __name__ == "__main__":
     # v4.4.0: Per-head eviction
     parser.add_argument("--per_head_eviction", action="store_true", help="Enable per-head eviction (each head keeps different tokens, like SnapKV)")
     parser.add_argument("--per_head_hi_weight", type=float, default=0.3, help="Weight for HI in per-head combination (0.0 = H2O only, 1.0 = HI only)")
+    # v6.1.0: Smoothing kernel
+    parser.add_argument("--smoothing_kernel", type=int, default=0, help="Smoothing kernel size (0=disabled, 5=recommended). Preserves phrase structure by promoting neighbors of important tokens.")
     # MarkovKV tuning parameters
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")

@@ -1297,6 +1297,8 @@ class CircuitKVCluster():
         # v4.4.0: Per-head eviction (like SnapKV)
         per_head_eviction: bool = False,  # If True, each head keeps different tokens
         per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
+        # v6.1.0: Smoothing Kernel for phrase preservation
+        smoothing_kernel: int = 0,  # Kernel size for score smoothing (0=disabled, 5=recommended)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1329,6 +1331,8 @@ class CircuitKVCluster():
         # v4.4.0: Per-head eviction
         self.per_head_eviction = per_head_eviction
         self.per_head_hi_weight = per_head_hi_weight
+        # v6.1.0: Smoothing Kernel
+        self.smoothing_kernel = smoothing_kernel
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1715,6 +1719,48 @@ class CircuitKVCluster():
         if n <= 1:
             return torch.ones_like(ranks)
         return ranks / (n - 1)
+
+    def _apply_smoothing(self, scores: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        """
+        v6.1.0: Apply 1D smoothing kernel to preserve phrase structure.
+
+        The "Token Isolation" Problem:
+        - Raw Markov scores spike on individual important tokens
+        - Selection keeps "Paris" but deletes "is" from "Paris is the capital"
+        - LLM loses syntactic context needed for reasoning
+
+        Solution: Low-pass filter (1D convolution) that promotes neighbors of important tokens.
+        If token j is important, tokens j-1 and j+1 get boosted to "survival status."
+
+        This approximates SnapKV's window pooling behavior without rigid boundaries.
+
+        Args:
+            scores: Raw importance scores [seq_len]
+            kernel_size: Size of smoothing window (odd recommended: 3, 5, 7)
+
+        Returns:
+            Smoothed scores [seq_len] preserving phrase structure
+        """
+        if kernel_size <= 1:
+            return scores
+
+        n = len(scores)
+        if n <= kernel_size:
+            return scores
+
+        # Reshape for Conv1d: [batch=1, channel=1, length=n]
+        scores_3d = scores.view(1, 1, -1)
+
+        # Create boxcar (averaging) kernel
+        weight = torch.ones(1, 1, kernel_size, device=scores.device, dtype=scores.dtype) / kernel_size
+
+        # Padding to preserve length (phase-aligned output)
+        padding = kernel_size // 2
+
+        # Apply convolution
+        smoothed = F.conv1d(scores_3d, weight, padding=padding)
+
+        return smoothed.flatten()[:n]  # Ensure exact length match
 
     def _compute_influence_neumann(
         self,
@@ -2409,8 +2455,13 @@ class CircuitKVCluster():
             version = "v5.0.0"
             da_note = ""
         elif self.combination_mode == "dis":
-            version = "v6.0.0"
-            da_note = ""  # v6.0.0: NO DA weighting (pure Markov)
+            # v6.0.0: No DA, v6.1.0: With smoothing kernel
+            if self.smoothing_kernel > 1:
+                version = "v6.1.0"
+                da_note = f", smooth={self.smoothing_kernel}"
+            else:
+                version = "v6.0.0"
+                da_note = ""  # v6.0.0: NO DA weighting (pure Markov)
         else:
             version = "v4.5.0"
             da_note = ", DA-weighted"
@@ -2580,6 +2631,14 @@ class CircuitKVCluster():
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
             )
+
+            # v6.1.0: Apply smoothing kernel to preserve phrase structure
+            # The "Token Isolation" Problem: Raw scores spike on individual tokens,
+            # but we need to keep syntactic neighbors for LLM reasoning.
+            # Smoothing promotes neighbors of important tokens to survival status.
+            if self.smoothing_kernel > 1:
+                qi_scores = self._apply_smoothing(qi_scores, self.smoothing_kernel)
+                hi_scores = self._apply_smoothing(hi_scores, self.smoothing_kernel)
 
             # v6.0.0: Direct rank normalization WITHOUT DA weighting
             # Pure Markov chain signals preserve transitive reasoning paths
@@ -3249,6 +3308,9 @@ def init_circuitkv(self):
         # v5.0.0: Union Selection
         if not hasattr(self.config, 'qi_ratio'):
             self.config.qi_ratio = 0.5  # Ratio of budget for QI in Union mode
+        # v6.1.0: Smoothing Kernel
+        if not hasattr(self.config, 'smoothing_kernel'):
+            self.config.smoothing_kernel = 0  # 0=disabled, 5=recommended for phrase preservation
 
     self.kv_cluster = CircuitKVCluster(
         window_size=self.config.window_size,
@@ -3292,4 +3354,6 @@ def init_circuitkv(self):
         per_head_hi_weight=self.config.per_head_hi_weight,
         # v5.0.0: Union Selection
         qi_ratio=self.config.qi_ratio,
+        # v6.1.0: Smoothing Kernel
+        smoothing_kernel=self.config.smoothing_kernel,
     )
