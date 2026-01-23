@@ -50,7 +50,7 @@ class EntropyConfig:
 # Core Entropy-Aware Functions
 # ============================================================================
 
-def compute_head_entropy(attn_weights: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+def compute_head_entropy(attn_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     Compute entropy for each attention head.
 
@@ -64,12 +64,16 @@ def compute_head_entropy(attn_weights: torch.Tensor, eps: float = 1e-10) -> torc
     Returns:
         entropy: [num_heads] entropy for each head (averaged over batch and queries)
     """
-    # Clamp to avoid log(0)
-    attn_clamped = attn_weights.clamp(min=eps)
+    # CRITICAL: Convert to float32 to avoid NaN from float16 log operations
+    attn_f32 = attn_weights.float()
+
+    # Clamp to avoid log(0) - use larger eps for numerical stability
+    attn_clamped = attn_f32.clamp(min=eps)
 
     # H = -sum(p * log(p)) for each query position
     # Shape: [bsz, num_heads, window_size]
-    entropy_per_query = -(attn_clamped * torch.log(attn_clamped)).sum(dim=-1)
+    log_attn = torch.log(attn_clamped)
+    entropy_per_query = -(attn_clamped * log_attn).sum(dim=-1)
 
     # Average over batch and query positions
     # Shape: [num_heads]
