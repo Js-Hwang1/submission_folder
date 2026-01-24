@@ -1308,6 +1308,8 @@ class CircuitKVCluster():
         # v6.5.0: Entropy-Aware Head Selection
         entropy_aware: bool = False,  # If True, use sharpest heads for QI, all heads for HI
         top_k_heads: int = 8,  # Number of sharpest (lowest entropy) heads for QI
+        # v6.5.1: Head Selection Mode - choose between entropy and transient mass
+        head_selection_mode: str = "entropy",  # "entropy" (lowest entropy) or "mass" (highest transient mass)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1351,6 +1353,8 @@ class CircuitKVCluster():
         # v6.5.0: Entropy-Aware Head Selection
         self.entropy_aware = entropy_aware
         self.top_k_heads = top_k_heads
+        # v6.5.1: Head Selection Mode
+        self.head_selection_mode = head_selection_mode
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1433,6 +1437,37 @@ class CircuitKVCluster():
         entropy_per_head = entropy_per_query.mean(dim=(0, 2))  # [num_heads]
 
         return entropy_per_head
+
+    def _compute_head_transient_mass(self, attn_weights: torch.Tensor, sink_size: int) -> torch.Tensor:
+        """
+        v6.5.1: Compute transient mass per attention head.
+
+        Transient mass = sum of attention to NON-SINK tokens.
+        High transient mass means the head connects content to content.
+        Low transient mass means the head mostly looks at sink tokens.
+
+        This is a more direct measure than entropy because:
+        - A sharp head (low entropy) could attend 100% to sink → useless for reasoning
+        - A high transient mass head actually connects content tokens
+
+        Args:
+            attn_weights: [bsz, num_heads, window_size, seq_len] - softmax attention
+            sink_size: Number of sink tokens at the beginning
+
+        Returns:
+            transient_mass: [num_heads] - transient mass per head (higher = more content connectivity)
+        """
+        # Sum attention to non-sink tokens (transient states in Markov chain terminology)
+        # attn_weights[..., sink_size:] = attention to content tokens only
+        transient_attn = attn_weights[..., sink_size:]  # [bsz, heads, window, seq-sink]
+
+        # Sum across the key dimension to get row sums (how much each query looks at content)
+        row_sums = transient_attn.sum(dim=-1)  # [bsz, heads, window]
+
+        # Average across batch and query positions to get per-head score
+        transient_mass_per_head = row_sums.mean(dim=(0, 2))  # [num_heads]
+
+        return transient_mass_per_head
 
     def _init_debug_log(self):
         """Initialize debug log (uses module-level singleton)."""
@@ -2603,27 +2638,34 @@ class CircuitKVCluster():
 
         # =====================================================================
         # v6.5.0: Entropy-Aware Head Selection
-        # Sharp heads (low entropy) are used for QI, all heads for HI
+        # v6.5.1: Transient Mass Selection (alternative to entropy)
+        # Sharp heads (low entropy) OR high transient mass heads are used for QI
         # =====================================================================
         full_attn_hi = None  # Will be set if entropy_aware=True
 
         if self.entropy_aware:
-            # Compute entropy per head (lower = sharper attention)
-            head_entropy = self._compute_head_entropy(attn_weights)  # [num_heads]
-            num_heads = head_entropy.shape[0]
-
-            # Select top-K sharpest heads (lowest entropy)
+            num_heads = attn_weights.shape[1]
             k = min(self.top_k_heads, num_heads)
-            _, sharp_head_indices = torch.topk(head_entropy, k, largest=False)
 
-            # attn_avg_qi: Max-pool over sharp heads only (for QI)
-            attn_sharp_heads = attn_weights[:, sharp_head_indices, :, :]  # [bsz, k, window, seq]
-            attn_avg_qi = attn_sharp_heads.max(dim=1).values.mean(dim=0)  # [window, seq]
+            if self.head_selection_mode == "mass":
+                # v6.5.1: Transient Mass Selection
+                # Select heads with highest content-to-content connectivity
+                head_mass = self._compute_head_transient_mass(attn_weights, self.sink_size)
+                _, selected_head_indices = torch.topk(head_mass, k, largest=True)  # Highest mass
+            else:
+                # v6.5.0: Entropy Selection (default)
+                # Select heads with lowest entropy (sharpest attention)
+                head_entropy = self._compute_head_entropy(attn_weights)
+                _, selected_head_indices = torch.topk(head_entropy, k, largest=False)  # Lowest entropy
+
+            # attn_avg_qi: Max-pool over selected heads only (for QI)
+            attn_selected_heads = attn_weights[:, selected_head_indices, :, :]  # [bsz, k, window, seq]
+            attn_avg_qi = attn_selected_heads.max(dim=1).values.mean(dim=0)  # [window, seq]
 
             # attn_avg_hi: Max-pool over all heads (for HI) - current behavior
             attn_avg_hi = attn_weights.max(dim=1).values.mean(dim=0)  # [window, seq]
 
-            # Use sharp-head attention for the main flow (QI matrix)
+            # Use selected-head attention for the main flow (QI matrix)
             attn_avg = attn_avg_qi
         else:
             # Default: use all heads for both QI and HI
@@ -3524,4 +3566,6 @@ def init_circuitkv(self):
         # v6.5.0: Entropy-Aware Head Selection
         entropy_aware=getattr(self.config, 'entropy_aware', False),
         top_k_heads=getattr(self.config, 'top_k_heads', 8),
+        # v6.5.1: Head Selection Mode
+        head_selection_mode=getattr(self.config, 'head_selection_mode', 'entropy'),
     )

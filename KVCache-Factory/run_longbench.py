@@ -334,6 +334,8 @@ def main(args):
                 # v6.5.0: Entropy-aware head selection
                 model.model.layers[i].self_attn.config.entropy_aware = args.entropy_aware
                 model.model.layers[i].self_attn.config.top_k_heads = args.top_k_heads
+                # v6.5.1: Head selection mode
+                model.model.layers[i].self_attn.config.head_selection_mode = args.head_selection_mode
                 if args.window_size_override is not None:
                     model.model.layers[i].self_attn.config.window_size = args.window_size_override
             
@@ -459,6 +461,8 @@ if __name__ == "__main__":
     # v6.5.0: Entropy-aware head selection
     parser.add_argument("--entropy_aware", action="store_true", help="v6.5.0: Use entropy-aware head selection (sharp heads for QI, all heads for HI)")
     parser.add_argument("--top_k_heads", type=int, default=8, help="Number of sharpest (lowest entropy) heads to use for QI when --entropy_aware is set")
+    parser.add_argument("--head_selection_mode", type=str, default="entropy", choices=["entropy", "mass"],
+                        help="v6.5.1: Head selection mode - 'entropy' (lowest entropy) or 'mass' (highest transient mass)")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
