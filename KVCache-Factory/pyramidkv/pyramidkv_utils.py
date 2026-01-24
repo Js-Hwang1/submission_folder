@@ -1312,6 +1312,8 @@ class CircuitKVCluster():
         head_selection_mode: str = "entropy",  # "entropy" (lowest entropy) or "mass" (highest transient mass)
         # v6.7.0: HI Pooling Mode - how to aggregate heads for HI
         hi_pooling_mode: str = "mean",  # "mean" (consensus, v6.7) or "max" (peak, v6.5)
+        # v6.8.0: Mass-Filtered Hubs - prune dead heads from HI consensus
+        hi_mass_threshold: float = 0.0,  # Min transient mass to include head in HI (0=all, 0.1=filter dead)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1359,6 +1361,8 @@ class CircuitKVCluster():
         self.head_selection_mode = head_selection_mode
         # v6.7.0: HI Pooling Mode
         self.hi_pooling_mode = hi_pooling_mode
+        # v6.8.0: Mass-Filtered Hubs
+        self.hi_mass_threshold = hi_mass_threshold
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2668,10 +2672,28 @@ class CircuitKVCluster():
             attn_avg_qi = attn_selected_heads.max(dim=1).values.mean(dim=0)  # [window, seq]
 
             # v6.7.0: HI pooling mode selection
+            # v6.8.0: Mass-filtered hubs - filter dead heads before MEAN pooling
             if self.hi_pooling_mode == "mean":
                 # MEAN captures consensus/hub structure, prevents sharp heads from dominating
                 # This fixes TREC/passage_count by preserving "broad context" heads
-                attn_avg_hi = attn_weights.mean(dim=1).mean(dim=0)  # [window, seq]
+                if self.hi_mass_threshold > 0:
+                    # v6.8.0: Filter out dead heads (heads with low transient mass)
+                    # Dead heads mostly attend to sink tokens and add noise to consensus
+                    head_mass = self._compute_head_transient_mass(attn_weights, self.sink_size)
+                    alive_mask = head_mass >= self.hi_mass_threshold  # [num_heads]
+                    n_alive = alive_mask.sum().item()
+
+                    if n_alive > 0:
+                        # MEAN over alive heads only
+                        alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+                        attn_alive = attn_weights[:, alive_indices, :, :]  # [bsz, n_alive, window, seq]
+                        attn_avg_hi = attn_alive.mean(dim=1).mean(dim=0)  # [window, seq]
+                    else:
+                        # Fallback: all heads are dead, use all anyway
+                        attn_avg_hi = attn_weights.mean(dim=1).mean(dim=0)
+                else:
+                    # v6.7 behavior: MEAN over all heads
+                    attn_avg_hi = attn_weights.mean(dim=1).mean(dim=0)  # [window, seq]
             else:
                 # v6.5 behavior: MAX pooling (sharp heads dominate)
                 attn_avg_hi = attn_weights.max(dim=1).values.mean(dim=0)  # [window, seq]
@@ -3581,4 +3603,6 @@ def init_circuitkv(self):
         head_selection_mode=getattr(self.config, 'head_selection_mode', 'entropy'),
         # v6.7.0: HI Pooling Mode
         hi_pooling_mode=getattr(self.config, 'hi_pooling_mode', 'mean'),
+        # v6.8.0: Mass-Filtered Hubs
+        hi_mass_threshold=getattr(self.config, 'hi_mass_threshold', 0.0),
     )
