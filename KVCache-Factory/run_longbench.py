@@ -421,6 +421,7 @@ if __name__ == "__main__":
     
     parser.add_argument("--use_cache", type=bool, default=True, help="")
     parser.add_argument("--attn_implementation", type=str,  default="flash_attention_2", choices=["flash_attention_2", "sdpa", "eager"])
+    parser.add_argument("--max_seq_length", type=int, default=None, help="Override max sequence length (useful for non-FlashAttn backends)")
     parser.add_argument("--method", type=str,  default=None)
     parser.add_argument("--quant_method",type=str,default=None,choices=["kivi","kvquant"])
     parser.add_argument("--nbits", type=int, default=8, help="")
