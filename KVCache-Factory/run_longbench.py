@@ -340,6 +340,8 @@ def main(args):
                 model.model.layers[i].self_attn.config.hi_pooling_mode = args.hi_pooling_mode
                 # v6.8.0: Mass-filtered hubs
                 model.model.layers[i].self_attn.config.hi_mass_threshold = args.hi_mass_threshold
+                # v6.8.1: Top-K mass heads for HI
+                model.model.layers[i].self_attn.config.hi_top_k_heads = args.hi_top_k_heads
                 if args.window_size_override is not None:
                     model.model.layers[i].self_attn.config.window_size = args.window_size_override
             
@@ -471,6 +473,8 @@ if __name__ == "__main__":
                         help="v6.7.0: HI pooling mode - 'mean' (consensus, default) or 'max' (peak, v6.5 behavior)")
     parser.add_argument("--hi_mass_threshold", type=float, default=0.0,
                         help="v6.8.0: Min transient mass to include head in HI (0=all, 0.1=filter dead heads)")
+    parser.add_argument("--hi_top_k_heads", type=int, default=0,
+                        help="v6.8.1: Select top-k heads by transient mass for HI (0=disabled, use threshold)")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")

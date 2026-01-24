@@ -1314,6 +1314,8 @@ class CircuitKVCluster():
         hi_pooling_mode: str = "mean",  # "mean" (consensus, v6.7) or "max" (peak, v6.5)
         # v6.8.0: Mass-Filtered Hubs - prune dead heads from HI consensus
         hi_mass_threshold: float = 0.0,  # Min transient mass to include head in HI (0=all, 0.1=filter dead)
+        # v6.8.1: Top-K Mass Heads for HI - select top-k heads by transient mass instead of threshold
+        hi_top_k_heads: int = 0,  # 0=disabled (use threshold), >0=select top-k heads by mass for HI
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1363,6 +1365,8 @@ class CircuitKVCluster():
         self.hi_pooling_mode = hi_pooling_mode
         # v6.8.0: Mass-Filtered Hubs
         self.hi_mass_threshold = hi_mass_threshold
+        # v6.8.1: Top-K Mass Heads for HI
+        self.hi_top_k_heads = hi_top_k_heads
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2673,10 +2677,20 @@ class CircuitKVCluster():
 
             # v6.7.0: HI pooling mode selection
             # v6.8.0: Mass-filtered hubs - filter dead heads before MEAN pooling
+            # v6.8.1: Top-K mass heads - select top-k heads by mass for HI
             if self.hi_pooling_mode == "mean":
                 # MEAN captures consensus/hub structure, prevents sharp heads from dominating
                 # This fixes TREC/passage_count by preserving "broad context" heads
-                if self.hi_mass_threshold > 0:
+                if self.hi_top_k_heads > 0:
+                    # v6.8.1: Select top-k heads by transient mass for HI
+                    # More principled than threshold - always uses exactly k high-connectivity heads
+                    head_mass = self._compute_head_transient_mass(attn_weights, self.sink_size)
+                    num_heads = head_mass.shape[0]
+                    k = min(self.hi_top_k_heads, num_heads)
+                    _, top_k_indices = head_mass.topk(k)  # [k]
+                    attn_top_k = attn_weights[:, top_k_indices, :, :]  # [bsz, k, window, seq]
+                    attn_avg_hi = attn_top_k.mean(dim=1).mean(dim=0)  # [window, seq]
+                elif self.hi_mass_threshold > 0:
                     # v6.8.0: Filter out dead heads (heads with low transient mass)
                     # Dead heads mostly attend to sink tokens and add noise to consensus
                     head_mass = self._compute_head_transient_mass(attn_weights, self.sink_size)
@@ -3605,4 +3619,6 @@ def init_circuitkv(self):
         hi_pooling_mode=getattr(self.config, 'hi_pooling_mode', 'mean'),
         # v6.8.0: Mass-Filtered Hubs
         hi_mass_threshold=getattr(self.config, 'hi_mass_threshold', 0.0),
+        # v6.8.1: Top-K Mass Heads for HI
+        hi_top_k_heads=getattr(self.config, 'hi_top_k_heads', 0),
     )
