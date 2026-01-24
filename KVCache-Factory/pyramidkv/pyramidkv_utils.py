@@ -2659,11 +2659,14 @@ class CircuitKVCluster():
                 _, selected_head_indices = torch.topk(head_entropy, k, largest=False)  # Lowest entropy
 
             # attn_avg_qi: Max-pool over selected heads only (for QI)
+            # MAX preserves strong "needle" signals from sharp heads
             attn_selected_heads = attn_weights[:, selected_head_indices, :, :]  # [bsz, k, window, seq]
             attn_avg_qi = attn_selected_heads.max(dim=1).values.mean(dim=0)  # [window, seq]
 
-            # attn_avg_hi: Max-pool over all heads (for HI) - current behavior
-            attn_avg_hi = attn_weights.max(dim=1).values.mean(dim=0)  # [window, seq]
+            # v6.7.0: attn_avg_hi: MEAN-pool over all heads (for HI)
+            # MEAN captures consensus/hub structure, prevents sharp heads from dominating
+            # This fixes TREC/passage_count by preserving "broad context" heads
+            attn_avg_hi = attn_weights.mean(dim=1).mean(dim=0)  # [window, seq]
 
             # Use selected-head attention for the main flow (QI matrix)
             attn_avg = attn_avg_qi
