@@ -1310,6 +1310,8 @@ class CircuitKVCluster():
         top_k_heads: int = 8,  # Number of sharpest (lowest entropy) heads for QI
         # v6.5.1: Head Selection Mode - choose between entropy and transient mass
         head_selection_mode: str = "entropy",  # "entropy" (lowest entropy) or "mass" (highest transient mass)
+        # v6.7.0: HI Pooling Mode - how to aggregate heads for HI
+        hi_pooling_mode: str = "mean",  # "mean" (consensus, v6.7) or "max" (peak, v6.5)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1355,6 +1357,8 @@ class CircuitKVCluster():
         self.top_k_heads = top_k_heads
         # v6.5.1: Head Selection Mode
         self.head_selection_mode = head_selection_mode
+        # v6.7.0: HI Pooling Mode
+        self.hi_pooling_mode = hi_pooling_mode
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2663,10 +2667,14 @@ class CircuitKVCluster():
             attn_selected_heads = attn_weights[:, selected_head_indices, :, :]  # [bsz, k, window, seq]
             attn_avg_qi = attn_selected_heads.max(dim=1).values.mean(dim=0)  # [window, seq]
 
-            # v6.7.0: attn_avg_hi: MEAN-pool over all heads (for HI)
-            # MEAN captures consensus/hub structure, prevents sharp heads from dominating
-            # This fixes TREC/passage_count by preserving "broad context" heads
-            attn_avg_hi = attn_weights.mean(dim=1).mean(dim=0)  # [window, seq]
+            # v6.7.0: HI pooling mode selection
+            if self.hi_pooling_mode == "mean":
+                # MEAN captures consensus/hub structure, prevents sharp heads from dominating
+                # This fixes TREC/passage_count by preserving "broad context" heads
+                attn_avg_hi = attn_weights.mean(dim=1).mean(dim=0)  # [window, seq]
+            else:
+                # v6.5 behavior: MAX pooling (sharp heads dominate)
+                attn_avg_hi = attn_weights.max(dim=1).values.mean(dim=0)  # [window, seq]
 
             # Use selected-head attention for the main flow (QI matrix)
             attn_avg = attn_avg_qi
@@ -3571,4 +3579,6 @@ def init_circuitkv(self):
         top_k_heads=getattr(self.config, 'top_k_heads', 8),
         # v6.5.1: Head Selection Mode
         head_selection_mode=getattr(self.config, 'head_selection_mode', 'entropy'),
+        # v6.7.0: HI Pooling Mode
+        hi_pooling_mode=getattr(self.config, 'hi_pooling_mode', 'mean'),
     )
