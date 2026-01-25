@@ -1316,6 +1316,8 @@ class CircuitKVCluster():
         hi_mass_threshold: float = 0.0,  # Min transient mass to include head in HI (0=all, 0.1=filter dead)
         # v6.8.1: Top-K Mass Heads for HI - select top-k heads by transient mass instead of threshold
         hi_top_k_heads: int = 0,  # 0=disabled (use threshold), >0=select top-k heads by mass for HI
+        # v6.9.0: CDF-Based Head Selection - select heads until cumulative mass >= threshold
+        hi_mass_cdf: float = 0.0,  # 0=disabled, 0.85=select heads covering 85% of total transient mass
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1367,6 +1369,8 @@ class CircuitKVCluster():
         self.hi_mass_threshold = hi_mass_threshold
         # v6.8.1: Top-K Mass Heads for HI
         self.hi_top_k_heads = hi_top_k_heads
+        # v6.9.0: CDF-Based Head Selection
+        self.hi_mass_cdf = hi_mass_cdf
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2678,10 +2682,31 @@ class CircuitKVCluster():
             # v6.7.0: HI pooling mode selection
             # v6.8.0: Mass-filtered hubs - filter dead heads before MEAN pooling
             # v6.8.1: Top-K mass heads - select top-k heads by mass for HI
+            # v6.9.0: CDF-based head selection - select heads covering X% of total mass
             if self.hi_pooling_mode == "mean":
                 # MEAN captures consensus/hub structure, prevents sharp heads from dominating
                 # This fixes TREC/passage_count by preserving "broad context" heads
-                if self.hi_top_k_heads > 0:
+                if self.hi_mass_cdf > 0:
+                    # v6.9.0: Select heads until cumulative mass >= threshold
+                    # Adaptive: uses fewer heads if mass is concentrated, more if distributed
+                    head_mass = self._compute_head_transient_mass(attn_weights, self.sink_size)
+                    total_mass = head_mass.sum()
+                    if total_mass > 0:
+                        # Sort heads by mass descending
+                        sorted_mass, sorted_indices = head_mass.sort(descending=True)
+                        # Compute cumulative sum normalized (CDF)
+                        cumsum = sorted_mass.cumsum(dim=0) / total_mass
+                        # Find how many heads needed to reach threshold
+                        n_heads_needed = (cumsum < self.hi_mass_cdf).sum().item() + 1
+                        n_heads_needed = min(n_heads_needed, head_mass.shape[0])
+                        # Select top heads by mass
+                        selected_indices = sorted_indices[:n_heads_needed]
+                        attn_selected = attn_weights[:, selected_indices, :, :]
+                        attn_avg_hi = attn_selected.mean(dim=1).mean(dim=0)  # [window, seq]
+                    else:
+                        # Fallback: all heads have zero mass
+                        attn_avg_hi = attn_weights.mean(dim=1).mean(dim=0)
+                elif self.hi_top_k_heads > 0:
                     # v6.8.1: Select top-k heads by transient mass for HI
                     # More principled than threshold - always uses exactly k high-connectivity heads
                     head_mass = self._compute_head_transient_mass(attn_weights, self.sink_size)
@@ -3621,4 +3646,6 @@ def init_circuitkv(self):
         hi_mass_threshold=getattr(self.config, 'hi_mass_threshold', 0.0),
         # v6.8.1: Top-K Mass Heads for HI
         hi_top_k_heads=getattr(self.config, 'hi_top_k_heads', 0),
+        # v6.9.0: CDF-Based Head Selection
+        hi_mass_cdf=getattr(self.config, 'hi_mass_cdf', 0.0),
     )
