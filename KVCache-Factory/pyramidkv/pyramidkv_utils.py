@@ -1318,6 +1318,8 @@ class CircuitKVCluster():
         hi_top_k_heads: int = 0,  # 0=disabled (use threshold), >0=select top-k heads by mass for HI
         # v6.9.0: CDF-Based Head Selection - select heads until cumulative mass >= threshold
         hi_mass_cdf: float = 0.0,  # 0=disabled, 0.85=select heads covering 85% of total transient mass
+        # Diagnostic: log head selection stats
+        hi_log_head_stats: bool = False,
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1371,6 +1373,8 @@ class CircuitKVCluster():
         self.hi_top_k_heads = hi_top_k_heads
         # v6.9.0: CDF-Based Head Selection
         self.hi_mass_cdf = hi_mass_cdf
+        # Diagnostic logging
+        self.hi_log_head_stats = hi_log_head_stats
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2721,6 +2725,17 @@ class CircuitKVCluster():
                     head_mass = self._compute_head_transient_mass(attn_weights, self.sink_size)
                     alive_mask = head_mass >= self.hi_mass_threshold  # [num_heads]
                     n_alive = alive_mask.sum().item()
+                    num_heads = head_mass.shape[0]
+
+                    # Diagnostic logging for head stats
+                    if getattr(self, 'hi_log_head_stats', False):
+                        mass_sorted, _ = head_mass.sort(descending=True)
+                        print(f"[HI-DIAG] layer={getattr(self, '_layer_idx', '?')} "
+                              f"n_heads={num_heads} n_alive={n_alive} "
+                              f"threshold={self.hi_mass_threshold:.2f} "
+                              f"mass_range=[{head_mass.min().item():.3f}, {head_mass.max().item():.3f}] "
+                              f"mass_mean={head_mass.mean().item():.3f} "
+                              f"top5_mass={mass_sorted[:5].tolist()}")
 
                     if n_alive > 0:
                         # MEAN over alive heads only
@@ -3648,4 +3663,6 @@ def init_circuitkv(self):
         hi_top_k_heads=getattr(self.config, 'hi_top_k_heads', 0),
         # v6.9.0: CDF-Based Head Selection
         hi_mass_cdf=getattr(self.config, 'hi_mass_cdf', 0.0),
+        # Diagnostic logging
+        hi_log_head_stats=getattr(self.config, 'hi_log_head_stats', False),
     )

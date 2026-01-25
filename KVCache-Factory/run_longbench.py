@@ -344,6 +344,8 @@ def main(args):
                 model.model.layers[i].self_attn.config.hi_top_k_heads = args.hi_top_k_heads
                 # v6.9.0: CDF-based head selection for HI
                 model.model.layers[i].self_attn.config.hi_mass_cdf = args.hi_mass_cdf
+                # Diagnostic logging
+                model.model.layers[i].self_attn.config.hi_log_head_stats = args.hi_log_head_stats
                 if args.window_size_override is not None:
                     model.model.layers[i].self_attn.config.window_size = args.window_size_override
             
@@ -479,6 +481,8 @@ if __name__ == "__main__":
                         help="v6.8.1: Select top-k heads by transient mass for HI (0=disabled, use threshold)")
     parser.add_argument("--hi_mass_cdf", type=float, default=0.0,
                         help="v6.9.0: Select heads covering X%% of total transient mass for HI (0=disabled, 0.85=85%%)")
+    parser.add_argument("--hi_log_head_stats", action="store_true",
+                        help="Log diagnostic stats about head selection (n_alive, mass distribution)")
     parser.add_argument("--window_size_override", type=int, default=None, help="Override local window size (default: 8 from run_longbench, 32/64 recommended for long ctx)")
     parser.add_argument("--max_gpu_memory", type=str, default=None,
                         help="Max GPU memory to use (e.g., '80GiB'). Remainder offloaded to CPU. Useful for GH200 unified memory.")
