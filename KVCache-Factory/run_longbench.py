@@ -460,23 +460,23 @@ if __name__ == "__main__":
     parser.add_argument("--smoothing_kernel", type=int, default=0, help="Smoothing kernel size (0=disabled, 5=recommended). Preserves phrase structure by promoting neighbors of important tokens.")
     # v6.2.0: Asymmetric Gaussian Smoothing
     parser.add_argument("--smooth_hi_only", action="store_true", help="Only smooth HI (keep QI sharp for precision on code/classification)")
-    parser.add_argument("--use_gaussian", action="store_true", help="Use Gaussian kernel instead of boxcar (preserves center spike while lifting neighbors)")
-    parser.add_argument("--qi_kernel_size", type=int, default=0, help="Kernel size for QI smoothing (0=use smoothing_kernel, -1=raw/no smoothing)")
-    parser.add_argument("--hi_kernel_size", type=int, default=0, help="Kernel size for HI smoothing (0=use smoothing_kernel)")
+    parser.add_argument("--use_gaussian", action=argparse.BooleanOptionalAction, default=True, help="Use Gaussian kernel instead of boxcar (default: True)")
+    parser.add_argument("--qi_kernel_size", type=int, default=3, help="Kernel size for QI smoothing (default: 3)")
+    parser.add_argument("--hi_kernel_size", type=int, default=5, help="Kernel size for HI smoothing (default: 5)")
     parser.add_argument("--gaussian_sigma", type=float, default=1.0, help="Sigma for Gaussian kernel (QI uses sigma*0.5 for tighter smoothing)")
     # MarkovKV tuning parameters
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
-    parser.add_argument("--sink_size", type=int, default=4, help="Absorbing boundary size (first N tokens always kept). Increase for multi-hop tasks.")
+    parser.add_argument("--sink_size", type=int, default=64, help="Absorbing boundary size (first N tokens always kept). Default: 64 for multi-hop tasks.")
     parser.add_argument("--neumann_temperature", type=float, default=1.0, help="Temperature for transition sharpening (<1.0 = sharper, prevents signal diffusion)")
     # v6.5.0: Entropy-aware head selection
-    parser.add_argument("--entropy_aware", action="store_true", help="v6.5.0: Use entropy-aware head selection (sharp heads for QI, all heads for HI)")
-    parser.add_argument("--top_k_heads", type=int, default=8, help="Number of sharpest (lowest entropy) heads to use for QI when --entropy_aware is set")
+    parser.add_argument("--entropy_aware", action=argparse.BooleanOptionalAction, default=True, help="v6.5.0: Use entropy-aware head selection (default: True)")
+    parser.add_argument("--top_k_heads", type=int, default=10, help="Number of sharpest (lowest entropy) heads to use for QI (default: 10)")
     parser.add_argument("--head_selection_mode", type=str, default="entropy", choices=["entropy", "mass"],
                         help="v6.5.1: Head selection mode - 'entropy' (lowest entropy) or 'mass' (highest transient mass)")
     parser.add_argument("--hi_pooling_mode", type=str, default="mean", choices=["mean", "max"],
                         help="v6.7.0: HI pooling mode - 'mean' (consensus, default) or 'max' (peak, v6.5 behavior)")
-    parser.add_argument("--hi_mass_threshold", type=float, default=0.0,
-                        help="v6.8.0: Min transient mass to include head in HI (0=all, 0.1=filter dead heads)")
+    parser.add_argument("--hi_mass_threshold", type=float, default=0.5,
+                        help="v6.8.0: Min transient mass to include head in HI (default: 0.5)")
     parser.add_argument("--hi_top_k_heads", type=int, default=0,
                         help="v6.8.1: Select top-k heads by transient mass for HI (0=disabled, use threshold)")
     parser.add_argument("--hi_mass_cdf", type=float, default=0.0,
