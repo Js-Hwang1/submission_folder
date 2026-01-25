@@ -1320,6 +1320,9 @@ class CircuitKVCluster():
         hi_mass_cdf: float = 0.0,  # 0=disabled, 0.85=select heads covering 85% of total transient mass
         # Diagnostic: log head selection stats
         hi_log_head_stats: bool = False,
+        # v6.10.0: Bridge Importance (BI) via A² - captures 2-hop attention paths for cross-document reasoning
+        use_bridge_importance: bool = False,  # Enable A² bridge importance for multi-hop
+        bi_kernel_size: int = 5,  # Smoothing kernel for BI (bridges need context)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1375,6 +1378,9 @@ class CircuitKVCluster():
         self.hi_mass_cdf = hi_mass_cdf
         # Diagnostic logging
         self.hi_log_head_stats = hi_log_head_stats
+        # v6.10.0: Bridge Importance
+        self.use_bridge_importance = use_bridge_importance
+        self.bi_kernel_size = bi_kernel_size
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1488,6 +1494,44 @@ class CircuitKVCluster():
         transient_mass_per_head = row_sums.mean(dim=(0, 2))  # [num_heads]
 
         return transient_mass_per_head
+
+    def _compute_bridge_importance(self, attn_matrix: torch.Tensor) -> torch.Tensor:
+        """
+        v6.10.0: Compute Bridge Importance via A² (second-order attention).
+
+        For multi-hop reasoning (especially cross-document like 2WikiMQA), we need to
+        capture tokens that are important through 2-hop paths:
+
+            Query → Bridge Token → Target Token
+
+        In Markov chain terms:
+        - A = one-step transition probabilities
+        - A² = two-step transition probabilities
+
+        Bridge Importance captures tokens that are reachable in 2 hops, which identifies
+        "bridge" tokens that connect different parts of the context (e.g., entities that
+        appear in both documents in 2WikiMQA).
+
+        Args:
+            attn_matrix: [seq_len, seq_len] - full attention matrix (already aggregated across heads)
+
+        Returns:
+            bi_scores: [seq_len] - bridge importance scores per token
+        """
+        # Compute A² = A @ A (two-hop attention)
+        # A²[i,j] = sum_k A[i,k] * A[k,j] = probability of reaching j from i in 2 steps
+        A_squared = torch.matmul(attn_matrix, attn_matrix)  # [seq, seq]
+
+        # Bridge Importance: How much is each token reachable in 2 hops from any query?
+        # Sum over all query positions (rows) to get total 2-hop reachability
+        bi_scores = A_squared.sum(dim=0)  # [seq_len]
+
+        # Alternative: Focus on 2-hop reach from recent queries (observation window)
+        # This emphasizes bridges relevant to the current question
+        # window_size = min(32, attn_matrix.shape[0])
+        # bi_scores = A_squared[-window_size:, :].sum(dim=0)  # [seq_len]
+
+        return bi_scores
 
     def _init_debug_log(self):
         """Initialize debug log (uses module-level singleton)."""
@@ -2917,10 +2961,28 @@ class CircuitKVCluster():
                 # HI: Wider smoothing for context preservation
                 hi_scores = self._apply_smoothing(hi_scores, hi_k, use_gaussian=self.use_gaussian, sigma=self.gaussian_sigma)
 
+            # v6.10.0: Bridge Importance via A² (second-order attention)
+            # Captures 2-hop paths for cross-document reasoning (2WikiMQA, multi-hop QA)
+            bi_scores = None
+            if getattr(self, 'use_bridge_importance', False):
+                # Use HI attention matrix (broader consensus) for bridge computation
+                attn_for_bi = full_attn_hi[:q_len, :q_len] if full_attn_hi is not None else full_attn[:q_len, :q_len]
+                bi_scores = self._compute_bridge_importance(attn_for_bi)
+
+                # Apply smoothing to BI (bridges need context)
+                bi_k = getattr(self, 'bi_kernel_size', 5)
+                if bi_k > 1:
+                    bi_scores = self._apply_smoothing(bi_scores, bi_k, use_gaussian=self.use_gaussian, sigma=self.gaussian_sigma)
+
             # v6.0.0: Direct rank normalization WITHOUT DA weighting
             # Pure Markov chain signals preserve transitive reasoning paths
             qi_rank = self._rank_normalize(qi_scores)
             hi_rank = self._rank_normalize(hi_scores)
+
+            # v6.10.0: Rank normalize BI if enabled
+            bi_rank = None
+            if bi_scores is not None:
+                bi_rank = self._rank_normalize(bi_scores)
 
             # v4.3.1: Ablation support - zero out one signal for A1 experiment
             if self.ablate_qi:
@@ -2930,8 +2992,10 @@ class CircuitKVCluster():
                 # QI-only ablation: use only Query Importance
                 hi_rank = torch.zeros_like(hi_rank)
 
-            # v6.0.0: MAX of pure Markov signals (no DA)
+            # v6.10.0: MAX of pure Markov signals (with optional BI for cross-document reasoning)
             combined_scores = torch.maximum(qi_rank, hi_rank)
+            if bi_rank is not None:
+                combined_scores = torch.maximum(combined_scores, bi_rank)
 
             # Store for debugging (use influence_scores variable for compatibility)
             influence_scores_full = torch.zeros(
@@ -3665,4 +3729,7 @@ def init_circuitkv(self):
         hi_mass_cdf=getattr(self.config, 'hi_mass_cdf', 0.0),
         # Diagnostic logging
         hi_log_head_stats=getattr(self.config, 'hi_log_head_stats', False),
+        # v6.10.0: Bridge Importance via A²
+        use_bridge_importance=getattr(self.config, 'use_bridge_importance', False),
+        bi_kernel_size=getattr(self.config, 'bi_kernel_size', 5),
     )
