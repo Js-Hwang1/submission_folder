@@ -470,7 +470,7 @@ if __name__ == "__main__":
     parser.add_argument("--gaussian_sigma", type=float, default=1.0, help="Sigma for Gaussian kernel (QI uses sigma*0.5 for tighter smoothing)")
     # MarkovKV tuning parameters
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
-    parser.add_argument("--sink_size", type=int, default=64, help="Absorbing boundary size (first N tokens always kept). Default: 64 for multi-hop tasks.")
+    parser.add_argument("--sink_size", type=int, default=4, help="Absorbing boundary size (first N tokens as absorbing states in Markov chain). Default: 4.")
     parser.add_argument("--neumann_temperature", type=float, default=1.0, help="Temperature for transition sharpening (<1.0 = sharper, prevents signal diffusion)")
     parser.add_argument("--neumann_gamma", type=float, default=1.0,
                         help="v6.11.0: Spectral decay factor for Neumann series (default: 1.0=no decay, try 0.9 for locality bias)")
