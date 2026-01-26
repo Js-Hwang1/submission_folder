@@ -1284,6 +1284,7 @@ class CircuitKVCluster():
         use_neumann: bool = True,  # v4.0.0: Use deterministic Neumann instead of random walks
         neumann_iterations: int = 10,  # Number of Neumann series iterations
         neumann_temperature: float = 1.0,  # Temperature for attention sharpening (lower = sharper)
+        neumann_gamma: float = 1.0,  # v6.11.0: Spectral decay factor (1.0=no decay, <1=locality bias)
         # v4.1.0: Combination tuning
         h2o_weight: float = 0.5,  # Weight for H2O in combination (0.5 = equal, >0.5 = favor H2O)
         combination_mode: str = "dis",  # "dis" (default, no DA), "max", "weighted", "union", "union_da"
@@ -1342,6 +1343,7 @@ class CircuitKVCluster():
         self.use_neumann = use_neumann
         self.neumann_iterations = neumann_iterations
         self.neumann_temperature = neumann_temperature
+        self.neumann_gamma = neumann_gamma
         # v4.1.0: Combination tuning
         self.h2o_weight = h2o_weight
         self.combination_mode = combination_mode
@@ -1931,9 +1933,11 @@ class CircuitKVCluster():
         sink_size: int = 4,
         num_iterations: int = 10,
         temperature: float = 1.0,
+        gamma: float = 1.0,
     ) -> torch.Tensor:
         """
         v4.0.0: Compute deterministic influence scores via Neumann series.
+        v6.11.0: Added spectral decay factor gamma for locality bias.
 
         Computes expected visit counts analytically using the Fundamental Matrix
         of an absorbing Markov chain:
@@ -2009,16 +2013,17 @@ class CircuitKVCluster():
         # Accumulator for Neumann series: starts with I (identity contribution)
         result = v.clone()
 
-        # Iterate Neumann series: result = I + Q + Q² + ... + Q^k
+        # Iterate Neumann series: result = I + γQ + γ²Q² + ... + γ^k Q^k
+        # v6.11.0: Added spectral decay factor gamma for locality bias
         # We want row q of N = (I-Q)^(-1), i.e., expected visits FROM query TO each j
         #
         # Row q of Q^k is computed as: (Q^k)[q,:] = e_q^T @ Q^k
         # In column form: ((Q^k)[q,:])^T = (Q^T)^k @ e_q
         #
-        # So we iterate: v_{k+1} = Q^T @ v_k, where v_0 = e_query
-        # This gives v_k = (Q^T)^k @ e_q = row q of Q^k (as column vector)
+        # So we iterate: v_{k+1} = γ * Q^T @ v_k, where v_0 = e_query
+        # This gives v_k = γ^k * (Q^T)^k @ e_q = row q of γ^k Q^k (as column vector)
         for _ in range(num_iterations):
-            v = torch.mv(Q.t(), v)  # Q^T @ v - gives row q of Q^k
+            v = gamma * torch.mv(Q.t(), v)  # γ * Q^T @ v - gives row q of γ^k Q^k
             result = result + v
 
             # Early stopping if converged
@@ -2050,10 +2055,12 @@ class CircuitKVCluster():
         num_iterations: int = 10,
         temperature: float = 1.0,
         attention_for_hi: torch.Tensor = None,
+        gamma: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         v4.2.0: Dual-Importance Scoring (DIS) via Absorbing Markov Chain.
         v6.5.0: Added entropy-aware mode with separate attention for HI.
+        v6.11.0: Added spectral decay factor gamma for locality bias.
 
         Computes TWO importance scores from the fundamental matrix N:
 
@@ -2154,9 +2161,11 @@ class CircuitKVCluster():
         result_hi = v_hi.clone()
 
         # Iterate both in parallel (with potentially different Q matrices)
+        # v6.11.0: Apply spectral decay factor gamma for locality bias
+        # Computes: I + γQ + γ²Q² + ... + γ^k Q^k  (discounted multi-hop paths)
         for _ in range(num_iterations):
-            v_qi = torch.mv(Q.t(), v_qi)
-            v_hi = torch.mv(Q_hi.t(), v_hi)  # v6.5.0: Use Q_hi for HI
+            v_qi = gamma * torch.mv(Q.t(), v_qi)
+            v_hi = gamma * torch.mv(Q_hi.t(), v_hi)  # v6.5.0: Use Q_hi for HI
             result_qi = result_qi + v_qi
             result_hi = result_hi + v_hi
 
@@ -2859,6 +2868,7 @@ class CircuitKVCluster():
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
                 attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                gamma=self.neumann_gamma,
             )
 
             # Store QI and HI for union selection (called in STEP 3)
@@ -2889,6 +2899,7 @@ class CircuitKVCluster():
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
                 attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                gamma=self.neumann_gamma,
             )
 
             # Compute Direct Attention (DA) - what the window actually attends to
@@ -2927,6 +2938,7 @@ class CircuitKVCluster():
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
                 attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                gamma=self.neumann_gamma,
             )
 
             # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
@@ -3013,6 +3025,7 @@ class CircuitKVCluster():
                 sink_size=self.sink_size,
                 num_iterations=self.neumann_iterations,
                 temperature=self.neumann_temperature,
+                gamma=self.neumann_gamma,
             )
             # Pad to full buffer size
             influence_scores_full = torch.zeros(
@@ -3693,6 +3706,7 @@ def init_circuitkv(self):
         use_neumann=self.config.use_neumann,
         neumann_iterations=self.config.neumann_iterations,
         neumann_temperature=self.config.neumann_temperature,
+        neumann_gamma=getattr(self.config, 'neumann_gamma', 1.0),
         # v4.1.0: Combination tuning
         h2o_weight=self.config.h2o_weight,
         combination_mode=self.config.combination_mode,

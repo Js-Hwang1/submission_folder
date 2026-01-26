@@ -331,6 +331,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.neumann_iterations = args.neumann_iterations
                 model.model.layers[i].self_attn.config.sink_size = args.sink_size
                 model.model.layers[i].self_attn.config.neumann_temperature = args.neumann_temperature
+                model.model.layers[i].self_attn.config.neumann_gamma = args.neumann_gamma
                 # v6.5.0: Entropy-aware head selection
                 model.model.layers[i].self_attn.config.entropy_aware = args.entropy_aware
                 model.model.layers[i].self_attn.config.top_k_heads = args.top_k_heads
@@ -471,6 +472,8 @@ if __name__ == "__main__":
     parser.add_argument("--neumann_iterations", type=int, default=10, help="Number of Neumann series iterations (increase for longer contexts)")
     parser.add_argument("--sink_size", type=int, default=64, help="Absorbing boundary size (first N tokens always kept). Default: 64 for multi-hop tasks.")
     parser.add_argument("--neumann_temperature", type=float, default=1.0, help="Temperature for transition sharpening (<1.0 = sharper, prevents signal diffusion)")
+    parser.add_argument("--neumann_gamma", type=float, default=1.0,
+                        help="v6.11.0: Spectral decay factor for Neumann series (default: 1.0=no decay, try 0.9 for locality bias)")
     # v6.5.0: Entropy-aware head selection
     parser.add_argument("--entropy_aware", action=argparse.BooleanOptionalAction, default=True, help="v6.5.0: Use entropy-aware head selection (default: True)")
     parser.add_argument("--top_k_heads", type=int, default=10, help="Number of sharpest (lowest entropy) heads to use for QI (default: 10)")
