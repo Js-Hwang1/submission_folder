@@ -230,7 +230,14 @@ def main(args):
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
      
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
-        
+        # CircuitKV debug: trigger sample transition (dumps previous sample's layer data)
+        if args.method.lower() == "circuitkv" and args.debug:
+            try:
+                from pyramidkv.pyramidkv_utils import _circuitkv_debug_next_sample
+                _circuitkv_debug_next_sample()
+            except ImportError:
+                pass
+
         batch_prompts = prompts[i:i+args.eval_batch_size]
         batch_inputs = inputs[i:i+args.eval_batch_size]
         batch_contexts = contexts[i:i+args.eval_batch_size]
@@ -406,8 +413,15 @@ def main(args):
 
             # print(f'{batch_generations[j]}')
             fout.write(json.dumps(example) + "\n")
-    
-    
+
+    # CircuitKV debug: final dump to flush the last sample's layer data
+    if args.method.lower() == "circuitkv" and args.debug:
+        try:
+            from pyramidkv.pyramidkv_utils import _circuitkv_debug_next_sample
+            _circuitkv_debug_next_sample()  # Dumps the final sample's data
+        except ImportError:
+            pass
+
 
 if __name__ == "__main__":
 

@@ -1581,13 +1581,11 @@ class CircuitKVCluster():
         attn_weights_per_head: torch.Tensor = None,
         layer_idx: int = 1,
     ):
-        """Trigger sample transition for CSV logging. Layer data already recorded."""
+        """Debug logging helper. Sample transition handled externally."""
         if not self.debug:
             return
-
-        # Only trigger sample transition on layer 1 (dumps previous sample's CSV data)
-        if layer_idx == 1:
-            _circuitkv_debug_next_sample()
+        # Layer data already recorded via _record_layer_fairness
+        # Sample transition is now triggered from run_longbench.py
 
     def _lazy_init(self, device, seq_len: int):
         """Initialize CUDA graph on first use (only needed for random walk mode)."""
