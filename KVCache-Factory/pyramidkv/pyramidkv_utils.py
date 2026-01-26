@@ -38,26 +38,33 @@ _CIRCUITKV_SAMPLE_COUNTER = 0
 _CIRCUITKV_LAYER_COUNTER = 0  # Track which layer we're on within a sample
 _CIRCUITKV_CURRENT_DATASET = None  # Track current dataset for diagnostics
 
+# Layer Fairness Diagnostic - track per-layer stats to detect "Participation Trophy Effect"
+_CIRCUITKV_LAYER_STATS = []  # List of (layer_idx, kept_count, raw_max_qi, raw_max_hi, raw_max_combined)
+
 def _set_circuitkv_dataset(dataset_name: str):
     """Set the current dataset name for debug logging."""
     global _CIRCUITKV_CURRENT_DATASET
     _CIRCUITKV_CURRENT_DATASET = dataset_name
 
 def _get_circuitkv_debug_log():
-    """Get or create the shared debug log file."""
+    """Get or create the shared debug log file (CSV format)."""
     global _CIRCUITKV_DEBUG_LOG, _CIRCUITKV_DEBUG_INITIALIZED
     if not _CIRCUITKV_DEBUG_INITIALIZED:
-        log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
+        log_path = os.path.join(os.getcwd(), "circuitkv_debug.csv")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
-        _CIRCUITKV_DEBUG_LOG.write("# CircuitKV v7 Debug Log\n")
-        _CIRCUITKV_DEBUG_LOG.write("# QI = Query Importance (Neumann series from query position)\n")
-        _CIRCUITKV_DEBUG_LOG.write("# HI = Hub Importance (average expected visits)\n\n")
+        # CSV header for layer fairness data
+        _CIRCUITKV_DEBUG_LOG.write("sample,dataset,layer,kept,raw_qi,raw_hi\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
 def _circuitkv_debug_next_sample():
-    """Increment sample counter and reset layer counter."""
+    """Increment sample counter, dump layer fairness, and reset layer counter."""
     global _CIRCUITKV_SAMPLE_COUNTER, _CIRCUITKV_LAYER_COUNTER
+
+    # Dump previous sample's layer fairness stats before starting new sample
+    if _CIRCUITKV_LAYER_STATS:
+        _dump_layer_fairness()
+
     _CIRCUITKV_SAMPLE_COUNTER += 1
     _CIRCUITKV_LAYER_COUNTER = 0
     return _CIRCUITKV_SAMPLE_COUNTER
@@ -67,6 +74,33 @@ def _circuitkv_debug_next_layer():
     global _CIRCUITKV_LAYER_COUNTER
     _CIRCUITKV_LAYER_COUNTER += 1
     return _CIRCUITKV_LAYER_COUNTER
+
+def _record_layer_fairness(layer_idx: int, kept_count: int, raw_max_qi: float, raw_max_hi: float, raw_max_combined: float):
+    """Record per-layer stats for Layer Fairness diagnostic."""
+    global _CIRCUITKV_LAYER_STATS
+    _CIRCUITKV_LAYER_STATS.append((layer_idx, kept_count, raw_max_qi, raw_max_hi, raw_max_combined))
+
+def _dump_layer_fairness():
+    """Dump layer fairness stats in CSV format (one row per layer)."""
+    global _CIRCUITKV_LAYER_STATS
+    if not _CIRCUITKV_LAYER_STATS:
+        return
+
+    log = _get_circuitkv_debug_log()
+    dataset = _CIRCUITKV_CURRENT_DATASET or "unknown"
+    sample_num = _CIRCUITKV_SAMPLE_COUNTER
+
+    # Write one CSV row per layer
+    for layer_idx, kept, raw_qi, raw_hi, _ in sorted(_CIRCUITKV_LAYER_STATS):
+        log.write(f"{sample_num},{dataset},{layer_idx},{kept},{raw_qi:.6f},{raw_hi:.6f}\n")
+
+    log.flush()
+    _CIRCUITKV_LAYER_STATS = []
+
+def _reset_layer_fairness():
+    """Reset layer fairness stats for a new sample."""
+    global _CIRCUITKV_LAYER_STATS
+    _CIRCUITKV_LAYER_STATS = []
 
 def key_pruner_query_driven(kv_states, q_states, recent_size=128, ratio=0.3):
     _, _, seqlen, head_dim = kv_states.shape
@@ -1545,77 +1579,15 @@ class CircuitKVCluster():
         qi_scores: torch.Tensor = None,
         hi_scores: torch.Tensor = None,
         attn_weights_per_head: torch.Tensor = None,
+        layer_idx: int = 1,
     ):
-        """Log focused debug data for diagnosing TREC/classification failures."""
+        """Trigger sample transition for CSV logging. Layer data already recorded."""
         if not self.debug:
             return
 
-        log = _get_circuitkv_debug_log()
-        layer_num = _circuitkv_debug_next_layer()
-
-        # Only log for first layer to avoid spam
-        if layer_num != 1:
-            return
-
-        sample_num = _circuitkv_debug_next_sample()
-        dataset = _CIRCUITKV_CURRENT_DATASET or "unknown"
-        kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
-
-        log.write(f"\n[SAMPLE {sample_num}] dataset={dataset} seq_len={q_len} budget={self.max_capacity_prompt}\n")
-
-        # 1. HEAD MASS VARIANCE (Signal-to-Noise)
-        if attn_weights_per_head is not None:
-            attn_per_head = attn_weights_per_head.mean(dim=0)  # [num_heads, window, seq]
-            num_heads = attn_per_head.shape[0]
-            head_masses = []
-            for h in range(num_heads):
-                head_attn = attn_per_head[h]
-                transient_mass = head_attn[:, self.sink_size:].sum().item()
-                total_mass = head_attn.sum().item()
-                head_masses.append(transient_mass / max(total_mass, 1e-8))
-
-            head_masses_t = torch.tensor(head_masses)
-            sorted_masses, sorted_indices = head_masses_t.sort(descending=True)
-
-            log.write(f"[HEAD_MASS] var={head_masses_t.var().item():.4f} mean={head_masses_t.mean().item():.4f} range=[{head_masses_t.min().item():.3f},{head_masses_t.max().item():.3f}]\n")
-            log.write(f"  top5: {[(sorted_indices[i].item(), f'{sorted_masses[i].item():.3f}') for i in range(min(5, num_heads))]}\n")
-            if head_masses_t.var().item() > 0.01:
-                log.write(f"  ⚠️ HIGH VARIANCE: MEAN pooling may dilute signal from dominant heads\n")
-
-        # 2. BUDGET ALLOCATION (Sink Saturation)
-        sink_pct = 100 * self.sink_size / self.max_capacity_prompt
-        window_pct = 100 * self.window_size / self.max_capacity_prompt
-        competitive = self.max_capacity_prompt - self.sink_size - self.window_size
-        middle_kept = sum(1 for p in kept_positions if self.sink_size <= p < q_len - self.window_size)
-
-        log.write(f"[BUDGET] sink={self.sink_size}({sink_pct:.1f}%) window={self.window_size}({window_pct:.1f}%) competitive={competitive}({100-sink_pct-window_pct:.1f}%)\n")
-        log.write(f"  middle_kept={middle_kept} utilization={100*middle_kept/max(competitive,1):.1f}%\n")
-
-        # 3. TOKEN CLUSTERING (Kernel Tax)
-        sorted_kept = sorted([p for p in kept_positions if self.sink_size <= p < q_len - self.window_size])
-        if len(sorted_kept) > 1:
-            gaps = [sorted_kept[i+1] - sorted_kept[i] for i in range(len(sorted_kept)-1)]
-            consecutive = sum(1 for g in gaps if g == 1)
-            islands = sum(1 for g in gaps if g > 1) + 1
-            avg_island = len(sorted_kept) / max(islands, 1)
-            kernel = max(self.qi_kernel_size, self.hi_kernel_size)
-
-            log.write(f"[CLUSTERING] islands={islands} avg_size={avg_island:.1f} consecutive_pairs={consecutive}\n")
-            if kernel > 1:
-                log.write(f"  kernel={kernel} expansion_ratio={avg_island/kernel:.2f}\n")
-                if avg_island < kernel * 0.5:
-                    log.write(f"  ⚠️ LOW EXPANSION: kernel not grouping tokens as expected\n")
-
-        # 4. HI SHARPNESS (Top-1 vs Mean ratio)
-        if hi_scores is not None:
-            hi_cpu = hi_scores[:q_len].cpu().float()
-            sharpness = hi_cpu.max().item() / max(hi_cpu.mean().item(), 1e-8)
-            log.write(f"[HI_SHARPNESS] top1={hi_cpu.max().item():.4f} mean={hi_cpu.mean().item():.6f} ratio={sharpness:.1f}\n")
-            if sharpness < 10:
-                log.write(f"  ⚠️ LOW SHARPNESS: HI scores are diffuse, may miss key tokens\n")
-
-        log.write(f"---\n")
-        log.flush()
+        # Only trigger sample transition on layer 1 (dumps previous sample's CSV data)
+        if layer_idx == 1:
+            _circuitkv_debug_next_sample()
 
     def _lazy_init(self, device, seq_len: int):
         """Initialize CUDA graph on first use (only needed for random walk mode)."""
@@ -2917,6 +2889,11 @@ class CircuitKVCluster():
 
             # v6.0.0: Direct rank normalization WITHOUT DA weighting
             # Pure Markov chain signals preserve transitive reasoning paths
+
+            # Layer Fairness Diagnostic: capture RAW max scores BEFORE rank normalization
+            _raw_max_qi = qi_scores.max().item() if qi_scores is not None else 0.0
+            _raw_max_hi = hi_scores.max().item() if hi_scores is not None else 0.0
+
             qi_rank = self._rank_normalize(qi_scores)
             hi_rank = self._rank_normalize(hi_scores)
 
@@ -3170,16 +3147,23 @@ class CircuitKVCluster():
                     q_len
                 )
 
-            # Debug logging
+            # Layer Fairness Diagnostic: record per-layer stats and detailed debug
             if self.debug:
-                # Compute H2O scores (column sums) for comparison
+                layer_idx = _circuitkv_debug_next_layer()
+                kept_count = keep_mask.sum().item()
+                # Retrieve raw max scores captured before rank normalization
+                raw_max_qi = locals().get('_raw_max_qi', 0.0)
+                raw_max_hi = locals().get('_raw_max_hi', 0.0)
+                raw_max_combined = scores.max().item() if scores is not None else 0.0
+                _record_layer_fairness(layer_idx, kept_count, raw_max_qi, raw_max_hi, raw_max_combined)
+
+                # Detailed debug logging (only for layer 1)
                 h2o_scores_debug = full_attn.sum(dim=0)
-                # Pass HI and QI if available (from DIS mode)
                 qi_debug = locals().get('qi_scores', None)
                 hi_debug = locals().get('hi_scores', None)
                 self._log_debug(
                     q_len, h2o_scores_debug, scores, keep_mask, full_attn,
-                    qi_debug, hi_debug, attn_weights_per_head
+                    qi_debug, hi_debug, attn_weights_per_head, layer_idx
                 )
 
             # Apply eviction - shared across all heads
