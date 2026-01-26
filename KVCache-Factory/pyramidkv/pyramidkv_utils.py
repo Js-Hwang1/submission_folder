@@ -2842,6 +2842,10 @@ class CircuitKVCluster():
                 gamma=self.neumann_gamma,
             )
 
+            # Layer Fairness: capture TRUE raw scores BEFORE smoothing/normalization
+            _raw_max_qi = qi_scores.max().item()
+            _raw_max_hi = hi_scores.max().item()
+
             # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
             #
             # The "Frequency Separation" Hypothesis:
@@ -2889,10 +2893,6 @@ class CircuitKVCluster():
 
             # v6.0.0: Direct rank normalization WITHOUT DA weighting
             # Pure Markov chain signals preserve transitive reasoning paths
-
-            # Layer Fairness Diagnostic: capture RAW max scores BEFORE rank normalization
-            _raw_max_qi = qi_scores.max().item() if qi_scores is not None else 0.0
-            _raw_max_hi = hi_scores.max().item() if hi_scores is not None else 0.0
 
             qi_rank = self._rank_normalize(qi_scores)
             hi_rank = self._rank_normalize(hi_scores)
@@ -3037,6 +3037,10 @@ class CircuitKVCluster():
                 head_chunk_size=getattr(self, 'head_chunk_size', 4),
             )
 
+            # Layer Fairness: capture raw scores (max across heads) BEFORE normalization
+            _raw_max_qi = qi_per_head.max().item()
+            _raw_max_hi = hi_per_head.max().item()
+
             # Truncate to non-window portion
             qi_per_head = qi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
             hi_per_head = hi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
@@ -3125,6 +3129,15 @@ class CircuitKVCluster():
             key_states = torch.cat([k_past_compress, k_cur], dim=2)
             value_states = torch.cat([v_past_compress, v_cur], dim=2)
 
+            # Layer Fairness Diagnostic for per-head mode
+            if self.debug:
+                layer_idx = _circuitkv_debug_next_layer()
+                # For per-head, count average middle tokens kept across heads
+                middle_kept = num_select if middle_len > 0 and non_window_budget > 0 else 0
+                raw_max_qi = locals().get('_raw_max_qi', 0.0)
+                raw_max_hi = locals().get('_raw_max_hi', 0.0)
+                _record_layer_fairness(layer_idx, middle_kept, raw_max_qi, raw_max_hi, 0.0)
+
         else:
             # =====================================================================
             # Original shared eviction (same tokens for all heads)
@@ -3150,12 +3163,14 @@ class CircuitKVCluster():
             # Layer Fairness Diagnostic: record per-layer stats and detailed debug
             if self.debug:
                 layer_idx = _circuitkv_debug_next_layer()
-                kept_count = keep_mask.sum().item()
-                # Retrieve raw max scores captured before rank normalization
+                # Count only MIDDLE tokens (between sink and window) for Layer Fairness test
+                kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
+                middle_kept = sum(1 for p in kept_positions if self.sink_size <= p < q_len - self.window_size)
+                # Retrieve raw max scores captured before smoothing/normalization
                 raw_max_qi = locals().get('_raw_max_qi', 0.0)
                 raw_max_hi = locals().get('_raw_max_hi', 0.0)
                 raw_max_combined = scores.max().item() if scores is not None else 0.0
-                _record_layer_fairness(layer_idx, kept_count, raw_max_qi, raw_max_hi, raw_max_combined)
+                _record_layer_fairness(layer_idx, middle_kept, raw_max_qi, raw_max_hi, raw_max_combined)
 
                 # Detailed debug logging (only for layer 1)
                 h2o_scores_debug = full_attn.sum(dim=0)
