@@ -354,6 +354,8 @@ def main(args):
                 model.model.layers[i].self_attn.config.hi_mass_cdf = args.hi_mass_cdf
                 # Diagnostic logging
                 model.model.layers[i].self_attn.config.hi_log_head_stats = args.hi_log_head_stats
+                # v6.12.0: HI signal gating threshold
+                model.model.layers[i].self_attn.config.hi_signal_threshold = args.hi_signal_threshold
                 # v6.10.0: Bridge Importance via A²
                 model.model.layers[i].self_attn.config.use_bridge_importance = args.use_bridge_importance
                 model.model.layers[i].self_attn.config.bi_kernel_size = args.bi_kernel_size
@@ -505,6 +507,8 @@ if __name__ == "__main__":
                         help="v6.9.0: Select heads covering X%% of total transient mass for HI (0=disabled, 0.85=85%%)")
     parser.add_argument("--hi_log_head_stats", action="store_true",
                         help="Log diagnostic stats about head selection (n_alive, mass distribution)")
+    parser.add_argument("--hi_signal_threshold", type=float, default=0.0,
+                        help="v6.12.0: HI signal gating threshold. If max(hi_raw) < threshold, silence HI for that layer (prevents noise amplification). 0=disabled, try 0.02-0.1")
     # v6.10.0: Bridge Importance via A²
     parser.add_argument("--use_bridge_importance", action="store_true",
                         help="v6.10.0: Enable A² bridge importance for cross-document reasoning (2WikiMQA)")

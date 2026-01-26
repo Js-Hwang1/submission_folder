@@ -1353,6 +1353,8 @@ class CircuitKVCluster():
         # v6.10.0: Bridge Importance (BI) via A² - captures 2-hop attention paths for cross-document reasoning
         use_bridge_importance: bool = False,  # Enable A² bridge importance for multi-hop
         bi_kernel_size: int = 5,  # Smoothing kernel for BI (bridges need context)
+        # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
+        hi_signal_threshold: float = 0.0,  # If max(hi_raw) < threshold, zero out hi_rank (0=disabled)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1412,6 +1414,8 @@ class CircuitKVCluster():
         # v6.10.0: Bridge Importance
         self.use_bridge_importance = use_bridge_importance
         self.bi_kernel_size = bi_kernel_size
+        # v6.12.0: HI Signal Gating
+        self.hi_signal_threshold = hi_signal_threshold
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2797,7 +2801,17 @@ class CircuitKVCluster():
             # For compatibility with scoring path, use MAX(rank(QI), rank(HI))
             # This is only used for debug logging, not for selection
             qi_rank = self._rank_normalize(qi_scores)
-            hi_rank = self._rank_normalize(hi_scores)
+
+            # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
+            hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
+            if hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+                hi_rank = torch.zeros_like(hi_scores)
+                if getattr(self, 'hi_log_head_stats', False):
+                    print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
+                          f"silenced (max={_raw_max_hi:.4f} < {hi_signal_threshold})")
+            else:
+                hi_rank = self._rank_normalize(hi_scores)
+
             combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging
@@ -2835,7 +2849,17 @@ class CircuitKVCluster():
 
             # For compatibility with scoring path
             qi_rank = self._rank_normalize(qi_weighted)
-            hi_rank = self._rank_normalize(hi_weighted)
+
+            # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
+            hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
+            if hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+                hi_rank = torch.zeros_like(hi_weighted)
+                if getattr(self, 'hi_log_head_stats', False):
+                    print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
+                          f"silenced (max={_raw_max_hi:.4f} < {hi_signal_threshold})")
+            else:
+                hi_rank = self._rank_normalize(hi_weighted)
+
             combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging
@@ -2910,7 +2934,18 @@ class CircuitKVCluster():
             # Pure Markov chain signals preserve transitive reasoning paths
 
             qi_rank = self._rank_normalize(qi_scores)
-            hi_rank = self._rank_normalize(hi_scores)
+
+            # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
+            # If raw HI max is below threshold, the HI scores are just noise that would
+            # be stretched to [0,1] by rank normalization, evicting valid QI signals.
+            hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
+            if hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+                hi_rank = torch.zeros_like(hi_scores)
+                if getattr(self, 'hi_log_head_stats', False):
+                    print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
+                          f"silenced (max={_raw_max_hi:.4f} < {hi_signal_threshold})")
+            else:
+                hi_rank = self._rank_normalize(hi_scores)
 
             # v6.10.0: Rank normalize BI if enabled
             bi_rank = None
