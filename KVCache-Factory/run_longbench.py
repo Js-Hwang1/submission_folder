@@ -316,9 +316,9 @@ def main(args):
                 model.model.layers[i].self_attn.config.ablate_hi = args.ablate_hi
                 model.model.layers[i].self_attn.config.combination_mode = args.combination_mode
                 model.model.layers[i].self_attn.config.qi_ratio = args.qi_ratio
-                # v4.4.0: Per-head eviction
+                # v7.0.0: Per-head Markov importance
                 model.model.layers[i].self_attn.config.per_head_eviction = args.per_head_eviction
-                model.model.layers[i].self_attn.config.per_head_hi_weight = args.per_head_hi_weight
+                model.model.layers[i].self_attn.config.head_chunk_size = args.head_chunk_size
                 # v6.1.0: Smoothing kernel
                 model.model.layers[i].self_attn.config.smoothing_kernel = args.smoothing_kernel
                 # v6.2.0: Asymmetric Gaussian Smoothing
@@ -457,9 +457,11 @@ if __name__ == "__main__":
     parser.add_argument("--combination_mode", type=str, default="dis", choices=["dis", "max", "weighted", "geometric", "sum", "union", "union_da"],
                         help="Score combination mode: union_da=Union(QI*DA,HI*DA) [v5.1], union=Union(QI,HI) [v5.0], dis=MAX(QI,HI)")
     parser.add_argument("--qi_ratio", type=float, default=0.5, help="Ratio of budget for QI in Union mode (0.5 = 50%% QI, 50%% HI)")
-    # v4.4.0: Per-head eviction
-    parser.add_argument("--per_head_eviction", action="store_true", help="Enable per-head eviction (each head keeps different tokens, like SnapKV)")
-    parser.add_argument("--per_head_hi_weight", type=float, default=0.3, help="Weight for HI in per-head combination (0.0 = H2O only, 1.0 = HI only)")
+    # v7.0.0: Per-head Markov importance (principled per-head selection)
+    parser.add_argument("--per_head_eviction", action="store_true",
+                        help="v7.0.0: Enable per-head Markov importance. Each head computes its own QI/HI using Neumann series on its attention pattern, then selects tokens via MAX(QI,HI). Respects head specialization unlike global selection.")
+    parser.add_argument("--head_chunk_size", type=int, default=8,
+                        help="v7.0.0: Number of heads to process in parallel for per-head Markov importance. Lower values reduce memory usage for long sequences (default: 8)")
     # v6.1.0: Smoothing kernel
     parser.add_argument("--smoothing_kernel", type=int, default=0, help="Smoothing kernel size (0=disabled, 5=recommended). Preserves phrase structure by promoting neighbors of important tokens.")
     # v6.2.0: Asymmetric Gaussian Smoothing

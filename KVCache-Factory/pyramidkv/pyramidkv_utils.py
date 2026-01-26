@@ -1295,9 +1295,9 @@ class CircuitKVCluster():
         # v4.3.1: Ablation flags for A1 experiment
         ablate_qi: bool = False,  # If True, use HI only (QI zeroed)
         ablate_hi: bool = False,  # If True, use QI only (HI zeroed)
-        # v4.4.0: Per-head eviction (like SnapKV)
-        per_head_eviction: bool = False,  # If True, each head keeps different tokens
-        per_head_hi_weight: float = 0.3,  # Weight for HI in per-head combination (0.3 = 30% HI, 70% H2O)
+        # v7.0.0: Per-head Markov importance (principled per-head selection)
+        per_head_eviction: bool = False,  # If True, each head computes its own QI/HI
+        head_chunk_size: int = 8,  # Number of heads to process in parallel (memory vs speed)
         # v6.1.0: Smoothing Kernel for phrase preservation
         smoothing_kernel: int = 0,  # Kernel size for score smoothing (0=disabled, 5=recommended)
         # v6.2.0: Asymmetric Gaussian Smoothing
@@ -1354,9 +1354,9 @@ class CircuitKVCluster():
         # v4.3.1: Ablation flags
         self.ablate_qi = ablate_qi
         self.ablate_hi = ablate_hi
-        # v4.4.0: Per-head eviction
+        # v7.0.0: Per-head Markov importance
         self.per_head_eviction = per_head_eviction
-        self.per_head_hi_weight = per_head_hi_weight
+        self.head_chunk_size = head_chunk_size
         # v6.1.0: Smoothing Kernel
         self.smoothing_kernel = smoothing_kernel
         # v6.2.0: Asymmetric Gaussian Smoothing
@@ -2194,6 +2194,139 @@ class CircuitKVCluster():
             hi_scores = hi_scores / hi_max
 
         return qi_scores, hi_scores
+
+    def _compute_per_head_markov_importance(
+        self,
+        attn_weights_per_head: torch.Tensor,
+        query_idx: int,
+        sink_size: int = 4,
+        num_iterations: int = 10,
+        gamma: float = 1.0,
+        head_chunk_size: int = 8,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        v7.0.0: Per-Head Markov Importance - Principled Per-Head Token Selection.
+
+        Computes QI and HI scores INDEPENDENTLY for each attention head using
+        Neumann series on each head's transition matrix. This preserves head
+        specialization: different heads attend to different tokens and should
+        keep different tokens in their KV cache.
+
+        Key Insight:
+        - SnapKV's per-head selection works because heads specialize
+        - Our global QI/HI destroys this by forcing uniform token selection
+        - Per-head Markov importance respects head specialization while
+          maintaining the principled Markov chain framework
+
+        Memory Efficiency:
+        - Full computation would need O(num_heads × seq_len²) memory
+        - Chunked processing: O(chunk_size × seq_len²) per chunk
+        - At seq_len=32k, chunk_size=8: 8 × 32k² × 4 = 32GB (fits H100)
+
+        Args:
+            attn_weights_per_head: [bsz, num_heads, window_size, seq_len] attention
+            query_idx: Query position (typically seq_len - 1)
+            sink_size: Absorbing boundary size (first N tokens)
+            num_iterations: Neumann series iterations
+            gamma: Spectral decay factor (1.0 = no decay)
+            head_chunk_size: Number of heads to process in parallel (memory vs speed)
+
+        Returns:
+            Tuple of (qi_per_head, hi_per_head), each [num_heads, seq_len]
+        """
+        # Average over batch dimension, keep heads separate
+        # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
+        attn = attn_weights_per_head.mean(dim=0)  # [num_heads, window_size, seq_len]
+        num_heads, window_size, seq_len = attn.shape
+        device = attn.device
+
+        # Build full attention matrix from window attention
+        # We need [num_heads, seq_len, seq_len] but only have window
+        # Reconstruct causal attention: each position attends to previous positions
+        # For positions beyond window, attention is approximated from last window row
+
+        # Handle edge cases
+        if seq_len <= sink_size:
+            uniform = torch.ones(num_heads, seq_len, device=device) / seq_len
+            return uniform, uniform.clone()
+
+        n_transient = seq_len - sink_size
+        query_transient_idx = query_idx - sink_size
+        if query_transient_idx < 0:
+            uniform = torch.ones(num_heads, seq_len, device=device) / seq_len
+            return uniform, uniform.clone()
+
+        # Initialize output tensors
+        qi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
+        hi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
+
+        # Process heads in chunks for memory efficiency
+        for chunk_start in range(0, num_heads, head_chunk_size):
+            chunk_end = min(chunk_start + head_chunk_size, num_heads)
+            chunk_size = chunk_end - chunk_start
+
+            # Get attention for this chunk of heads
+            # Use the last row of window (most recent query position's attention)
+            # This is [chunk_size, seq_len] - the attention distribution from query
+            attn_chunk = attn[chunk_start:chunk_end, -1, :]  # [chunk, seq_len]
+
+            # Build transition matrix P from attention (row-stochastic)
+            # Each row sums to 1 (attention is already softmaxed)
+            # P[i, j] = probability of transitioning from i to j
+            # For causal attention, we approximate P using the query's attention pattern
+            # replicated for all positions (simplification that works empirically)
+            P_chunk = attn_chunk.unsqueeze(1).expand(-1, seq_len, -1).clone()  # [chunk, seq, seq]
+
+            # Make it properly causal: zero out future positions
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+            P_chunk.masked_fill_(causal_mask.unsqueeze(0), 0)
+
+            # Re-normalize rows to sum to 1
+            row_sums = P_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            P_chunk = P_chunk / row_sums
+
+            # Extract Q (transient-to-transient transitions)
+            Q_chunk = P_chunk[:, sink_size:, sink_size:].contiguous()  # [chunk, n_transient, n_transient]
+
+            # Initialize QI vectors: one-hot at query position
+            v_qi = torch.zeros(chunk_size, n_transient, device=device, dtype=torch.float32)
+            v_qi[:, query_transient_idx] = 1.0
+            result_qi = v_qi.clone()
+
+            # Initialize HI vectors: uniform distribution
+            v_hi = torch.ones(chunk_size, n_transient, device=device, dtype=torch.float32) / n_transient
+            result_hi = v_hi.clone()
+
+            # Neumann series iteration: N = I + γQ + γ²Q² + ... + γ^k Q^k
+            # v = Q^T @ v iteratively computes (Q^T)^k @ v₀
+            for _ in range(num_iterations):
+                # Batched matrix-vector multiply: [chunk, n, n] @ [chunk, n, 1] -> [chunk, n, 1]
+                v_qi = gamma * torch.bmm(Q_chunk.transpose(-1, -2), v_qi.unsqueeze(-1)).squeeze(-1)
+                v_hi = gamma * torch.bmm(Q_chunk.transpose(-1, -2), v_hi.unsqueeze(-1)).squeeze(-1)
+                result_qi = result_qi + v_qi
+                result_hi = result_hi + v_hi
+
+            # Map back to full sequence [chunk, seq_len]
+            qi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
+            qi_full[:, sink_size:] = result_qi
+            qi_full[:, :sink_size] = result_qi.sum(dim=-1, keepdim=True) * 0.01  # Small score for sink
+
+            hi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
+            hi_full[:, sink_size:] = result_hi
+            hi_full[:, :sink_size] = result_hi.sum(dim=-1, keepdim=True) * 0.01
+
+            # Normalize each head's scores to [0, 1]
+            qi_max = qi_full.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+            qi_full = qi_full / qi_max
+
+            hi_max = hi_full.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+            hi_full = hi_full / hi_max
+
+            # Store results for this chunk
+            qi_per_head[chunk_start:chunk_end] = qi_full
+            hi_per_head[chunk_start:chunk_end] = hi_full
+
+        return qi_per_head, hi_per_head
 
     def _detect_instruction_anchors_heuristic(
         self,
@@ -3109,67 +3242,82 @@ class CircuitKVCluster():
 
         if self.per_head_eviction:
             # =====================================================================
-            # v4.4.0: PER-HEAD EVICTION (each head keeps different tokens)
+            # v7.0.0: PER-HEAD MARKOV IMPORTANCE
+            # Principled per-head token selection using Markov chain analysis.
+            #
             # Key insight: Different attention heads specialize in different patterns.
-            # Forcing all heads to share the same KV cache subset destroys head diversity.
+            # Global QI/HI forces all heads to keep the same tokens, destroying
+            # head specialization. Per-head Markov importance computes QI and HI
+            # independently for each head using its own attention pattern.
+            #
+            # This is scientifically principled (same Markov chain theory) while
+            # respecting that heads have different roles and should keep different
+            # tokens in their KV cache.
             # =====================================================================
 
-            # Compute per-head H2O scores (column sums of attention per head)
-            # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
-            # Sum over window dimension to get importance for each position per head
-            h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)  # [bsz, num_heads, non_window_len]
-            h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len] - avg over batch
-
-            # v4.4.1: Per-head eviction with PURE QI or HI when ablation flags set
-            # No H2O mixing when using ablation - user wants pure importance scores
             non_window_len = q_len - self.window_size
 
+            # Compute per-head Markov importance scores
+            # qi_per_head, hi_per_head: [num_heads, seq_len]
+            qi_per_head, hi_per_head = self._compute_per_head_markov_importance(
+                attn_weights_per_head,
+                query_idx=q_len - 1,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                gamma=self.neumann_gamma,
+                head_chunk_size=getattr(self, 'head_chunk_size', 8),
+            )
+
+            # Truncate to non-window portion
+            qi_per_head = qi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
+            hi_per_head = hi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
+
+            # Rank normalize per head
+            qi_rank_per_head = torch.zeros_like(qi_per_head)
+            hi_rank_per_head = torch.zeros_like(hi_per_head)
+            for h in range(num_heads):
+                qi_rank_per_head[h] = self._rank_normalize(qi_per_head[h])
+                hi_rank_per_head[h] = self._rank_normalize(hi_per_head[h])
+
+            # v7.0.0: Per-head MAX(QI, HI) - same DIS logic but per head
+            # Each head keeps tokens important to EITHER its QI or HI
             if self.ablate_hi and not self.ablate_qi:
-                # QI-ONLY mode: PURE QI, no H2O mixing
-                # Broadcast QI across all heads (same QI per position for all heads,
-                # but per-head selection will still create diversity via H2O tiebreaking)
-                qi_for_perhead = qi_scores[:non_window_len]
-                qi_rank = self._rank_normalize(qi_for_perhead)
-                per_head_scores = qi_rank.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
-
+                # QI-ONLY mode
+                per_head_scores = qi_rank_per_head
             elif not self.ablate_hi and self.ablate_qi:
-                # HI-ONLY mode: PURE HI, no H2O mixing
-                hi_for_perhead = hi_scores[:non_window_len]
-                hi_rank = self._rank_normalize(hi_for_perhead)
-                per_head_scores = hi_rank.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
-
+                # HI-ONLY mode
+                per_head_scores = hi_rank_per_head
             elif self.ablate_hi and self.ablate_qi:
-                # Both ablated: pure H2O per-head (SnapKV-style)
-                h2o_rank_per_head = torch.zeros_like(h2o_per_head)
+                # Both ablated: fallback to H2O per-head (SnapKV-style)
+                h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)
+                h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len]
+                per_head_scores = torch.zeros_like(h2o_per_head)
                 for h in range(num_heads):
-                    h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
-                per_head_scores = h2o_rank_per_head
-
+                    per_head_scores[h] = self._rank_normalize(h2o_per_head[h])
             else:
-                # Default (no ablation): Use MAX(HI, QI) combined with per-head H2O
-                # Rank normalize per-head H2O scores
-                h2o_rank_per_head = torch.zeros_like(h2o_per_head)
+                # Default: MAX(QI, HI) per head - the principled approach
+                per_head_scores = torch.maximum(qi_rank_per_head, hi_rank_per_head)
+
+            # Apply Gaussian smoothing for spatial coherence (optional)
+            # Use the existing kernel settings
+            smooth_kernel = max(self.qi_kernel_size, self.hi_kernel_size)
+            if smooth_kernel > 1 and self.use_gaussian:
+                # Apply Gaussian smoothing per head
+                per_head_scores_smooth = self._apply_smoothing(
+                    per_head_scores.view(-1),  # Flatten
+                    smooth_kernel,
+                    use_gaussian=True,
+                    sigma=self.gaussian_sigma
+                ).view(num_heads, -1)  # Reshape back
+                # Actually, need to smooth each head separately
+                per_head_scores_smooth = torch.zeros_like(per_head_scores)
                 for h in range(num_heads):
-                    h2o_rank_per_head[h] = self._rank_normalize(h2o_per_head[h])
-
-                # Use combined DIS scores (already MAX of HI, QI)
-                dis_for_perhead = selected_scores[:non_window_len]
-                dis_rank = self._rank_normalize(dis_for_perhead)
-                dis_broadcast = dis_rank.unsqueeze(0).expand(num_heads, -1)
-
-                # Combine H2O per-head with DIS (broadcast)
-                importance_weight = self.per_head_hi_weight
-                per_head_scores = (1 - importance_weight) * h2o_rank_per_head + importance_weight * dis_broadcast
-
-            # Apply SnapKV-style avgpool smoothing for spatial coherence
-            if self.kernel_size > 1:
-                # per_head_scores: [num_heads, non_window_len]
-                per_head_scores_smooth = F.avg_pool1d(
-                    per_head_scores.unsqueeze(0),  # [1, num_heads, non_window_len]
-                    kernel_size=self.kernel_size,
-                    padding=self.kernel_size // 2,
-                    stride=1
-                ).squeeze(0)  # [num_heads, non_window_len]
+                    per_head_scores_smooth[h] = self._apply_smoothing(
+                        per_head_scores[h],
+                        smooth_kernel,
+                        use_gaussian=True,
+                        sigma=self.gaussian_sigma
+                    )
                 per_head_scores = per_head_scores_smooth
 
             # Per-head top-k selection
@@ -3654,11 +3802,11 @@ def init_circuitkv(self):
             self.config.ablate_qi = False  # If True, disable QI (use HI only)
         if not hasattr(self.config, 'ablate_hi'):
             self.config.ablate_hi = False  # If True, disable HI (use QI only)
-        # v4.4.0: Per-head eviction
+        # v7.0.0: Per-head Markov importance
         if not hasattr(self.config, 'per_head_eviction'):
-            self.config.per_head_eviction = False  # If True, each head keeps different tokens
-        if not hasattr(self.config, 'per_head_hi_weight'):
-            self.config.per_head_hi_weight = 0.3  # Weight for HI in per-head combination
+            self.config.per_head_eviction = False  # If True, each head computes its own QI/HI
+        if not hasattr(self.config, 'head_chunk_size'):
+            self.config.head_chunk_size = 8  # Number of heads to process in parallel
         # v5.0.0: Union Selection
         if not hasattr(self.config, 'qi_ratio'):
             self.config.qi_ratio = 0.5  # Ratio of budget for QI in Union mode
@@ -3715,9 +3863,9 @@ def init_circuitkv(self):
         # v4.3.1: Ablation flags
         ablate_qi=self.config.ablate_qi,
         ablate_hi=self.config.ablate_hi,
-        # v4.4.0: Per-head eviction
+        # v7.0.0: Per-head Markov importance
         per_head_eviction=self.config.per_head_eviction,
-        per_head_hi_weight=self.config.per_head_hi_weight,
+        head_chunk_size=self.config.head_chunk_size,
         # v5.0.0: Union Selection
         qi_ratio=self.config.qi_ratio,
         # v6.1.0: Smoothing Kernel
