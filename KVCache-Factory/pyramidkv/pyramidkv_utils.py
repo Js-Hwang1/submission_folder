@@ -30,43 +30,66 @@ except ImportError:
     BREAKTHROUGHS_AVAILABLE = False
 
 # =============================================================================
-# Module-level debug logging for CircuitKV (singleton pattern)
+# Module-level debug logging for CircuitKV - JSONL Diagnostic System
 # =============================================================================
+import json
+
 _CIRCUITKV_DEBUG_LOG = None
 _CIRCUITKV_DEBUG_INITIALIZED = False
 _CIRCUITKV_SAMPLE_COUNTER = 0
-_CIRCUITKV_LAYER_COUNTER = 0  # Track which layer we're on within a sample
-_CIRCUITKV_CURRENT_DATASET = None  # Track current dataset for diagnostics
+_CIRCUITKV_LAYER_COUNTER = 0
+_CIRCUITKV_CURRENT_DATASET = None
+_CIRCUITKV_CURRENT_SEQ_LEN = 0
+_CIRCUITKV_CURRENT_BUDGET = 0
 
-# Layer Fairness Diagnostic - track per-layer stats to detect "Participation Trophy Effect"
-_CIRCUITKV_LAYER_STATS = []  # List of (layer_idx, kept_count, raw_max_qi, raw_max_hi, raw_max_combined)
+# Comprehensive per-layer diagnostic data for current sample
+_CIRCUITKV_SAMPLE_DATA = {
+    "sample_id": 0,
+    "dataset": None,
+    "seq_len": 0,
+    "budget": 0,
+    "layers": []
+}
 
 def _set_circuitkv_dataset(dataset_name: str):
     """Set the current dataset name for debug logging."""
     global _CIRCUITKV_CURRENT_DATASET
     _CIRCUITKV_CURRENT_DATASET = dataset_name
 
+def _set_circuitkv_sample_info(seq_len: int, budget: int):
+    """Set current sample info for diagnostics."""
+    global _CIRCUITKV_CURRENT_SEQ_LEN, _CIRCUITKV_CURRENT_BUDGET
+    _CIRCUITKV_CURRENT_SEQ_LEN = seq_len
+    _CIRCUITKV_CURRENT_BUDGET = budget
+
 def _get_circuitkv_debug_log():
-    """Get or create the shared debug log file (CSV format)."""
+    """Get or create the JSONL debug log file."""
     global _CIRCUITKV_DEBUG_LOG, _CIRCUITKV_DEBUG_INITIALIZED
     if not _CIRCUITKV_DEBUG_INITIALIZED:
-        log_path = os.path.join(os.getcwd(), "circuitkv_debug.csv")
+        log_path = os.path.join(os.getcwd(), "circuitkv_diagnostic.jsonl")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
-        # CSV header for layer fairness data
-        _CIRCUITKV_DEBUG_LOG.write("sample,dataset,layer,kept,raw_qi,raw_hi\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
 def _circuitkv_debug_next_sample():
-    """Increment sample counter, dump layer fairness, and reset layer counter."""
-    global _CIRCUITKV_SAMPLE_COUNTER, _CIRCUITKV_LAYER_COUNTER
+    """Dump current sample data and prepare for next sample."""
+    global _CIRCUITKV_SAMPLE_COUNTER, _CIRCUITKV_LAYER_COUNTER, _CIRCUITKV_SAMPLE_DATA
 
-    # Dump previous sample's layer fairness stats before starting new sample
-    if _CIRCUITKV_LAYER_STATS:
-        _dump_layer_fairness()
+    # Dump previous sample's data
+    if _CIRCUITKV_SAMPLE_DATA["layers"]:
+        _dump_sample_diagnostic()
 
     _CIRCUITKV_SAMPLE_COUNTER += 1
     _CIRCUITKV_LAYER_COUNTER = 0
+
+    # Reset sample data
+    _CIRCUITKV_SAMPLE_DATA = {
+        "sample_id": _CIRCUITKV_SAMPLE_COUNTER,
+        "dataset": _CIRCUITKV_CURRENT_DATASET,
+        "seq_len": _CIRCUITKV_CURRENT_SEQ_LEN,
+        "budget": _CIRCUITKV_CURRENT_BUDGET,
+        "layers": []
+    }
     return _CIRCUITKV_SAMPLE_COUNTER
 
 def _circuitkv_debug_next_layer():
@@ -75,32 +98,215 @@ def _circuitkv_debug_next_layer():
     _CIRCUITKV_LAYER_COUNTER += 1
     return _CIRCUITKV_LAYER_COUNTER
 
-def _record_layer_fairness(layer_idx: int, kept_count: int, raw_max_qi: float, raw_max_hi: float, raw_max_combined: float):
-    """Record per-layer stats for Layer Fairness diagnostic."""
-    global _CIRCUITKV_LAYER_STATS
-    _CIRCUITKV_LAYER_STATS.append((layer_idx, kept_count, raw_max_qi, raw_max_hi, raw_max_combined))
+def _record_layer_diagnostic(
+    layer_idx: int,
+    seq_len: int,
+    budget: int,
+    sink_size: int,
+    window_size: int,
+    # CircuitKV data
+    qi_raw_max: float,
+    hi_raw_max: float,
+    qi_scores: torch.Tensor,
+    hi_scores: torch.Tensor,
+    combined_scores: torch.Tensor,
+    circuitkv_kept_positions: list,
+    # SnapKV baseline data
+    snapkv_scores: torch.Tensor,
+    snapkv_kept_positions: list,
+    # Attention data for analysis
+    attn_column_sums: torch.Tensor = None,
+):
+    """Record comprehensive per-layer diagnostic data."""
+    global _CIRCUITKV_SAMPLE_DATA
 
-def _dump_layer_fairness():
-    """Dump layer fairness stats in CSV format (one row per layer)."""
-    global _CIRCUITKV_LAYER_STATS
-    if not _CIRCUITKV_LAYER_STATS:
+    # Compute overlap metrics
+    ckv_set = set(circuitkv_kept_positions)
+    skv_set = set(snapkv_kept_positions)
+
+    overlap = ckv_set & skv_set
+    ckv_only = ckv_set - skv_set  # CircuitKV keeps but SnapKV doesn't
+    skv_only = skv_set - ckv_set  # SnapKV keeps but CircuitKV doesn't (CRITICAL)
+
+    overlap_ratio = len(overlap) / len(ckv_set) if ckv_set else 0.0
+
+    # Get top positions by each score type (excluding sink and window)
+    middle_start = sink_size
+    middle_end = seq_len - window_size
+
+    def get_top_k_middle(scores, k=50):
+        """Get top-k positions from middle region."""
+        if scores is None or len(scores) == 0:
+            return []
+        middle_scores = scores[middle_start:middle_end].clone()
+        if len(middle_scores) == 0:
+            return []
+        k = min(k, len(middle_scores))
+        _, top_idx = middle_scores.topk(k)
+        return (top_idx + middle_start).cpu().tolist()
+
+    # Score statistics for middle region
+    def get_score_stats(scores):
+        if scores is None or len(scores) == 0:
+            return {"max": 0, "min": 0, "mean": 0, "std": 0}
+        middle = scores[middle_start:middle_end]
+        if len(middle) == 0:
+            return {"max": 0, "min": 0, "mean": 0, "std": 0}
+        return {
+            "max": middle.max().item(),
+            "min": middle.min().item(),
+            "mean": middle.mean().item(),
+            "std": middle.std().item() if len(middle) > 1 else 0
+        }
+
+    layer_data = {
+        "layer_idx": layer_idx,
+        "seq_len": seq_len,
+        "budget": budget,
+        "sink_size": sink_size,
+        "window_size": window_size,
+        "middle_region": [middle_start, middle_end],
+
+        # CircuitKV scores
+        "circuitkv": {
+            "qi_raw_max": qi_raw_max,
+            "hi_raw_max": hi_raw_max,
+            "qi_stats": get_score_stats(qi_scores),
+            "hi_stats": get_score_stats(hi_scores),
+            "combined_stats": get_score_stats(combined_scores),
+            "qi_top50": get_top_k_middle(qi_scores, 50),
+            "hi_top50": get_top_k_middle(hi_scores, 50),
+            "kept_count": len(circuitkv_kept_positions),
+            "kept_middle_count": len([p for p in circuitkv_kept_positions if middle_start <= p < middle_end]),
+        },
+
+        # SnapKV baseline
+        "snapkv": {
+            "score_stats": get_score_stats(snapkv_scores),
+            "top50": get_top_k_middle(snapkv_scores, 50),
+            "kept_count": len(snapkv_kept_positions),
+            "kept_middle_count": len([p for p in snapkv_kept_positions if middle_start <= p < middle_end]),
+        },
+
+        # Comparison metrics
+        "comparison": {
+            "overlap_ratio": overlap_ratio,
+            "overlap_count": len(overlap),
+            "circuitkv_only_count": len(ckv_only),
+            "snapkv_only_count": len(skv_only),
+            # CRITICAL: positions SnapKV keeps but CircuitKV evicts (potential errors)
+            "evicted_by_circuitkv": sorted(list(skv_only))[:100],  # Limit to 100
+            # Positions CircuitKV keeps but SnapKV doesn't (our additions)
+            "added_by_circuitkv": sorted(list(ckv_only))[:100],
+        },
+
+        # H2O baseline (column sums)
+        "h2o": {
+            "stats": get_score_stats(attn_column_sums) if attn_column_sums is not None else None,
+            "top50": get_top_k_middle(attn_column_sums, 50) if attn_column_sums is not None else [],
+        }
+    }
+
+    _CIRCUITKV_SAMPLE_DATA["layers"].append(layer_data)
+
+def _dump_sample_diagnostic():
+    """Dump current sample's diagnostic data as a single JSONL line."""
+    global _CIRCUITKV_SAMPLE_DATA
+
+    if not _CIRCUITKV_SAMPLE_DATA["layers"]:
         return
 
     log = _get_circuitkv_debug_log()
-    dataset = _CIRCUITKV_CURRENT_DATASET or "unknown"
-    sample_num = _CIRCUITKV_SAMPLE_COUNTER
 
-    # Write one CSV row per layer
-    for layer_idx, kept, raw_qi, raw_hi, _ in sorted(_CIRCUITKV_LAYER_STATS):
-        log.write(f"{sample_num},{dataset},{layer_idx},{kept},{raw_qi:.6f},{raw_hi:.6f}\n")
+    # Add summary statistics across layers
+    layers = _CIRCUITKV_SAMPLE_DATA["layers"]
+    _CIRCUITKV_SAMPLE_DATA["summary"] = {
+        "num_layers": len(layers),
+        "avg_overlap_ratio": sum(l["comparison"]["overlap_ratio"] for l in layers) / len(layers),
+        "total_snapkv_only": sum(l["comparison"]["snapkv_only_count"] for l in layers),
+        "layers_with_low_hi": sum(1 for l in layers if l["circuitkv"]["hi_raw_max"] < 0.05),
+        "avg_qi_raw_max": sum(l["circuitkv"]["qi_raw_max"] for l in layers) / len(layers),
+        "avg_hi_raw_max": sum(l["circuitkv"]["hi_raw_max"] for l in layers) / len(layers),
+    }
 
+    log.write(json.dumps(_CIRCUITKV_SAMPLE_DATA) + "\n")
     log.flush()
-    _CIRCUITKV_LAYER_STATS = []
+
+def _compute_snapkv_baseline(
+    attn_weights: torch.Tensor,
+    seq_len: int,
+    budget: int,
+    sink_size: int,
+    window_size: int,
+    kernel_size: int = 7,
+) -> tuple:
+    """
+    Compute what SnapKV would select for comparison.
+
+    SnapKV algorithm:
+    1. Sum attention from last window_size queries to all keys
+    2. Apply avgpool smoothing
+    3. Select top-k per head, then aggregate
+
+    Returns:
+        snapkv_scores: [seq_len] aggregated scores
+        snapkv_kept_positions: list of positions SnapKV would keep
+    """
+    # attn_weights: [bsz, num_heads, window_size, seq_len]
+    bsz, num_heads, ws, sl = attn_weights.shape
+
+    # Sum attention across window queries (what SnapKV does)
+    # [bsz, num_heads, seq_len-window]
+    attn_sum = attn_weights[:, :, :, :-window_size].sum(dim=2)
+
+    # Apply avgpool smoothing (SnapKV default)
+    # Need to reshape for F.avg_pool1d: [batch*heads, 1, seq_len-window]
+    attn_flat = attn_sum.view(bsz * num_heads, 1, -1)
+    attn_smoothed = F.avg_pool1d(
+        attn_flat,
+        kernel_size=kernel_size,
+        padding=kernel_size // 2,
+        stride=1
+    )
+    attn_smoothed = attn_smoothed.view(bsz, num_heads, -1)
+
+    # SnapKV does per-head selection, but for comparison we aggregate
+    # Take mean across heads to get shared importance
+    snapkv_scores_middle = attn_smoothed.mean(dim=(0, 1))  # [seq_len - window]
+
+    # Create full score tensor
+    snapkv_scores = torch.zeros(seq_len, device=attn_weights.device)
+    snapkv_scores[:len(snapkv_scores_middle)] = snapkv_scores_middle
+
+    # Compute what SnapKV would keep
+    # Budget allocation: sink + middle_select + window
+    middle_budget = budget - sink_size - window_size
+
+    if middle_budget > 0:
+        # SnapKV selects from non-sink, non-window region
+        middle_scores = snapkv_scores[sink_size:seq_len - window_size].clone()
+        if len(middle_scores) > 0:
+            k = min(middle_budget, len(middle_scores))
+            _, top_idx = middle_scores.topk(k)
+            middle_kept = (top_idx + sink_size).cpu().tolist()
+        else:
+            middle_kept = []
+    else:
+        middle_kept = []
+
+    # Full kept positions: sink + selected middle + window
+    kept_positions = list(range(sink_size)) + middle_kept + list(range(seq_len - window_size, seq_len))
+
+    return snapkv_scores, sorted(kept_positions)
+
+# Legacy compatibility functions
+def _record_layer_fairness(layer_idx: int, kept_count: int, raw_max_qi: float, raw_max_hi: float, raw_max_combined: float):
+    """Legacy function - now a no-op, use _record_layer_diagnostic instead."""
+    pass
 
 def _reset_layer_fairness():
-    """Reset layer fairness stats for a new sample."""
-    global _CIRCUITKV_LAYER_STATS
-    _CIRCUITKV_LAYER_STATS = []
+    """Legacy function - now a no-op."""
+    pass
 
 def key_pruner_query_driven(kv_states, q_states, recent_size=128, ratio=0.3):
     _, _, seqlen, head_dim = kv_states.shape
@@ -1588,12 +1794,55 @@ class CircuitKVCluster():
         hi_scores: torch.Tensor = None,
         attn_weights_per_head: torch.Tensor = None,
         layer_idx: int = 1,
+        qi_raw_max: float = 0.0,
+        hi_raw_max: float = 0.0,
     ):
-        """Debug logging helper. Sample transition handled externally."""
+        """
+        Comprehensive debug logging with SnapKV baseline comparison.
+
+        Outputs JSONL with per-layer diagnostic data including:
+        - CircuitKV scores (QI, HI, combined) and kept positions
+        - SnapKV baseline scores and kept positions
+        - Overlap analysis to identify selection divergence
+        """
         if not self.debug:
             return
-        # Layer data already recorded via _record_layer_fairness
-        # Sample transition is now triggered from run_longbench.py
+
+        # Get CircuitKV kept positions
+        circuitkv_kept = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
+
+        # Compute SnapKV baseline for comparison
+        if attn_weights_per_head is not None:
+            snapkv_scores, snapkv_kept = _compute_snapkv_baseline(
+                attn_weights_per_head,
+                seq_len=q_len,
+                budget=self.max_capacity_prompt,
+                sink_size=self.sink_size,
+                window_size=self.window_size,
+                kernel_size=7,  # SnapKV default
+            )
+        else:
+            # Fallback: use H2O scores as proxy
+            snapkv_scores = h2o_scores[:q_len] if h2o_scores is not None else None
+            snapkv_kept = circuitkv_kept  # No comparison possible
+
+        # Record comprehensive diagnostic data
+        _record_layer_diagnostic(
+            layer_idx=layer_idx,
+            seq_len=q_len,
+            budget=self.max_capacity_prompt,
+            sink_size=self.sink_size,
+            window_size=self.window_size,
+            qi_raw_max=qi_raw_max,
+            hi_raw_max=hi_raw_max,
+            qi_scores=qi_scores,
+            hi_scores=hi_scores,
+            combined_scores=combined_scores,
+            circuitkv_kept_positions=circuitkv_kept,
+            snapkv_scores=snapkv_scores,
+            snapkv_kept_positions=snapkv_kept,
+            attn_column_sums=h2o_scores[:q_len] if h2o_scores is not None else None,
+        )
 
     def _lazy_init(self, device, seq_len: int):
         """Initialize CUDA graph on first use (only needed for random walk mode)."""
@@ -3245,13 +3494,15 @@ class CircuitKVCluster():
                 raw_max_combined = scores.max().item() if scores is not None else 0.0
                 _record_layer_fairness(layer_idx, middle_kept, _raw_max_qi, _raw_max_hi, raw_max_combined)
 
-                # Detailed debug logging (only for layer 1)
+                # Comprehensive diagnostic logging with SnapKV comparison
                 h2o_scores_debug = full_attn.sum(dim=0)
                 qi_debug = locals().get('qi_scores', None)
                 hi_debug = locals().get('hi_scores', None)
                 self._log_debug(
                     q_len, h2o_scores_debug, scores, keep_mask, full_attn,
-                    qi_debug, hi_debug, attn_weights_per_head, layer_idx
+                    qi_debug, hi_debug, attn_weights_per_head, layer_idx,
+                    qi_raw_max=_raw_max_qi,
+                    hi_raw_max=_raw_max_hi,
                 )
 
             # Apply eviction - shared across all heads

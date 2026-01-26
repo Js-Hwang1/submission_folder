@@ -238,6 +238,14 @@ def main(args):
             except ImportError:
                 pass
 
+        # MarkovKV debug: trigger sample transition
+        if args.method.lower() == "markovkv" and args.debug:
+            try:
+                from pyramidkv.pyramidkv_utils import _circuitkv_debug_next_sample
+                _circuitkv_debug_next_sample()
+            except ImportError:
+                pass
+
         batch_prompts = prompts[i:i+args.eval_batch_size]
         batch_inputs = inputs[i:i+args.eval_batch_size]
         batch_contexts = contexts[i:i+args.eval_batch_size]
@@ -271,8 +279,18 @@ def main(args):
             max_capacity_prompts = args.max_capacity_prompts
         elif args.max_capacity_prompts_ratio != -1:
             max_capacity_prompts = round(batch_input_ids.shape[1] * args.max_capacity_prompts_ratio)
-        
-        
+
+        # Set sample info for diagnostic logging
+        if args.debug and args.method.lower() in ["circuitkv", "markovkv"]:
+            try:
+                from pyramidkv.pyramidkv_utils import _set_circuitkv_sample_info
+                _set_circuitkv_sample_info(
+                    seq_len=batch_input_ids.shape[1],
+                    budget=max_capacity_prompts
+                )
+            except ImportError:
+                pass
+
         if args.method != "FullKV":
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "circuitkv"]:
                 window_sizes = 64  # Match SnapKV/PyramidKV default (was 8)
@@ -418,8 +436,8 @@ def main(args):
             # print(f'{batch_generations[j]}')
             fout.write(json.dumps(example) + "\n")
 
-    # CircuitKV debug: final dump to flush the last sample's layer data
-    if args.method.lower() == "circuitkv" and args.debug:
+    # Debug: final dump to flush the last sample's diagnostic data
+    if args.method.lower() in ["circuitkv", "markovkv"] and args.debug:
         try:
             from pyramidkv.pyramidkv_utils import _circuitkv_debug_next_sample
             _circuitkv_debug_next_sample()  # Dumps the final sample's data
