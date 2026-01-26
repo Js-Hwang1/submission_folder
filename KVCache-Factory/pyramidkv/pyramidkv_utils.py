@@ -2522,6 +2522,10 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
+        # Layer Fairness Debug: Initialize raw score trackers
+        _raw_max_qi = 0.0
+        _raw_max_hi = 0.0
+
         mode = "Neumann" if self.use_neumann else "RandomWalk"
         if self.combination_mode == "union":
             comb = f"Union(QI:{self.qi_ratio:.0%},HI:{1-self.qi_ratio:.0%})"  # v5.0: Union selection (no DA)
@@ -3134,9 +3138,7 @@ class CircuitKVCluster():
                 layer_idx = _circuitkv_debug_next_layer()
                 # For per-head, count average middle tokens kept across heads
                 middle_kept = num_select if middle_len > 0 and non_window_budget > 0 else 0
-                raw_max_qi = locals().get('_raw_max_qi', 0.0)
-                raw_max_hi = locals().get('_raw_max_hi', 0.0)
-                _record_layer_fairness(layer_idx, middle_kept, raw_max_qi, raw_max_hi, 0.0)
+                _record_layer_fairness(layer_idx, middle_kept, _raw_max_qi, _raw_max_hi, 0.0)
 
         else:
             # =====================================================================
@@ -3166,11 +3168,9 @@ class CircuitKVCluster():
                 # Count only MIDDLE tokens (between sink and window) for Layer Fairness test
                 kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
                 middle_kept = sum(1 for p in kept_positions if self.sink_size <= p < q_len - self.window_size)
-                # Retrieve raw max scores captured before smoothing/normalization
-                raw_max_qi = locals().get('_raw_max_qi', 0.0)
-                raw_max_hi = locals().get('_raw_max_hi', 0.0)
+                # Use raw max scores captured before smoothing/normalization
                 raw_max_combined = scores.max().item() if scores is not None else 0.0
-                _record_layer_fairness(layer_idx, middle_kept, raw_max_qi, raw_max_hi, raw_max_combined)
+                _record_layer_fairness(layer_idx, middle_kept, _raw_max_qi, _raw_max_hi, raw_max_combined)
 
                 # Detailed debug logging (only for layer 1)
                 h2o_scores_debug = full_attn.sum(dim=0)
