@@ -4217,4 +4217,11 @@ def init_circuitkv(self):
         # v6.10.0: Bridge Importance via A²
         use_bridge_importance=getattr(self.config, 'use_bridge_importance', False),
         bi_kernel_size=getattr(self.config, 'bi_kernel_size', 5),
+        # v6.12.0: HI Signal Gating
+        hi_signal_threshold=getattr(self.config, 'hi_signal_threshold', 0.0),
+        # v6.12.1: HI Soft Scaling
+        hi_scale_by_max=getattr(self.config, 'hi_scale_by_max', False),
+        # v6.13.0: Bidirectional Markov Chain
+        use_bidirectional_markov=getattr(self.config, 'use_bidirectional_markov', False),
+        bidirectional_gamma=getattr(self.config, 'bidirectional_gamma', 0.9),
     )
