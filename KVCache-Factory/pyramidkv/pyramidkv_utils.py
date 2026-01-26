@@ -1534,22 +1534,6 @@ class CircuitKVCluster():
     def _init_debug_log(self):
         """Initialize debug log (uses module-level singleton)."""
         log = _get_circuitkv_debug_log()
-        # Only write config on first init (layer 0)
-        if _CIRCUITKV_LAYER_COUNTER == 0:
-            log.write(f"⚙️  CONFIGURATION (v2.0.0):\n")
-            log.write(f"  Algorithm: MAX(rank_h2o, rank_influence)\n")
-            log.write(f"  \n")
-            log.write(f"  KV Cache Budget:\n")
-            log.write(f"    max_capacity_prompt: {self.max_capacity_prompt}\n")
-            log.write(f"    window_size:         {self.window_size} (local tokens always kept)\n")
-            log.write(f"    sink_size:           {self.sink_size} (sink tokens always kept)\n")
-            log.write(f"  \n")
-            log.write(f"  Influence Walker:\n")
-            log.write(f"    num_walkers:         {self.num_walkers}\n")
-            log.write(f"    max_steps:           {self.max_steps}\n")
-            log.write(f"  \n")
-            log.write("\n" + "=" * 80 + "\n\n")
-            log.flush()
 
     def _log_debug(
         self,
