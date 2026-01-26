@@ -379,6 +379,9 @@ def main(args):
                 # v6.13.0: Bidirectional Markov Chain
                 model.model.layers[i].self_attn.config.use_bidirectional_markov = args.use_bidirectional_markov
                 model.model.layers[i].self_attn.config.bidirectional_gamma = args.bidirectional_gamma
+                # v6.14.0: Query-Distance Weighting
+                model.model.layers[i].self_attn.config.use_query_distance_weight = args.use_query_distance_weight
+                model.model.layers[i].self_attn.config.query_distance_temp = args.query_distance_temp
                 # v6.10.0: Bridge Importance via A²
                 model.model.layers[i].self_attn.config.use_bridge_importance = args.use_bridge_importance
                 model.model.layers[i].self_attn.config.bi_kernel_size = args.bi_kernel_size
@@ -539,6 +542,11 @@ if __name__ == "__main__":
                         help="v6.13.0: Enable bidirectional Markov chain. Symmetrizes attention matrix A_sym=(A+A^T)/2 to fix early-position bias in causal attention.")
     parser.add_argument("--bidirectional_gamma", type=float, default=0.9,
                         help="v6.13.0: Discount factor for bidirectional Neumann series (default: 0.9, lower values favor direct attention)")
+    # v6.14.0: Query-Distance Weighting
+    parser.add_argument("--use_query_distance_weight", action="store_true",
+                        help="v6.14.0: Multiply Markov scores by exp(-distance_from_query/temp) to favor tokens near query.")
+    parser.add_argument("--query_distance_temp", type=float, default=1000.0,
+                        help="v6.14.0: Temperature for query distance decay (default: 1000, lower = sharper decay toward query)")
     # v6.10.0: Bridge Importance via A²
     parser.add_argument("--use_bridge_importance", action="store_true",
                         help="v6.10.0: Enable A² bridge importance for cross-document reasoning (2WikiMQA)")

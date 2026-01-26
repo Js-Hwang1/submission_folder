@@ -1566,6 +1566,9 @@ class CircuitKVCluster():
         # v6.13.0: Bidirectional Markov Chain - symmetrize attention for proper centrality
         use_bidirectional_markov: bool = False,  # If True, use A_sym = (A + A^T)/2 for Markov chain
         bidirectional_gamma: float = 0.9,  # Discount factor for bidirectional Neumann series
+        # v6.14.0: Query-Distance Weighting - favor tokens near query position
+        use_query_distance_weight: bool = False,  # If True, multiply scores by exp(-dist/temp)
+        query_distance_temp: float = 1000.0,  # Temperature for distance decay (higher = slower decay)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1632,6 +1635,9 @@ class CircuitKVCluster():
         # v6.13.0: Bidirectional Markov Chain
         self.use_bidirectional_markov = use_bidirectional_markov
         self.bidirectional_gamma = bidirectional_gamma
+        # v6.14.0: Query-Distance Weighting
+        self.use_query_distance_weight = use_query_distance_weight
+        self.query_distance_temp = query_distance_temp
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -3236,6 +3242,20 @@ class CircuitKVCluster():
                     gamma=self.neumann_gamma,
                 )
 
+            # v6.14.0: Query-Distance Weighting - favor tokens near query
+            use_qdw = getattr(self, 'use_query_distance_weight', False)
+            if use_qdw:
+                qdw_temp = getattr(self, 'query_distance_temp', 1000.0)
+                positions = torch.arange(q_len, device=qi_scores.device, dtype=qi_scores.dtype)
+                # Distance from query (query is at current_idx = q_len - 1)
+                distance = (current_idx - positions).float()
+                # Exponential decay: closer to query = higher weight
+                # weight[query_pos] = 1.0, weight decays as we go earlier
+                distance_weight = torch.exp(-distance / qdw_temp)
+                # Apply to both QI and HI
+                qi_scores = qi_scores * distance_weight
+                hi_scores = hi_scores * distance_weight
+
             # Store QI and HI for union selection (called in STEP 3)
             self._qi_scores_for_union = qi_scores
             self._hi_scores_for_union = hi_scores
@@ -3299,6 +3319,16 @@ class CircuitKVCluster():
                     attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
                     gamma=self.neumann_gamma,
                 )
+
+            # v6.14.0: Query-Distance Weighting - favor tokens near query
+            use_qdw = getattr(self, 'use_query_distance_weight', False)
+            if use_qdw:
+                qdw_temp = getattr(self, 'query_distance_temp', 1000.0)
+                positions = torch.arange(q_len, device=qi_scores.device, dtype=qi_scores.dtype)
+                distance = (current_idx - positions).float()
+                distance_weight = torch.exp(-distance / qdw_temp)
+                qi_scores = qi_scores * distance_weight
+                hi_scores = hi_scores * distance_weight
 
             # Compute Direct Attention (DA) - what the window actually attends to
             da_scores = full_attn[-self.window_size:, :q_len].sum(dim=0)
@@ -3371,6 +3401,16 @@ class CircuitKVCluster():
                     gamma=self.neumann_gamma,
                 )
             # _raw_max_qi and _raw_max_hi are now returned from the function (pre-normalization)
+
+            # v6.14.0: Query-Distance Weighting - favor tokens near query
+            use_qdw = getattr(self, 'use_query_distance_weight', False)
+            if use_qdw:
+                qdw_temp = getattr(self, 'query_distance_temp', 1000.0)
+                positions = torch.arange(q_len, device=qi_scores.device, dtype=qi_scores.dtype)
+                distance = (current_idx - positions).float()
+                distance_weight = torch.exp(-distance / qdw_temp)
+                qi_scores = qi_scores * distance_weight
+                hi_scores = hi_scores * distance_weight
 
             # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
             #
@@ -4224,4 +4264,7 @@ def init_circuitkv(self):
         # v6.13.0: Bidirectional Markov Chain
         use_bidirectional_markov=getattr(self.config, 'use_bidirectional_markov', False),
         bidirectional_gamma=getattr(self.config, 'bidirectional_gamma', 0.9),
+        # v6.14.0: Query-Distance Weighting
+        use_query_distance_weight=getattr(self.config, 'use_query_distance_weight', False),
+        query_distance_temp=getattr(self.config, 'query_distance_temp', 1000.0),
     )
