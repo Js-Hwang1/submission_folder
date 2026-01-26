@@ -1946,6 +1946,10 @@ class CircuitKVCluster():
         hi_scores[sink_size:] = result_hi
         hi_scores[:sink_size] = result_hi.sum() * 0.01  # Small score for sink
 
+        # Capture raw max values BEFORE normalization (for Layer Fairness debug)
+        qi_raw_max = qi_scores.max().item()
+        hi_raw_max = hi_scores.max().item()
+
         # Normalize each to [0, 1]
         qi_max = qi_scores.max()
         if qi_max > 0:
@@ -1955,7 +1959,7 @@ class CircuitKVCluster():
         if hi_max > 0:
             hi_scores = hi_scores / hi_max
 
-        return qi_scores, hi_scores
+        return qi_scores, hi_scores, qi_raw_max, hi_raw_max
 
     def _compute_per_head_markov_importance(
         self,
@@ -1994,7 +1998,9 @@ class CircuitKVCluster():
             head_chunk_size: Number of heads to process in parallel (memory vs speed)
 
         Returns:
-            Tuple of (qi_per_head, hi_per_head), each [num_heads, seq_len]
+            Tuple of (qi_per_head, hi_per_head, qi_raw_max, hi_raw_max)
+            - qi_per_head, hi_per_head: each [num_heads, seq_len] (normalized)
+            - qi_raw_max, hi_raw_max: float max values BEFORE normalization
         """
         # Average over batch dimension, keep heads separate
         # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
@@ -2010,17 +2016,21 @@ class CircuitKVCluster():
         # Handle edge cases
         if seq_len <= sink_size:
             uniform = torch.ones(num_heads, seq_len, device=device) / seq_len
-            return uniform, uniform.clone()
+            return uniform, uniform.clone(), 1.0, 1.0
 
         n_transient = seq_len - sink_size
         query_transient_idx = query_idx - sink_size
         if query_transient_idx < 0:
             uniform = torch.ones(num_heads, seq_len, device=device) / seq_len
-            return uniform, uniform.clone()
+            return uniform, uniform.clone(), 1.0, 1.0
 
         # Initialize output tensors
         qi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
         hi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
+
+        # Track raw max values across all chunks (before normalization)
+        global_qi_raw_max = 0.0
+        global_hi_raw_max = 0.0
 
         # Process heads in chunks for memory efficiency
         for chunk_start in range(0, num_heads, head_chunk_size):
@@ -2085,6 +2095,12 @@ class CircuitKVCluster():
             hi_full[:, sink_size:] = result_hi
             hi_full[:, :sink_size] = result_hi.sum(dim=-1, keepdim=True) * 0.01
 
+            # Capture raw max BEFORE normalization (for Layer Fairness debug)
+            chunk_qi_raw_max = qi_full.max().item()
+            chunk_hi_raw_max = hi_full.max().item()
+            global_qi_raw_max = max(global_qi_raw_max, chunk_qi_raw_max)
+            global_hi_raw_max = max(global_hi_raw_max, chunk_hi_raw_max)
+
             # Normalize each head's scores to [0, 1]
             qi_max = qi_full.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
             qi_full = qi_full / qi_max
@@ -2096,7 +2112,7 @@ class CircuitKVCluster():
             qi_per_head[chunk_start:chunk_end] = qi_full
             hi_per_head[chunk_start:chunk_end] = hi_full
 
-        return qi_per_head, hi_per_head
+        return qi_per_head, hi_per_head, global_qi_raw_max, global_hi_raw_max
 
     def _detect_instruction_anchors_heuristic(
         self,
@@ -2766,7 +2782,7 @@ class CircuitKVCluster():
             # - QI → late-position tokens (81% late) on paths FROM query
             # - HI → early-position tokens (67% early) that are global hubs
             # By taking union, we guarantee coverage from both perspectives.
-            qi_scores, hi_scores = self._compute_dual_importance_scores(
+            qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
                 full_attn[:q_len, :q_len].contiguous(),
                 current_idx,
                 sink_size=self.sink_size,
@@ -2797,7 +2813,7 @@ class CircuitKVCluster():
             # v5.1.0: Union Selection WITH DA weighting
             # Same as union but multiply by Direct Attention to preserve query relevance.
             # This keeps the attention grounding that helped v4.5.0 on TREC/classification.
-            qi_scores, hi_scores = self._compute_dual_importance_scores(
+            qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
                 full_attn[:q_len, :q_len].contiguous(),
                 current_idx,
                 sink_size=self.sink_size,
@@ -2836,7 +2852,7 @@ class CircuitKVCluster():
             # QI and HI from fundamental matrix N, combined via MAX(rank)
             # Analysis shows DA weighting HURTS performance: 42.24 (with DA) vs 42.42 (without DA)
             # DA hurts multi-hop QA (multifieldqa -1.06, narrativeqa -0.89) and retrieval tasks
-            qi_scores, hi_scores = self._compute_dual_importance_scores(
+            qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
                 full_attn[:q_len, :q_len].contiguous(),
                 current_idx,
                 sink_size=self.sink_size,
@@ -2845,10 +2861,7 @@ class CircuitKVCluster():
                 attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
                 gamma=self.neumann_gamma,
             )
-
-            # Layer Fairness: capture TRUE raw scores BEFORE smoothing/normalization
-            _raw_max_qi = qi_scores.max().item()
-            _raw_max_hi = hi_scores.max().item()
+            # _raw_max_qi and _raw_max_hi are now returned from the function (pre-normalization)
 
             # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
             #
@@ -3032,7 +3045,8 @@ class CircuitKVCluster():
 
             # Compute per-head Markov importance scores
             # qi_per_head, hi_per_head: [num_heads, seq_len]
-            qi_per_head, hi_per_head = self._compute_per_head_markov_importance(
+            # _raw_max_qi, _raw_max_hi: raw max values BEFORE normalization
+            qi_per_head, hi_per_head, _raw_max_qi, _raw_max_hi = self._compute_per_head_markov_importance(
                 attn_weights_per_head,
                 query_idx=q_len - 1,
                 sink_size=self.sink_size,
@@ -3040,10 +3054,6 @@ class CircuitKVCluster():
                 gamma=self.neumann_gamma,
                 head_chunk_size=getattr(self, 'head_chunk_size', 4),
             )
-
-            # Layer Fairness: capture raw scores (max across heads) BEFORE normalization
-            _raw_max_qi = qi_per_head.max().item()
-            _raw_max_hi = hi_per_head.max().item()
 
             # Truncate to non-window portion
             qi_per_head = qi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
