@@ -2914,11 +2914,6 @@ class CircuitKVCluster():
         else:
             version = "v4.5.0"
             da_note = ", DA-weighted"
-        # Only print version info once per instance
-        if not self._version_printed:
-            print(f"CircuitKV {version} ({mode}, k={self.neumann_iterations}, {comb}{da_note}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
-            self._version_printed = True
-
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
