@@ -3242,74 +3242,60 @@ class CircuitKVCluster():
 
         if self.per_head_eviction:
             # =====================================================================
-            # v7.0.0: PER-HEAD MARKOV IMPORTANCE
-            # Principled per-head token selection using Markov chain analysis.
+            # v7.1.0: HEAD-GATED GLOBAL IMPORTANCE
+            # Principled per-head token selection combining global Markov importance
+            # with per-head attention gating.
             #
-            # Key insight: Different attention heads specialize in different patterns.
-            # Global QI/HI forces all heads to keep the same tokens, destroying
-            # head specialization. Per-head Markov importance computes QI and HI
-            # independently for each head using its own attention pattern.
+            # Key insight: Global Markov (QI/HI) correctly captures multi-hop
+            # reasoning paths. Per-head attention gates which globally-important
+            # tokens each head should keep based on its specialization.
             #
-            # This is scientifically principled (same Markov chain theory) while
-            # respecting that heads have different roles and should keep different
-            # tokens in their KV cache.
+            # Formula: score[h,j] = GlobalMarkov[j] × HeadGate[h,j]
+            #
+            # Novelty: "Markov importance identifies WHAT matters globally;
+            #           head attention determines WHO keeps it."
+            #
+            # This preserves multi-hop reasoning (unlike broken per-head Markov)
+            # while respecting head specialization (unlike global-only selection).
             # =====================================================================
 
             non_window_len = q_len - self.window_size
 
-            # Compute per-head Markov importance scores
-            # qi_per_head, hi_per_head: [num_heads, seq_len]
-            qi_per_head, hi_per_head = self._compute_per_head_markov_importance(
-                attn_weights_per_head,
-                query_idx=q_len - 1,
-                sink_size=self.sink_size,
-                num_iterations=self.neumann_iterations,
-                gamma=self.neumann_gamma,
-                head_chunk_size=getattr(self, 'head_chunk_size', 8),
-            )
+            # STEP 1: Get global Markov importance (already computed above)
+            # combined_scores: [q_len] = MAX(rank(QI), rank(HI))
+            global_importance = combined_scores[:non_window_len]  # [non_window_len]
 
-            # Truncate to non-window portion
-            qi_per_head = qi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
-            hi_per_head = hi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
+            # STEP 2: Compute per-head attention gate (direct attention from window)
+            # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
+            # Sum over window dimension to get what each head attends to
+            head_gate = attn_weights_per_head[:, :, :, :non_window_len].sum(dim=2)  # [bsz, num_heads, non_window_len]
+            head_gate = head_gate.mean(dim=0)  # [num_heads, non_window_len] - avg over batch
 
-            # Rank normalize per head
-            qi_rank_per_head = torch.zeros_like(qi_per_head)
-            hi_rank_per_head = torch.zeros_like(hi_per_head)
-            for h in range(num_heads):
-                qi_rank_per_head[h] = self._rank_normalize(qi_per_head[h])
-                hi_rank_per_head[h] = self._rank_normalize(hi_per_head[h])
+            # Normalize gate per head to [0, 1]
+            head_gate_max = head_gate.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+            head_gate = head_gate / head_gate_max
 
-            # v7.0.0: Per-head MAX(QI, HI) - same DIS logic but per head
-            # Each head keeps tokens important to EITHER its QI or HI
-            if self.ablate_hi and not self.ablate_qi:
-                # QI-ONLY mode
-                per_head_scores = qi_rank_per_head
-            elif not self.ablate_hi and self.ablate_qi:
-                # HI-ONLY mode
-                per_head_scores = hi_rank_per_head
-            elif self.ablate_hi and self.ablate_qi:
-                # Both ablated: fallback to H2O per-head (SnapKV-style)
-                h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)
-                h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len]
-                per_head_scores = torch.zeros_like(h2o_per_head)
-                for h in range(num_heads):
-                    per_head_scores[h] = self._rank_normalize(h2o_per_head[h])
+            # STEP 3: Combine - Head-gated global importance
+            # Tokens need to be BOTH globally important AND relevant to the specific head
+            # Broadcast global importance and multiply by per-head gate
+            global_importance_broadcast = global_importance.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
+
+            if self.ablate_hi and self.ablate_qi:
+                # Both ablated: pure per-head H2O (SnapKV-style, no global Markov)
+                per_head_scores = head_gate
             else:
-                # Default: MAX(QI, HI) per head - the principled approach
-                per_head_scores = torch.maximum(qi_rank_per_head, hi_rank_per_head)
+                # Default: Head-gated global Markov importance
+                per_head_scores = global_importance_broadcast * head_gate  # [num_heads, non_window_len]
+
+            # Rank normalize per head for fair comparison
+            per_head_scores_ranked = torch.zeros_like(per_head_scores)
+            for h in range(num_heads):
+                per_head_scores_ranked[h] = self._rank_normalize(per_head_scores[h])
+            per_head_scores = per_head_scores_ranked
 
             # Apply Gaussian smoothing for spatial coherence (optional)
-            # Use the existing kernel settings
             smooth_kernel = max(self.qi_kernel_size, self.hi_kernel_size)
             if smooth_kernel > 1 and self.use_gaussian:
-                # Apply Gaussian smoothing per head
-                per_head_scores_smooth = self._apply_smoothing(
-                    per_head_scores.view(-1),  # Flatten
-                    smooth_kernel,
-                    use_gaussian=True,
-                    sigma=self.gaussian_sigma
-                ).view(num_heads, -1)  # Reshape back
-                # Actually, need to smooth each head separately
                 per_head_scores_smooth = torch.zeros_like(per_head_scores)
                 for h in range(num_heads):
                     per_head_scores_smooth[h] = self._apply_smoothing(
