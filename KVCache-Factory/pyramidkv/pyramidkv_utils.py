@@ -1404,6 +1404,7 @@ class CircuitKVCluster():
         self.debug = debug
         self._debug_log = None
         self._sample_counter = 0
+        self._version_printed = False  # Only print version info once
 
         # Lazy initialization of CUDA graph
         self._graph = None
@@ -1564,6 +1565,7 @@ class CircuitKVCluster():
         full_attn: torch.Tensor,
         qi_scores: torch.Tensor = None,
         hi_scores: torch.Tensor = None,
+        attn_weights_per_head: torch.Tensor = None,
     ):
         """Log structured debug data for AI analysis. Machine-parseable format."""
         if not self.debug:
@@ -1823,6 +1825,105 @@ class CircuitKVCluster():
                 if hi_wins > 0.8 * q_len:
                     issues.append("HI_OVER_DOMINATES")
             log.write(f"issues={issues}\n")
+
+            # =====================================================================
+            # HEAD-LEVEL DIAGNOSTICS (v7.2.0)
+            # For analyzing why MEAN pooling may be too diffuse for classification
+            # =====================================================================
+            if attn_weights_per_head is not None:
+                log.write(f"\n[HEAD_DIAGNOSTICS]\n")
+                # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
+                attn_per_head = attn_weights_per_head.mean(dim=0)  # [num_heads, window, seq]
+                num_heads_diag = attn_per_head.shape[0]
+
+                # 1. HEAD-WISE MASS DISTRIBUTION (Signal-to-Noise)
+                # Compute transient mass per head (attention to non-sink tokens)
+                head_masses = []
+                for h in range(num_heads_diag):
+                    head_attn = attn_per_head[h]  # [window, seq]
+                    # Mass = sum of attention to transient tokens (excluding sink)
+                    transient_mass = head_attn[:, self.sink_size:].sum().item()
+                    total_mass = head_attn.sum().item()
+                    head_masses.append(transient_mass / max(total_mass, 1e-8))
+
+                head_masses_t = torch.tensor(head_masses)
+                mass_variance = head_masses_t.var().item()
+                mass_mean = head_masses_t.mean().item()
+                mass_max = head_masses_t.max().item()
+                mass_min = head_masses_t.min().item()
+
+                log.write(f"head_mass_variance={mass_variance:.6f}\n")
+                log.write(f"head_mass_mean={mass_mean:.6f}\n")
+                log.write(f"head_mass_range=[{mass_min:.4f}, {mass_max:.4f}]\n")
+                log.write(f"head_mass_spread={mass_max - mass_min:.4f}\n")
+
+                # Flag: High variance = few super-heads, MEAN may hurt
+                if mass_variance > 0.01:
+                    log.write(f"WARNING: High head mass variance - MEAN pooling may dilute signal\n")
+
+                # Top-5 and Bottom-5 heads by mass
+                sorted_masses, sorted_indices = head_masses_t.sort(descending=True)
+                log.write(f"top5_head_masses={[(sorted_indices[i].item(), sorted_masses[i].item()) for i in range(min(5, num_heads_diag))]}\n")
+                log.write(f"bottom5_head_masses={[(sorted_indices[-(i+1)].item(), sorted_masses[-(i+1)].item()) for i in range(min(5, num_heads_diag))]}\n")
+
+            # 2. SINK-SATURATION vs CONTENT-FOCUS
+            log.write(f"\n[BUDGET_ALLOCATION]\n")
+            total_budget = self.max_capacity_prompt
+            sink_allocation = self.sink_size
+            window_allocation = self.window_size
+            competitive_slots = total_budget - sink_allocation - window_allocation
+
+            log.write(f"total_budget={total_budget}\n")
+            log.write(f"sink_allocation={sink_allocation} ({100*sink_allocation/total_budget:.1f}%)\n")
+            log.write(f"window_allocation={window_allocation} ({100*window_allocation/total_budget:.1f}%)\n")
+            log.write(f"competitive_slots={competitive_slots} ({100*competitive_slots/total_budget:.1f}%)\n")
+
+            # How many competitive slots are actually used vs wasted?
+            middle_kept = sum(1 for p in kept_positions if self.sink_size <= p < q_len - self.window_size)
+            log.write(f"middle_tokens_kept={middle_kept}\n")
+            log.write(f"competitive_utilization={100*middle_kept/max(competitive_slots,1):.1f}%\n")
+
+            # 3. TOKEN DENSITY / CLUSTERING ANALYSIS
+            log.write(f"\n[TOKEN_CLUSTERING]\n")
+            # Check if kept tokens are clustered (islands) or scattered
+            sorted_kept = sorted([p for p in kept_positions if self.sink_size <= p < q_len - self.window_size])
+            if len(sorted_kept) > 1:
+                gaps = [sorted_kept[i+1] - sorted_kept[i] for i in range(len(sorted_kept)-1)]
+                avg_gap = sum(gaps) / len(gaps)
+                max_gap = max(gaps)
+                min_gap = min(gaps)
+                consecutive_count = sum(1 for g in gaps if g == 1)
+                island_count = sum(1 for g in gaps if g > 1) + 1  # Number of separate islands
+
+                log.write(f"avg_gap_between_kept={avg_gap:.2f}\n")
+                log.write(f"max_gap={max_gap}\n")
+                log.write(f"min_gap={min_gap}\n")
+                log.write(f"consecutive_pairs={consecutive_count}\n")
+                log.write(f"island_count={island_count}\n")
+                log.write(f"avg_island_size={len(sorted_kept)/max(island_count,1):.1f}\n")
+
+                # Kernel tax: if kernel=5, we expect islands of ~5 consecutive tokens
+                effective_kernel = max(self.qi_kernel_size, self.hi_kernel_size)
+                if effective_kernel > 1 and island_count > 0:
+                    expected_island_size = effective_kernel
+                    actual_island_size = len(sorted_kept) / island_count
+                    log.write(f"effective_kernel={effective_kernel}\n")
+                    log.write(f"kernel_expansion_ratio={actual_island_size/expected_island_size:.2f}\n")
+
+            # 4. HI SHARPNESS RATIO (Top-1 vs Mean)
+            if hi_scores is not None:
+                hi_cpu = hi_scores[:q_len].cpu().float()
+                hi_max_val = hi_cpu.max().item()
+                hi_mean_val = hi_cpu.mean().item()
+                hi_sharpness = hi_max_val / max(hi_mean_val, 1e-8)
+                log.write(f"\n[HI_SHARPNESS]\n")
+                log.write(f"hi_top1={hi_max_val:.6f}\n")
+                log.write(f"hi_mean={hi_mean_val:.6f}\n")
+                log.write(f"hi_sharpness_ratio={hi_sharpness:.2f}\n")
+
+                # High sharpness = clear winners; low sharpness = diffuse/flat
+                if hi_sharpness < 5:
+                    log.write(f"WARNING: Low HI sharpness - scores are diffuse, MEAN may flatten peaks\n")
 
             log.write(f"\n{'='*60}\n\n")
             log.flush()
@@ -2813,7 +2914,10 @@ class CircuitKVCluster():
         else:
             version = "v4.5.0"
             da_note = ", DA-weighted"
-        print(f"CircuitKV {version} ({mode}, k={self.neumann_iterations}, {comb}{da_note}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
+        # Only print version info once per instance
+        if not self._version_printed:
+            print(f"CircuitKV {version} ({mode}, k={self.neumann_iterations}, {comb}{da_note}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
+            self._version_printed = True
 
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
@@ -3389,7 +3493,10 @@ class CircuitKVCluster():
                 # Pass HI and QI if available (from DIS mode)
                 qi_debug = locals().get('qi_scores', None)
                 hi_debug = locals().get('hi_scores', None)
-                self._log_debug(q_len, h2o_scores_debug, scores, keep_mask, full_attn, qi_debug, hi_debug)
+                self._log_debug(
+                    q_len, h2o_scores_debug, scores, keep_mask, full_attn,
+                    qi_debug, hi_debug, attn_weights_per_head
+                )
 
             # Apply eviction - shared across all heads
             # Get indices of tokens to keep (excluding local window which is appended)
