@@ -376,6 +376,9 @@ def main(args):
                 model.model.layers[i].self_attn.config.hi_signal_threshold = args.hi_signal_threshold
                 # v6.12.1: HI soft scaling by raw max
                 model.model.layers[i].self_attn.config.hi_scale_by_max = args.hi_scale_by_max
+                # v6.13.0: Bidirectional Markov Chain
+                model.model.layers[i].self_attn.config.use_bidirectional_markov = args.use_bidirectional_markov
+                model.model.layers[i].self_attn.config.bidirectional_gamma = args.bidirectional_gamma
                 # v6.10.0: Bridge Importance via A²
                 model.model.layers[i].self_attn.config.use_bridge_importance = args.use_bridge_importance
                 model.model.layers[i].self_attn.config.bi_kernel_size = args.bi_kernel_size
@@ -531,6 +534,11 @@ if __name__ == "__main__":
                         help="v6.12.0: HI signal gating threshold. If max(hi_raw) < threshold, silence HI for that layer (prevents noise amplification). 0=disabled, try 0.02-0.1")
     parser.add_argument("--hi_scale_by_max", action="store_true",
                         help="v6.12.1: Scale HI rank by layer's raw max (soft gating). hi_rank = rank_normalize(hi) * hi_raw_max. Automatically dampens noisy layers without threshold tuning.")
+    # v6.13.0: Bidirectional Markov Chain
+    parser.add_argument("--use_bidirectional_markov", action="store_true",
+                        help="v6.13.0: Enable bidirectional Markov chain. Symmetrizes attention matrix A_sym=(A+A^T)/2 to fix early-position bias in causal attention.")
+    parser.add_argument("--bidirectional_gamma", type=float, default=0.9,
+                        help="v6.13.0: Discount factor for bidirectional Neumann series (default: 0.9, lower values favor direct attention)")
     # v6.10.0: Bridge Importance via A²
     parser.add_argument("--use_bridge_importance", action="store_true",
                         help="v6.10.0: Enable A² bridge importance for cross-document reasoning (2WikiMQA)")

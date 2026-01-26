@@ -1563,6 +1563,9 @@ class CircuitKVCluster():
         hi_signal_threshold: float = 0.0,  # If max(hi_raw) < threshold, zero out hi_rank (0=disabled)
         # v6.12.1: HI Soft Scaling - scale rank by raw max (automatic dampening)
         hi_scale_by_max: bool = False,  # If True, hi_rank = rank_normalize(hi) * hi_raw_max
+        # v6.13.0: Bidirectional Markov Chain - symmetrize attention for proper centrality
+        use_bidirectional_markov: bool = False,  # If True, use A_sym = (A + A^T)/2 for Markov chain
+        bidirectional_gamma: float = 0.9,  # Discount factor for bidirectional Neumann series
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1626,6 +1629,9 @@ class CircuitKVCluster():
         self.hi_signal_threshold = hi_signal_threshold
         # v6.12.1: HI Soft Scaling
         self.hi_scale_by_max = hi_scale_by_max
+        # v6.13.0: Bidirectional Markov Chain
+        self.use_bidirectional_markov = use_bidirectional_markov
+        self.bidirectional_gamma = bidirectional_gamma
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2206,6 +2212,175 @@ class CircuitKVCluster():
         hi_raw_max = hi_scores.max().item()
 
         # Normalize each to [0, 1]
+        qi_max = qi_scores.max()
+        if qi_max > 0:
+            qi_scores = qi_scores / qi_max
+
+        hi_max = hi_scores.max()
+        if hi_max > 0:
+            hi_scores = hi_scores / hi_max
+
+        return qi_scores, hi_scores, qi_raw_max, hi_raw_max
+
+    def _compute_bidirectional_importance_scores(
+        self,
+        attention: torch.Tensor,
+        query_idx: int,
+        sink_size: int = 4,
+        num_iterations: int = 10,
+        temperature: float = 1.0,
+        gamma: float = 0.9,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+        """
+        v6.13.0: Bidirectional Markov Chain for Importance Scoring.
+
+        Key Insight:
+        ------------
+        Standard causal attention creates a LOWER-TRIANGULAR transition matrix,
+        causing the Neumann series to systematically bias toward early positions.
+        This is because probability mass can only flow backward, and early tokens
+        accumulate visits from the ENTIRE sequence.
+
+        Solution:
+        ---------
+        Symmetrize the attention matrix to model BIDIRECTIONAL information flow:
+        - Forward: attention[i,j] = "position i attends to j" (what I need)
+        - Backward: attention[j,i] = "position j attends to i" (who needs me)
+        - Symmetric: (forward + backward) / 2 = bidirectional importance
+
+        This restores proper Markov chain dynamics where both early AND late
+        tokens can have high centrality based on their semantic role, not just
+        their position.
+
+        Mathematical Foundation:
+        ------------------------
+        Let A be the causal attention matrix (lower triangular after masking).
+
+        1. Symmetrize: A_sym = (A + A^T) / 2
+           - A_sym[i,j] captures bidirectional attention between i and j
+           - For i < j: A_sym[i,j] = A[j,i] / 2 (j attends to i)
+           - For i > j: A_sym[i,j] = A[i,j] / 2 (i attends to j)
+
+        2. Row-normalize: Q_bi = A_sym / rowsum(A_sym)
+           - Creates proper stochastic transition matrix
+           - Each row sums to 1 (probability distribution)
+
+        3. Neumann series: N = I + γQ + γ²Q² + ... + γ^k Q^k
+           - Computes discounted expected visits
+           - γ < 1 ensures convergence and favors direct connections
+
+        4. QI = N[query, :] (expected visits from query)
+           HI = mean(N, dim=0) (average visits from all positions)
+
+        Args:
+            attention: Causal attention matrix [seq_len, seq_len]
+            query_idx: Query position (typically seq_len - 1)
+            sink_size: Number of sink tokens (absorbing states)
+            num_iterations: Neumann series iterations (k)
+            temperature: Attention sharpening (lower = sharper)
+            gamma: Discount factor for multi-hop paths (0.9 recommended)
+
+        Returns:
+            Tuple of (qi_scores, hi_scores, qi_raw_max, hi_raw_max)
+        """
+        n = attention.shape[0]
+        device = attention.device
+        dtype = torch.float32
+
+        # Handle edge cases
+        if n <= sink_size:
+            uniform = torch.ones(n, device=device, dtype=dtype) / n
+            return uniform, uniform, 1.0, 1.0
+
+        # =====================================================================
+        # STEP 1: Apply temperature scaling (optional sharpening)
+        # =====================================================================
+        if temperature != 1.0 and temperature > 0:
+            attn_scaled = attention ** (1.0 / temperature)
+        else:
+            attn_scaled = attention.clone()
+
+        # =====================================================================
+        # STEP 2: Symmetrize attention matrix
+        # A_sym = (A_forward + A_backward) / 2
+        # This models bidirectional information flow
+        # =====================================================================
+        A_sym = (attn_scaled + attn_scaled.t()) / 2.0
+
+        # =====================================================================
+        # STEP 3: Extract transient submatrix (exclude sink tokens)
+        # =====================================================================
+        n_transient = n - sink_size
+        A_trans = A_sym[sink_size:, sink_size:].contiguous()  # [n_transient, n_transient]
+
+        # =====================================================================
+        # STEP 4: Row-normalize to get stochastic transition matrix Q_bi
+        # =====================================================================
+        row_sums = A_trans.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        Q_bi = A_trans / row_sums  # [n_transient, n_transient]
+
+        # =====================================================================
+        # STEP 5: Query position in transient space
+        # =====================================================================
+        query_transient_idx = query_idx - sink_size
+        if query_transient_idx < 0:
+            uniform = torch.ones(n, device=device, dtype=dtype) / n
+            return uniform, uniform, 1.0, 1.0
+
+        # =====================================================================
+        # STEP 6: Neumann series for QI and HI
+        # QI: Start from one-hot at query position
+        # HI: Start from uniform distribution (average importance)
+        #
+        # Iterate: result = I + γQ + γ²Q² + ...
+        # Using: v_{k+1} = γ * Q^T @ v_k (for row of N)
+        # =====================================================================
+
+        # Initialize QI: one-hot at query
+        v_qi = torch.zeros(n_transient, device=device, dtype=dtype)
+        v_qi[query_transient_idx] = 1.0
+        result_qi = v_qi.clone()
+
+        # Initialize HI: uniform (average over all starting points)
+        v_hi = torch.ones(n_transient, device=device, dtype=dtype) / n_transient
+        result_hi = v_hi.clone()
+
+        # Iterate Neumann series with discount factor gamma
+        # result = I + γQ + γ²Q² + ... (discounted multi-hop paths)
+        for k in range(num_iterations):
+            # For row q of N = I + γQ + γ²Q² + ..., we compute:
+            # (N)[q,:] = e_q + γ * e_q @ Q + γ² * e_q @ Q² + ...
+            # Iteratively: v_{k+1} = γ * Q^T @ v_k (transpose for row access)
+            v_qi = gamma * torch.mv(Q_bi.t(), v_qi)
+            v_hi = gamma * torch.mv(Q_bi.t(), v_hi)
+
+            result_qi = result_qi + v_qi
+            result_hi = result_hi + v_hi
+
+            # Early stopping if converged
+            if v_qi.abs().max().item() < 1e-8 and v_hi.abs().max().item() < 1e-8:
+                break
+
+        # =====================================================================
+        # STEP 7: Map back to full sequence
+        # =====================================================================
+        qi_scores = torch.zeros(n, device=device, dtype=dtype)
+        qi_scores[sink_size:] = result_qi
+        qi_scores[:sink_size] = result_qi.mean() * 0.1  # Small score for sink
+
+        hi_scores = torch.zeros(n, device=device, dtype=dtype)
+        hi_scores[sink_size:] = result_hi
+        hi_scores[:sink_size] = result_hi.mean() * 0.1  # Small score for sink
+
+        # =====================================================================
+        # STEP 8: Capture raw max BEFORE normalization (for diagnostics)
+        # =====================================================================
+        qi_raw_max = qi_scores.max().item()
+        hi_raw_max = hi_scores.max().item()
+
+        # =====================================================================
+        # STEP 9: Normalize to [0, 1] range
+        # =====================================================================
         qi_max = qi_scores.max()
         if qi_max > 0:
             qi_scores = qi_scores / qi_max
@@ -3037,15 +3212,29 @@ class CircuitKVCluster():
             # - QI → late-position tokens (81% late) on paths FROM query
             # - HI → early-position tokens (67% early) that are global hubs
             # By taking union, we guarantee coverage from both perspectives.
-            qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
-                full_attn[:q_len, :q_len].contiguous(),
-                current_idx,
-                sink_size=self.sink_size,
-                num_iterations=self.neumann_iterations,
-                temperature=self.neumann_temperature,
-                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
-                gamma=self.neumann_gamma,
-            )
+
+            # v6.13.0: Bidirectional Markov Chain - fixes early-position bias
+            use_bidirectional = getattr(self, 'use_bidirectional_markov', False)
+            if use_bidirectional:
+                bi_gamma = getattr(self, 'bidirectional_gamma', 0.9)
+                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_bidirectional_importance_scores(
+                    full_attn[:q_len, :q_len].contiguous(),
+                    current_idx,
+                    sink_size=self.sink_size,
+                    num_iterations=self.neumann_iterations,
+                    temperature=self.neumann_temperature,
+                    gamma=bi_gamma,
+                )
+            else:
+                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
+                    full_attn[:q_len, :q_len].contiguous(),
+                    current_idx,
+                    sink_size=self.sink_size,
+                    num_iterations=self.neumann_iterations,
+                    temperature=self.neumann_temperature,
+                    attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                    gamma=self.neumann_gamma,
+                )
 
             # Store QI and HI for union selection (called in STEP 3)
             self._qi_scores_for_union = qi_scores
@@ -3087,15 +3276,29 @@ class CircuitKVCluster():
             # v5.1.0: Union Selection WITH DA weighting
             # Same as union but multiply by Direct Attention to preserve query relevance.
             # This keeps the attention grounding that helped v4.5.0 on TREC/classification.
-            qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
-                full_attn[:q_len, :q_len].contiguous(),
-                current_idx,
-                sink_size=self.sink_size,
-                num_iterations=self.neumann_iterations,
-                temperature=self.neumann_temperature,
-                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
-                gamma=self.neumann_gamma,
-            )
+
+            # v6.13.0: Bidirectional Markov Chain - fixes early-position bias
+            use_bidirectional = getattr(self, 'use_bidirectional_markov', False)
+            if use_bidirectional:
+                bi_gamma = getattr(self, 'bidirectional_gamma', 0.9)
+                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_bidirectional_importance_scores(
+                    full_attn[:q_len, :q_len].contiguous(),
+                    current_idx,
+                    sink_size=self.sink_size,
+                    num_iterations=self.neumann_iterations,
+                    temperature=self.neumann_temperature,
+                    gamma=bi_gamma,
+                )
+            else:
+                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
+                    full_attn[:q_len, :q_len].contiguous(),
+                    current_idx,
+                    sink_size=self.sink_size,
+                    num_iterations=self.neumann_iterations,
+                    temperature=self.neumann_temperature,
+                    attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                    gamma=self.neumann_gamma,
+                )
 
             # Compute Direct Attention (DA) - what the window actually attends to
             da_scores = full_attn[-self.window_size:, :q_len].sum(dim=0)
@@ -3144,15 +3347,29 @@ class CircuitKVCluster():
             # QI and HI from fundamental matrix N, combined via MAX(rank)
             # Analysis shows DA weighting HURTS performance: 42.24 (with DA) vs 42.42 (without DA)
             # DA hurts multi-hop QA (multifieldqa -1.06, narrativeqa -0.89) and retrieval tasks
-            qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
-                full_attn[:q_len, :q_len].contiguous(),
-                current_idx,
-                sink_size=self.sink_size,
-                num_iterations=self.neumann_iterations,
-                temperature=self.neumann_temperature,
-                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
-                gamma=self.neumann_gamma,
-            )
+
+            # v6.13.0: Bidirectional Markov Chain - fixes early-position bias
+            use_bidirectional = getattr(self, 'use_bidirectional_markov', False)
+            if use_bidirectional:
+                bi_gamma = getattr(self, 'bidirectional_gamma', 0.9)
+                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_bidirectional_importance_scores(
+                    full_attn[:q_len, :q_len].contiguous(),
+                    current_idx,
+                    sink_size=self.sink_size,
+                    num_iterations=self.neumann_iterations,
+                    temperature=self.neumann_temperature,
+                    gamma=bi_gamma,
+                )
+            else:
+                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
+                    full_attn[:q_len, :q_len].contiguous(),
+                    current_idx,
+                    sink_size=self.sink_size,
+                    num_iterations=self.neumann_iterations,
+                    temperature=self.neumann_temperature,
+                    attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                    gamma=self.neumann_gamma,
+                )
             # _raw_max_qi and _raw_max_hi are now returned from the function (pre-normalization)
 
             # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
