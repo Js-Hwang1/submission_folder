@@ -49,14 +49,9 @@ def _get_circuitkv_debug_log():
     if not _CIRCUITKV_DEBUG_INITIALIZED:
         log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
-        _CIRCUITKV_DEBUG_LOG.write("[LOG_HEADER]\n")
-        _CIRCUITKV_DEBUG_LOG.write("version=4.5.0\n")
-        _CIRCUITKV_DEBUG_LOG.write("format=structured\n")
-        _CIRCUITKV_DEBUG_LOG.write("algorithm=MAX(rank(QI*DA), rank(HI*DA))\n")
-        _CIRCUITKV_DEBUG_LOG.write("QI=Query Importance from Neumann N[query_row]\n")
-        _CIRCUITKV_DEBUG_LOG.write("HI=Hub Importance = column_sums(N)\n")
-        _CIRCUITKV_DEBUG_LOG.write("DA=Direct Attention = column_sums(window_attention)\n")
-        _CIRCUITKV_DEBUG_LOG.write("N=Fundamental Matrix (I-Q)^(-1)\n\n")
+        _CIRCUITKV_DEBUG_LOG.write("# CircuitKV v7 Debug Log\n")
+        _CIRCUITKV_DEBUG_LOG.write("# QI = Query Importance (Neumann series from query position)\n")
+        _CIRCUITKV_DEBUG_LOG.write("# HI = Hub Importance (average expected visits)\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
@@ -1567,366 +1562,76 @@ class CircuitKVCluster():
         hi_scores: torch.Tensor = None,
         attn_weights_per_head: torch.Tensor = None,
     ):
-        """Log structured debug data for AI analysis. Machine-parseable format."""
+        """Log focused debug data for diagnosing TREC/classification failures."""
         if not self.debug:
             return
 
         log = _get_circuitkv_debug_log()
         layer_num = _circuitkv_debug_next_layer()
 
-        if layer_num == 1:
-            sample_num = _circuitkv_debug_next_sample()
-            dataset = _CIRCUITKV_CURRENT_DATASET or "unknown"
-            compression_ratio = 100 * (1 - self.max_capacity_prompt / q_len)
+        # Only log for first layer to avoid spam
+        if layer_num != 1:
+            return
 
-            # =====================================================================
-            # HEADER
-            # =====================================================================
-            log.write(f"\n[SAMPLE {sample_num}]\n")
-            log.write(f"dataset={dataset}\n")
-            log.write(f"seq_len={q_len}\n")
-            log.write(f"budget={self.max_capacity_prompt}\n")
-            log.write(f"sink={self.sink_size}\n")
-            log.write(f"window={self.window_size}\n")
-            log.write(f"competitive_slots={self.max_capacity_prompt - self.sink_size - self.window_size}\n")
-            log.write(f"compression_pct={compression_ratio:.1f}\n")
-            log.write(f"neumann_k={self.neumann_iterations}\n")
-            log.write(f"temperature={self.neumann_temperature}\n")
-            log.write(f"combination_mode={self.combination_mode}\n\n")
+        sample_num = _circuitkv_debug_next_sample()
+        dataset = _CIRCUITKV_CURRENT_DATASET or "unknown"
+        kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
 
-            # Get tensors
-            h2o_cpu = h2o_scores[:q_len].cpu().float()
-            combined_cpu = combined_scores[:q_len].cpu().float()
-            kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
-            evicted_positions = (~keep_mask).nonzero(as_tuple=True)[0].cpu().tolist()
+        log.write(f"\n[SAMPLE {sample_num}] dataset={dataset} seq_len={q_len} budget={self.max_capacity_prompt}\n")
 
-            # =====================================================================
-            # HI / QI SCORES (if available from DIS mode)
-            # =====================================================================
-            if qi_scores is not None and hi_scores is not None:
-                qi_cpu = qi_scores[:q_len].cpu().float()
-                hi_cpu = hi_scores[:q_len].cpu().float()
+        # 1. HEAD MASS VARIANCE (Signal-to-Noise)
+        if attn_weights_per_head is not None:
+            attn_per_head = attn_weights_per_head.mean(dim=0)  # [num_heads, window, seq]
+            num_heads = attn_per_head.shape[0]
+            head_masses = []
+            for h in range(num_heads):
+                head_attn = attn_per_head[h]
+                transient_mass = head_attn[:, self.sink_size:].sum().item()
+                total_mass = head_attn.sum().item()
+                head_masses.append(transient_mass / max(total_mass, 1e-8))
 
-                # Rank normalize
-                qi_ranks = torch.argsort(torch.argsort(qi_cpu)).float() / (q_len - 1)
-                hi_ranks = torch.argsort(torch.argsort(hi_cpu)).float() / (q_len - 1)
-                max_ranks = torch.maximum(qi_ranks, hi_ranks)
+            head_masses_t = torch.tensor(head_masses)
+            sorted_masses, sorted_indices = head_masses_t.sort(descending=True)
 
-                log.write(f"[QI_SCORES] (Query Importance from Neumann N[q,:])\n")
-                log.write(f"qi_mean={qi_cpu.mean().item():.6f}\n")
-                log.write(f"qi_std={qi_cpu.std().item():.6f}\n")
-                log.write(f"qi_min={qi_cpu.min().item():.6f}\n")
-                log.write(f"qi_max={qi_cpu.max().item():.6f}\n")
-                log.write(f"qi_p50={torch.quantile(qi_cpu, 0.5).item():.6f}\n")
-                log.write(f"qi_p95={torch.quantile(qi_cpu, 0.95).item():.6f}\n")
-                log.write(f"qi_zeros={int((qi_cpu == 0).sum().item())}\n")
+            log.write(f"[HEAD_MASS] var={head_masses_t.var().item():.4f} mean={head_masses_t.mean().item():.4f} range=[{head_masses_t.min().item():.3f},{head_masses_t.max().item():.3f}]\n")
+            log.write(f"  top5: {[(sorted_indices[i].item(), f'{sorted_masses[i].item():.3f}') for i in range(min(5, num_heads))]}\n")
+            if head_masses_t.var().item() > 0.01:
+                log.write(f"  ⚠️ HIGH VARIANCE: MEAN pooling may dilute signal from dominant heads\n")
 
-                log.write(f"\n[HI_SCORES] (Hub Importance = column sums of N)\n")
-                log.write(f"hi_mean={hi_cpu.mean().item():.6f}\n")
-                log.write(f"hi_std={hi_cpu.std().item():.6f}\n")
-                log.write(f"hi_min={hi_cpu.min().item():.6f}\n")
-                log.write(f"hi_max={hi_cpu.max().item():.6f}\n")
-                log.write(f"hi_p50={torch.quantile(hi_cpu, 0.5).item():.6f}\n")
-                log.write(f"hi_p95={torch.quantile(hi_cpu, 0.95).item():.6f}\n")
-                log.write(f"hi_zeros={int((hi_cpu == 0).sum().item())}\n")
+        # 2. BUDGET ALLOCATION (Sink Saturation)
+        sink_pct = 100 * self.sink_size / self.max_capacity_prompt
+        window_pct = 100 * self.window_size / self.max_capacity_prompt
+        competitive = self.max_capacity_prompt - self.sink_size - self.window_size
+        middle_kept = sum(1 for p in kept_positions if self.sink_size <= p < q_len - self.window_size)
 
-                # QI vs HI correlation
-                if qi_cpu.std() > 0 and hi_cpu.std() > 0:
-                    qi_hi_corr = torch.corrcoef(torch.stack([qi_cpu, hi_cpu]))[0, 1].item()
-                    log.write(f"qi_hi_correlation={qi_hi_corr:.4f}\n")
+        log.write(f"[BUDGET] sink={self.sink_size}({sink_pct:.1f}%) window={self.window_size}({window_pct:.1f}%) competitive={competitive}({100-sink_pct-window_pct:.1f}%)\n")
+        log.write(f"  middle_kept={middle_kept} utilization={100*middle_kept/max(competitive,1):.1f}%\n")
 
-                # Who dominates in MAX(QI, HI)?
-                qi_wins = (qi_ranks > hi_ranks).sum().item()
-                hi_wins = (hi_ranks > qi_ranks).sum().item()
-                ties = q_len - qi_wins - hi_wins
-                log.write(f"qi_dominates_n={qi_wins}\n")
-                log.write(f"hi_dominates_n={hi_wins}\n")
-                log.write(f"ties_n={ties}\n")
+        # 3. TOKEN CLUSTERING (Kernel Tax)
+        sorted_kept = sorted([p for p in kept_positions if self.sink_size <= p < q_len - self.window_size])
+        if len(sorted_kept) > 1:
+            gaps = [sorted_kept[i+1] - sorted_kept[i] for i in range(len(sorted_kept)-1)]
+            consecutive = sum(1 for g in gaps if g == 1)
+            islands = sum(1 for g in gaps if g > 1) + 1
+            avg_island = len(sorted_kept) / max(islands, 1)
+            kernel = max(self.qi_kernel_size, self.hi_kernel_size)
 
-                # Top-20 by QI
-                qi_topk_vals, qi_topk_idx = torch.topk(qi_cpu, min(20, q_len))
-                log.write(f"\n[QI_TOP20]\n")
-                for i in range(min(20, q_len)):
-                    pos = qi_topk_idx[i].item()
-                    log.write(f"rank={i+1} pos={pos} qi={qi_cpu[pos].item():.6f} hi={hi_cpu[pos].item():.6f} max_rank={max_ranks[pos].item():.4f}\n")
+            log.write(f"[CLUSTERING] islands={islands} avg_size={avg_island:.1f} consecutive_pairs={consecutive}\n")
+            if kernel > 1:
+                log.write(f"  kernel={kernel} expansion_ratio={avg_island/kernel:.2f}\n")
+                if avg_island < kernel * 0.5:
+                    log.write(f"  ⚠️ LOW EXPANSION: kernel not grouping tokens as expected\n")
 
-                # Top-20 by HI
-                hi_topk_vals, hi_topk_idx = torch.topk(hi_cpu, min(20, q_len))
-                log.write(f"\n[HI_TOP20]\n")
-                for i in range(min(20, q_len)):
-                    pos = hi_topk_idx[i].item()
-                    log.write(f"rank={i+1} pos={pos} qi={qi_cpu[pos].item():.6f} hi={hi_cpu[pos].item():.6f} max_rank={max_ranks[pos].item():.4f}\n")
+        # 4. HI SHARPNESS (Top-1 vs Mean ratio)
+        if hi_scores is not None:
+            hi_cpu = hi_scores[:q_len].cpu().float()
+            sharpness = hi_cpu.max().item() / max(hi_cpu.mean().item(), 1e-8)
+            log.write(f"[HI_SHARPNESS] top1={hi_cpu.max().item():.4f} mean={hi_cpu.mean().item():.6f} ratio={sharpness:.1f}\n")
+            if sharpness < 10:
+                log.write(f"  ⚠️ LOW SHARPNESS: HI scores are diffuse, may miss key tokens\n")
 
-                # Divergence analysis: tokens where QI >> HI or HI >> QI
-                log.write(f"\n[QI_HI_DIVERGENCE] (tokens where one signal >> other)\n")
-                rank_diff = qi_ranks - hi_ranks
-                high_qi_low_hi = (rank_diff > 0.3).nonzero(as_tuple=True)[0][:10]
-                high_hi_low_qi = (rank_diff < -0.3).nonzero(as_tuple=True)[0][:10]
-                log.write(f"high_qi_low_hi_positions={high_qi_low_hi.tolist()}\n")
-                log.write(f"high_hi_low_qi_positions={high_hi_low_qi.tolist()}\n")
-
-            else:
-                # Fallback: use H2O as proxy (non-DIS mode)
-                log.write(f"[H2O_SCORES] (column sums of attention A, not from N)\n")
-                log.write(f"h2o_mean={h2o_cpu.mean().item():.6f}\n")
-                log.write(f"h2o_std={h2o_cpu.std().item():.6f}\n")
-                log.write(f"h2o_min={h2o_cpu.min().item():.6f}\n")
-                log.write(f"h2o_max={h2o_cpu.max().item():.6f}\n")
-                log.write(f"h2o_p50={torch.quantile(h2o_cpu, 0.5).item():.6f}\n")
-                log.write(f"h2o_p95={torch.quantile(h2o_cpu, 0.95).item():.6f}\n")
-
-            # =====================================================================
-            # COMBINED/MAX SCORES
-            # =====================================================================
-            log.write(f"\n[COMBINED_SCORES] (final selection criterion)\n")
-            log.write(f"combined_mean={combined_cpu.mean().item():.6f}\n")
-            log.write(f"combined_std={combined_cpu.std().item():.6f}\n")
-            log.write(f"combined_min={combined_cpu.min().item():.6f}\n")
-            log.write(f"combined_max={combined_cpu.max().item():.6f}\n")
-            log.write(f"combined_p50={torch.quantile(combined_cpu, 0.5).item():.6f}\n")
-            log.write(f"combined_p95={torch.quantile(combined_cpu, 0.95).item():.6f}\n")
-
-            # Top-20 by combined
-            comb_topk_vals, comb_topk_idx = torch.topk(combined_cpu, min(20, q_len))
-            log.write(f"\n[COMBINED_TOP20]\n")
-            for i in range(min(20, q_len)):
-                pos = comb_topk_idx[i].item()
-                log.write(f"rank={i+1} pos={pos} combined={combined_cpu[pos].item():.6f}\n")
-
-            # =====================================================================
-            # POSITION COVERAGE
-            # =====================================================================
-            log.write(f"\n[POSITION_COVERAGE]\n")
-            log.write(f"kept_count={len(kept_positions)}\n")
-            log.write(f"evicted_count={len(evicted_positions)}\n")
-
-            n_segments = 10
-            segment_size = q_len // n_segments
-            segment_coverage = []
-            for seg in range(n_segments):
-                seg_start = seg * segment_size
-                seg_end = (seg + 1) * segment_size if seg < n_segments - 1 else q_len
-                kept_in_seg = sum(1 for p in kept_positions if seg_start <= p < seg_end)
-                total_in_seg = seg_end - seg_start
-                coverage_pct = 100 * kept_in_seg / total_in_seg if total_in_seg > 0 else 0
-                segment_coverage.append(coverage_pct)
-                log.write(f"seg{seg}_range=[{seg_start},{seg_end}] kept={kept_in_seg} coverage_pct={coverage_pct:.1f}\n")
-
-            middle_coverage = sum(segment_coverage[2:8]) / 6
-            log.write(f"middle_coverage_avg={middle_coverage:.1f}\n")
-
-            # =====================================================================
-            # ATTENTION ANALYSIS
-            # =====================================================================
-            log.write(f"\n[ATTENTION_ANALYSIS]\n")
-            attn_row = full_attn[-1, :q_len].cpu()
-            attn_row_norm = attn_row / (attn_row.sum() + 1e-8)
-            entropy = -(attn_row_norm * torch.log(attn_row_norm + 1e-10)).sum().item()
-            max_entropy = math.log(q_len)
-            log.write(f"query_attn_entropy={entropy:.4f}\n")
-            log.write(f"max_entropy={max_entropy:.4f}\n")
-            log.write(f"entropy_ratio={entropy/max_entropy:.4f}\n")
-
-            attn_topk_vals, attn_topk_idx = torch.topk(attn_row, min(20, q_len))
-            log.write(f"query_top20_attn_positions={attn_topk_idx.tolist()}\n")
-
-            attn_top_kept = sum(1 for p in attn_topk_idx[:10].tolist() if p in kept_positions)
-            log.write(f"top10_attn_kept={attn_top_kept}\n")
-
-            total_attn_mass = attn_row.sum().item()
-            kept_attn_mass = sum(attn_row[p].item() for p in kept_positions if p < q_len)
-            log.write(f"total_attn_mass={total_attn_mass:.6f}\n")
-            log.write(f"kept_attn_mass={kept_attn_mass:.6f}\n")
-            log.write(f"kept_attn_pct={100*kept_attn_mass/max(total_attn_mass,1e-8):.1f}\n")
-
-            # =====================================================================
-            # SNAPKV COMPARISON
-            # =====================================================================
-            log.write(f"\n[SNAPKV_COMPARISON]\n")
-            snapkv_budget = self.max_capacity_prompt - self.window_size - self.sink_size
-            middle_start = self.sink_size
-            middle_end = q_len - self.window_size
-
-            if snapkv_budget > 0 and middle_end > middle_start:
-                snapkv_scores = h2o_cpu.clone()
-                if len(snapkv_scores) > 5:
-                    snapkv_scores_smooth = F.avg_pool1d(
-                        snapkv_scores.unsqueeze(0).unsqueeze(0),
-                        kernel_size=5, padding=2, stride=1
-                    ).squeeze()
-                else:
-                    snapkv_scores_smooth = snapkv_scores
-
-                snapkv_middle = snapkv_scores_smooth[middle_start:middle_end]
-                _, snapkv_topk_idx = torch.topk(snapkv_middle, min(snapkv_budget, len(snapkv_middle)))
-                snapkv_selected = set((snapkv_topk_idx + middle_start).tolist())
-                circuitkv_middle = set(p for p in kept_positions if middle_start <= p < middle_end)
-
-                overlap = circuitkv_middle & snapkv_selected
-                only_ckv = circuitkv_middle - snapkv_selected
-                only_snap = snapkv_selected - circuitkv_middle
-
-                log.write(f"snapkv_would_select={len(snapkv_selected)}\n")
-                log.write(f"circuitkv_selected={len(circuitkv_middle)}\n")
-                log.write(f"overlap={len(overlap)}\n")
-                log.write(f"only_circuitkv={len(only_ckv)}\n")
-                log.write(f"only_snapkv={len(only_snap)}\n")
-                log.write(f"overlap_pct={100*len(overlap)/max(len(snapkv_selected),1):.1f}\n")
-
-                if len(only_ckv) > 0:
-                    log.write(f"circuitkv_only_positions={sorted(only_ckv)[:20]}\n")
-                if len(only_snap) > 0:
-                    log.write(f"snapkv_only_positions={sorted(only_snap)[:20]}\n")
-
-            # =====================================================================
-            # EVICTION DETAILS
-            # =====================================================================
-            log.write(f"\n[TOP_EVICTIONS] (highest-scored tokens that were evicted)\n")
-            evicted_with_scores = [(pos, combined_cpu[pos].item()) for pos in evicted_positions if pos < q_len]
-            evicted_with_scores.sort(key=lambda x: x[1], reverse=True)
-            for pos, score in evicted_with_scores[:20]:
-                region = "early" if pos < q_len//4 else "mid" if pos < 3*q_len//4 else "late"
-                log.write(f"pos={pos} combined={score:.6f} region={region}\n")
-
-            # =====================================================================
-            # SCORE DISCRIMINATION
-            # =====================================================================
-            log.write(f"\n[SCORE_DISCRIMINATION]\n")
-            kept_scores = torch.tensor([combined_cpu[p].item() for p in kept_positions if p < q_len])
-            evicted_scores = torch.tensor([combined_cpu[p].item() for p in evicted_positions if p < q_len])
-
-            if len(kept_scores) > 0 and len(evicted_scores) > 0:
-                log.write(f"kept_mean={kept_scores.mean().item():.6f}\n")
-                log.write(f"evicted_mean={evicted_scores.mean().item():.6f}\n")
-                log.write(f"score_gap={kept_scores.mean().item() - evicted_scores.mean().item():.6f}\n")
-                log.write(f"kept_min={kept_scores.min().item():.6f}\n")
-                log.write(f"evicted_max={evicted_scores.max().item():.6f}\n")
-
-                if evicted_scores.max() > kept_scores.min():
-                    n_bad_evict = (evicted_scores > kept_scores.min()).sum().item()
-                    log.write(f"score_overlap_count={n_bad_evict}\n")
-                else:
-                    log.write(f"score_overlap_count=0\n")
-
-            # =====================================================================
-            # ISSUE FLAGS
-            # =====================================================================
-            log.write(f"\n[ISSUE_FLAGS]\n")
-            issues = []
-            if middle_coverage < 10:
-                issues.append("LOW_MIDDLE_COVERAGE")
-            if attn_top_kept < 7:
-                issues.append("MISSING_HIGH_ATTN_TOKENS")
-            if kept_attn_mass / max(total_attn_mass, 1e-8) < 0.7:
-                issues.append("LOW_ATTN_MASS_CAPTURED")
-            if qi_scores is not None and hi_scores is not None:
-                if qi_wins > 0.8 * q_len:
-                    issues.append("QI_OVER_DOMINATES")
-                if hi_wins > 0.8 * q_len:
-                    issues.append("HI_OVER_DOMINATES")
-            log.write(f"issues={issues}\n")
-
-            # =====================================================================
-            # HEAD-LEVEL DIAGNOSTICS (v7.2.0)
-            # For analyzing why MEAN pooling may be too diffuse for classification
-            # =====================================================================
-            if attn_weights_per_head is not None:
-                log.write(f"\n[HEAD_DIAGNOSTICS]\n")
-                # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
-                attn_per_head = attn_weights_per_head.mean(dim=0)  # [num_heads, window, seq]
-                num_heads_diag = attn_per_head.shape[0]
-
-                # 1. HEAD-WISE MASS DISTRIBUTION (Signal-to-Noise)
-                # Compute transient mass per head (attention to non-sink tokens)
-                head_masses = []
-                for h in range(num_heads_diag):
-                    head_attn = attn_per_head[h]  # [window, seq]
-                    # Mass = sum of attention to transient tokens (excluding sink)
-                    transient_mass = head_attn[:, self.sink_size:].sum().item()
-                    total_mass = head_attn.sum().item()
-                    head_masses.append(transient_mass / max(total_mass, 1e-8))
-
-                head_masses_t = torch.tensor(head_masses)
-                mass_variance = head_masses_t.var().item()
-                mass_mean = head_masses_t.mean().item()
-                mass_max = head_masses_t.max().item()
-                mass_min = head_masses_t.min().item()
-
-                log.write(f"head_mass_variance={mass_variance:.6f}\n")
-                log.write(f"head_mass_mean={mass_mean:.6f}\n")
-                log.write(f"head_mass_range=[{mass_min:.4f}, {mass_max:.4f}]\n")
-                log.write(f"head_mass_spread={mass_max - mass_min:.4f}\n")
-
-                # Flag: High variance = few super-heads, MEAN may hurt
-                if mass_variance > 0.01:
-                    log.write(f"WARNING: High head mass variance - MEAN pooling may dilute signal\n")
-
-                # Top-5 and Bottom-5 heads by mass
-                sorted_masses, sorted_indices = head_masses_t.sort(descending=True)
-                log.write(f"top5_head_masses={[(sorted_indices[i].item(), sorted_masses[i].item()) for i in range(min(5, num_heads_diag))]}\n")
-                log.write(f"bottom5_head_masses={[(sorted_indices[-(i+1)].item(), sorted_masses[-(i+1)].item()) for i in range(min(5, num_heads_diag))]}\n")
-
-            # 2. SINK-SATURATION vs CONTENT-FOCUS
-            log.write(f"\n[BUDGET_ALLOCATION]\n")
-            total_budget = self.max_capacity_prompt
-            sink_allocation = self.sink_size
-            window_allocation = self.window_size
-            competitive_slots = total_budget - sink_allocation - window_allocation
-
-            log.write(f"total_budget={total_budget}\n")
-            log.write(f"sink_allocation={sink_allocation} ({100*sink_allocation/total_budget:.1f}%)\n")
-            log.write(f"window_allocation={window_allocation} ({100*window_allocation/total_budget:.1f}%)\n")
-            log.write(f"competitive_slots={competitive_slots} ({100*competitive_slots/total_budget:.1f}%)\n")
-
-            # How many competitive slots are actually used vs wasted?
-            middle_kept = sum(1 for p in kept_positions if self.sink_size <= p < q_len - self.window_size)
-            log.write(f"middle_tokens_kept={middle_kept}\n")
-            log.write(f"competitive_utilization={100*middle_kept/max(competitive_slots,1):.1f}%\n")
-
-            # 3. TOKEN DENSITY / CLUSTERING ANALYSIS
-            log.write(f"\n[TOKEN_CLUSTERING]\n")
-            # Check if kept tokens are clustered (islands) or scattered
-            sorted_kept = sorted([p for p in kept_positions if self.sink_size <= p < q_len - self.window_size])
-            if len(sorted_kept) > 1:
-                gaps = [sorted_kept[i+1] - sorted_kept[i] for i in range(len(sorted_kept)-1)]
-                avg_gap = sum(gaps) / len(gaps)
-                max_gap = max(gaps)
-                min_gap = min(gaps)
-                consecutive_count = sum(1 for g in gaps if g == 1)
-                island_count = sum(1 for g in gaps if g > 1) + 1  # Number of separate islands
-
-                log.write(f"avg_gap_between_kept={avg_gap:.2f}\n")
-                log.write(f"max_gap={max_gap}\n")
-                log.write(f"min_gap={min_gap}\n")
-                log.write(f"consecutive_pairs={consecutive_count}\n")
-                log.write(f"island_count={island_count}\n")
-                log.write(f"avg_island_size={len(sorted_kept)/max(island_count,1):.1f}\n")
-
-                # Kernel tax: if kernel=5, we expect islands of ~5 consecutive tokens
-                effective_kernel = max(self.qi_kernel_size, self.hi_kernel_size)
-                if effective_kernel > 1 and island_count > 0:
-                    expected_island_size = effective_kernel
-                    actual_island_size = len(sorted_kept) / island_count
-                    log.write(f"effective_kernel={effective_kernel}\n")
-                    log.write(f"kernel_expansion_ratio={actual_island_size/expected_island_size:.2f}\n")
-
-            # 4. HI SHARPNESS RATIO (Top-1 vs Mean)
-            if hi_scores is not None:
-                hi_cpu = hi_scores[:q_len].cpu().float()
-                hi_max_val = hi_cpu.max().item()
-                hi_mean_val = hi_cpu.mean().item()
-                hi_sharpness = hi_max_val / max(hi_mean_val, 1e-8)
-                log.write(f"\n[HI_SHARPNESS]\n")
-                log.write(f"hi_top1={hi_max_val:.6f}\n")
-                log.write(f"hi_mean={hi_mean_val:.6f}\n")
-                log.write(f"hi_sharpness_ratio={hi_sharpness:.2f}\n")
-
-                # High sharpness = clear winners; low sharpness = diffuse/flat
-                if hi_sharpness < 5:
-                    log.write(f"WARNING: Low HI sharpness - scores are diffuse, MEAN may flatten peaks\n")
-
-            log.write(f"\n{'='*60}\n\n")
-            log.flush()
+        log.write(f"---\n")
+        log.flush()
 
     def _lazy_init(self, device, seq_len: int):
         """Initialize CUDA graph on first use (only needed for random walk mode)."""
