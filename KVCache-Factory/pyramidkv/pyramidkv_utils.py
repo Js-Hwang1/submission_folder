@@ -2265,25 +2265,33 @@ class CircuitKVCluster():
             chunk_end = min(chunk_start + head_chunk_size, num_heads)
             chunk_size = chunk_end - chunk_start
 
-            # Get attention for this chunk of heads
-            # Use the last row of window (most recent query position's attention)
-            # This is [chunk_size, seq_len] - the attention distribution from query
-            attn_chunk = attn[chunk_start:chunk_end, -1, :]  # [chunk, seq_len]
+            # Build full attention matrix for this chunk of heads
+            # full_attn_chunk: [chunk_size, seq_len, seq_len]
+            # We place window attention in the LAST window_size rows (where we have data)
+            full_attn_chunk = torch.zeros(chunk_size, seq_len, seq_len, device=device, dtype=torch.float32)
 
-            # Build transition matrix P from attention (row-stochastic)
-            # Each row sums to 1 (attention is already softmaxed)
-            # P[i, j] = probability of transitioning from i to j
-            # For causal attention, we approximate P using the query's attention pattern
-            # replicated for all positions (simplification that works empirically)
-            P_chunk = attn_chunk.unsqueeze(1).expand(-1, seq_len, -1).clone()  # [chunk, seq, seq]
+            # Get window attention for this chunk: [chunk_size, window_size, seq_len]
+            window_attn = attn[chunk_start:chunk_end, :, :]
+
+            # Place window attention in the last window_size rows
+            # These are the rows for positions [seq_len - window_size, ..., seq_len - 1]
+            actual_window = min(window_size, seq_len)
+            full_attn_chunk[:, -actual_window:, :] = window_attn[:, -actual_window:, :]
 
             # Make it properly causal: zero out future positions
             causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
-            P_chunk.masked_fill_(causal_mask.unsqueeze(0), 0)
+            full_attn_chunk.masked_fill_(causal_mask.unsqueeze(0), 0)
 
-            # Re-normalize rows to sum to 1
-            row_sums = P_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            P_chunk = P_chunk / row_sums
+            # Normalize rows to get transition matrix P
+            # Rows with all zeros (outside window) will get uniform distribution
+            row_sums = full_attn_chunk.sum(dim=-1, keepdim=True)
+            # For rows outside window, use uniform over previous positions
+            zero_rows = (row_sums.squeeze(-1) < 1e-8)  # [chunk, seq_len]
+            for i in range(seq_len - actual_window):
+                if i > 0:  # Position 0 has no previous positions
+                    full_attn_chunk[:, i, :i] = 1.0 / i
+            row_sums = full_attn_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            P_chunk = full_attn_chunk / row_sums
 
             # Extract Q (transient-to-transient transitions)
             Q_chunk = P_chunk[:, sink_size:, sink_size:].contiguous()  # [chunk, n_transient, n_transient]
@@ -3242,56 +3250,54 @@ class CircuitKVCluster():
 
         if self.per_head_eviction:
             # =====================================================================
-            # v7.1.0: HEAD-GATED GLOBAL IMPORTANCE
-            # Principled per-head token selection combining global Markov importance
-            # with per-head attention gating.
+            # v7.0.0: PER-HEAD MARKOV IMPORTANCE (FIXED)
+            # Each head computes its own QI/HI using Neumann series on its own
+            # attention pattern, then selects tokens via MAX(QI, HI).
             #
-            # Key insight: Global Markov (QI/HI) correctly captures multi-hop
-            # reasoning paths. Per-head attention gates which globally-important
-            # tokens each head should keep based on its specialization.
-            #
-            # Formula: score[h,j] = GlobalMarkov[j] × HeadGate[h,j]
-            #
-            # Novelty: "Markov importance identifies WHAT matters globally;
-            #           head attention determines WHO keeps it."
-            #
-            # This preserves multi-hop reasoning (unlike broken per-head Markov)
-            # while respecting head specialization (unlike global-only selection).
+            # Key fix: Build full attention matrix per head using ALL window rows,
+            # not just the last row. For positions outside window, use uniform
+            # attention over previous positions.
             # =====================================================================
 
             non_window_len = q_len - self.window_size
 
-            # STEP 1: Get global Markov importance (already computed above)
-            # combined_scores: [q_len] = MAX(rank(QI), rank(HI))
-            global_importance = combined_scores[:non_window_len]  # [non_window_len]
+            # Compute per-head Markov importance scores
+            # qi_per_head, hi_per_head: [num_heads, seq_len]
+            qi_per_head, hi_per_head = self._compute_per_head_markov_importance(
+                attn_weights_per_head,
+                query_idx=q_len - 1,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                gamma=self.neumann_gamma,
+                head_chunk_size=getattr(self, 'head_chunk_size', 4),
+            )
 
-            # STEP 2: Compute per-head attention gate (direct attention from window)
-            # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
-            # Sum over window dimension to get what each head attends to
-            head_gate = attn_weights_per_head[:, :, :, :non_window_len].sum(dim=2)  # [bsz, num_heads, non_window_len]
-            head_gate = head_gate.mean(dim=0)  # [num_heads, non_window_len] - avg over batch
+            # Truncate to non-window portion
+            qi_per_head = qi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
+            hi_per_head = hi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
 
-            # Normalize gate per head to [0, 1]
-            head_gate_max = head_gate.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
-            head_gate = head_gate / head_gate_max
-
-            # STEP 3: Combine - Head-gated global importance
-            # Tokens need to be BOTH globally important AND relevant to the specific head
-            # Broadcast global importance and multiply by per-head gate
-            global_importance_broadcast = global_importance.unsqueeze(0).expand(num_heads, -1)  # [num_heads, non_window_len]
-
-            if self.ablate_hi and self.ablate_qi:
-                # Both ablated: pure per-head H2O (SnapKV-style, no global Markov)
-                per_head_scores = head_gate
-            else:
-                # Default: Head-gated global Markov importance
-                per_head_scores = global_importance_broadcast * head_gate  # [num_heads, non_window_len]
-
-            # Rank normalize per head for fair comparison
-            per_head_scores_ranked = torch.zeros_like(per_head_scores)
+            # Rank normalize per head
+            qi_rank_per_head = torch.zeros_like(qi_per_head)
+            hi_rank_per_head = torch.zeros_like(hi_per_head)
             for h in range(num_heads):
-                per_head_scores_ranked[h] = self._rank_normalize(per_head_scores[h])
-            per_head_scores = per_head_scores_ranked
+                qi_rank_per_head[h] = self._rank_normalize(qi_per_head[h])
+                hi_rank_per_head[h] = self._rank_normalize(hi_per_head[h])
+
+            # Per-head MAX(QI, HI)
+            if self.ablate_hi and not self.ablate_qi:
+                per_head_scores = qi_rank_per_head
+            elif not self.ablate_hi and self.ablate_qi:
+                per_head_scores = hi_rank_per_head
+            elif self.ablate_hi and self.ablate_qi:
+                # Both ablated: pure per-head H2O (SnapKV-style)
+                h2o_per_head = attn_weights_per_head[:, :, :, :non_window_len].sum(dim=2)
+                h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len]
+                per_head_scores = torch.zeros_like(h2o_per_head)
+                for h in range(num_heads):
+                    per_head_scores[h] = self._rank_normalize(h2o_per_head[h])
+            else:
+                # Default: MAX(QI, HI) per head
+                per_head_scores = torch.maximum(qi_rank_per_head, hi_rank_per_head)
 
             # Apply Gaussian smoothing for spatial coherence (optional)
             smooth_kernel = max(self.qi_kernel_size, self.hi_kernel_size)
