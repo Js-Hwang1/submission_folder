@@ -1355,6 +1355,8 @@ class CircuitKVCluster():
         bi_kernel_size: int = 5,  # Smoothing kernel for BI (bridges need context)
         # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
         hi_signal_threshold: float = 0.0,  # If max(hi_raw) < threshold, zero out hi_rank (0=disabled)
+        # v6.12.1: HI Soft Scaling - scale rank by raw max (automatic dampening)
+        hi_scale_by_max: bool = False,  # If True, hi_rank = rank_normalize(hi) * hi_raw_max
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1416,6 +1418,8 @@ class CircuitKVCluster():
         self.bi_kernel_size = bi_kernel_size
         # v6.12.0: HI Signal Gating
         self.hi_signal_threshold = hi_signal_threshold
+        # v6.12.1: HI Soft Scaling
+        self.hi_scale_by_max = hi_scale_by_max
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -2802,9 +2806,18 @@ class CircuitKVCluster():
             # This is only used for debug logging, not for selection
             qi_rank = self._rank_normalize(qi_scores)
 
-            # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
+            # v6.12.0/v6.12.1: HI Signal Gating/Scaling - handle noisy HI in deep layers
+            hi_scale_by_max = getattr(self, 'hi_scale_by_max', False)
             hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
-            if hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+            if hi_scale_by_max:
+                # v6.12.1: Soft scaling - scale rank by layer's raw max
+                # Automatically dampens noisy layers without threshold tuning
+                hi_rank = self._rank_normalize(hi_scores) * _raw_max_hi
+                if getattr(self, 'hi_log_head_stats', False):
+                    print(f"[HI-SCALE] layer={getattr(self, '_layer_idx', '?')} "
+                          f"scaled by max={_raw_max_hi:.4f}")
+            elif hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+                # v6.12.0: Hard gating - silence layer entirely
                 hi_rank = torch.zeros_like(hi_scores)
                 if getattr(self, 'hi_log_head_stats', False):
                     print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
@@ -2850,9 +2863,17 @@ class CircuitKVCluster():
             # For compatibility with scoring path
             qi_rank = self._rank_normalize(qi_weighted)
 
-            # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
+            # v6.12.0/v6.12.1: HI Signal Gating/Scaling - handle noisy HI in deep layers
+            hi_scale_by_max = getattr(self, 'hi_scale_by_max', False)
             hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
-            if hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+            if hi_scale_by_max:
+                # v6.12.1: Soft scaling - scale rank by layer's raw max
+                hi_rank = self._rank_normalize(hi_weighted) * _raw_max_hi
+                if getattr(self, 'hi_log_head_stats', False):
+                    print(f"[HI-SCALE] layer={getattr(self, '_layer_idx', '?')} "
+                          f"scaled by max={_raw_max_hi:.4f}")
+            elif hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+                # v6.12.0: Hard gating - silence layer entirely
                 hi_rank = torch.zeros_like(hi_weighted)
                 if getattr(self, 'hi_log_head_stats', False):
                     print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
@@ -2935,11 +2956,20 @@ class CircuitKVCluster():
 
             qi_rank = self._rank_normalize(qi_scores)
 
-            # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
+            # v6.12.0/v6.12.1: HI Signal Gating/Scaling - handle noisy HI in deep layers
             # If raw HI max is below threshold, the HI scores are just noise that would
             # be stretched to [0,1] by rank normalization, evicting valid QI signals.
+            hi_scale_by_max = getattr(self, 'hi_scale_by_max', False)
             hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
-            if hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+            if hi_scale_by_max:
+                # v6.12.1: Soft scaling - scale rank by layer's raw max
+                # Automatically dampens noisy layers without threshold tuning
+                hi_rank = self._rank_normalize(hi_scores) * _raw_max_hi
+                if getattr(self, 'hi_log_head_stats', False):
+                    print(f"[HI-SCALE] layer={getattr(self, '_layer_idx', '?')} "
+                          f"scaled by max={_raw_max_hi:.4f}")
+            elif hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
+                # v6.12.0: Hard gating - silence layer entirely
                 hi_rank = torch.zeros_like(hi_scores)
                 if getattr(self, 'hi_log_head_stats', False):
                     print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "

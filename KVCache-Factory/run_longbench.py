@@ -356,6 +356,8 @@ def main(args):
                 model.model.layers[i].self_attn.config.hi_log_head_stats = args.hi_log_head_stats
                 # v6.12.0: HI signal gating threshold
                 model.model.layers[i].self_attn.config.hi_signal_threshold = args.hi_signal_threshold
+                # v6.12.1: HI soft scaling by raw max
+                model.model.layers[i].self_attn.config.hi_scale_by_max = args.hi_scale_by_max
                 # v6.10.0: Bridge Importance via A²
                 model.model.layers[i].self_attn.config.use_bridge_importance = args.use_bridge_importance
                 model.model.layers[i].self_attn.config.bi_kernel_size = args.bi_kernel_size
@@ -509,6 +511,8 @@ if __name__ == "__main__":
                         help="Log diagnostic stats about head selection (n_alive, mass distribution)")
     parser.add_argument("--hi_signal_threshold", type=float, default=0.0,
                         help="v6.12.0: HI signal gating threshold. If max(hi_raw) < threshold, silence HI for that layer (prevents noise amplification). 0=disabled, try 0.02-0.1")
+    parser.add_argument("--hi_scale_by_max", action="store_true",
+                        help="v6.12.1: Scale HI rank by layer's raw max (soft gating). hi_rank = rank_normalize(hi) * hi_raw_max. Automatically dampens noisy layers without threshold tuning.")
     # v6.10.0: Bridge Importance via A²
     parser.add_argument("--use_bridge_importance", action="store_true",
                         help="v6.10.0: Enable A² bridge importance for cross-document reasoning (2WikiMQA)")
