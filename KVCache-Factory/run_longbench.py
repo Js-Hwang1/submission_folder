@@ -358,6 +358,9 @@ def main(args):
                 model.model.layers[i].self_attn.config.sink_size = args.sink_size
                 model.model.layers[i].self_attn.config.neumann_temperature = args.neumann_temperature
                 model.model.layers[i].self_attn.config.neumann_gamma = args.neumann_gamma
+                # v7.6.0: Asymmetric gamma
+                model.model.layers[i].self_attn.config.qi_gamma = args.qi_gamma if args.qi_gamma is not None else args.neumann_gamma
+                model.model.layers[i].self_attn.config.hi_gamma = args.hi_gamma if args.hi_gamma is not None else args.neumann_gamma
                 # v6.5.0: Entropy-aware head selection
                 model.model.layers[i].self_attn.config.entropy_aware = args.entropy_aware
                 model.model.layers[i].self_attn.config.top_k_heads = args.top_k_heads
@@ -521,6 +524,11 @@ if __name__ == "__main__":
     parser.add_argument("--neumann_temperature", type=float, default=1.0, help="Temperature for transition sharpening (<1.0 = sharper, prevents signal diffusion)")
     parser.add_argument("--neumann_gamma", type=float, default=1.0,
                         help="v6.11.0: Spectral decay factor for Neumann series (default: 1.0=no decay, try 0.9 for locality bias)")
+    # v7.6.0: Asymmetric gamma for QI/HI
+    parser.add_argument("--qi_gamma", type=float, default=None,
+                        help="v7.6.0: Separate gamma for QI (overrides neumann_gamma for QI if set). Higher values emphasize multi-hop for retrieval.")
+    parser.add_argument("--hi_gamma", type=float, default=None,
+                        help="v7.6.0: Separate gamma for HI (overrides neumann_gamma for HI if set). Lower values for stable hub detection.")
     # v6.5.0: Entropy-aware head selection
     parser.add_argument("--entropy_aware", action=argparse.BooleanOptionalAction, default=True, help="v6.5.0: Use entropy-aware head selection (default: True)")
     parser.add_argument("--top_k_heads", type=int, default=10, help="Number of sharpest (lowest entropy) heads to use for QI (default: 10)")

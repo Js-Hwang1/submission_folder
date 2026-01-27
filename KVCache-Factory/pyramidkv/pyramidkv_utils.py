@@ -1285,6 +1285,8 @@ class CircuitKVCluster():
         neumann_iterations: int = 10,  # Number of Neumann series iterations
         neumann_temperature: float = 1.0,  # Temperature for attention sharpening (lower = sharper)
         neumann_gamma: float = 1.0,  # v6.11.0: Spectral decay factor (1.0=no decay, <1=locality bias)
+        qi_gamma: float = None,  # v7.6.0: Separate gamma for QI (None = use neumann_gamma)
+        hi_gamma: float = None,  # v7.6.0: Separate gamma for HI (None = use neumann_gamma)
         # v4.1.0: Combination tuning
         h2o_weight: float = 0.5,  # Weight for H2O in combination (0.5 = equal, >0.5 = favor H2O)
         combination_mode: str = "dis",  # "dis" (default, no DA), "max", "weighted", "union", "union_da"
@@ -1345,6 +1347,9 @@ class CircuitKVCluster():
         self.neumann_iterations = neumann_iterations
         self.neumann_temperature = neumann_temperature
         self.neumann_gamma = neumann_gamma
+        # v7.6.0: Asymmetric gamma for QI/HI
+        self.qi_gamma = qi_gamma if qi_gamma is not None else neumann_gamma
+        self.hi_gamma = hi_gamma if hi_gamma is not None else neumann_gamma
         # v4.1.0: Combination tuning
         self.h2o_weight = h2o_weight
         self.combination_mode = combination_mode
@@ -2206,6 +2211,8 @@ class CircuitKVCluster():
         gamma: float = 1.0,
         head_chunk_size: int = 8,
         true_hub_hi: bool = False,
+        qi_gamma: float = None,
+        hi_gamma: float = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         v7.0.0: Per-Head Markov Importance - Principled Per-Head Token Selection.
@@ -2324,9 +2331,12 @@ class CircuitKVCluster():
             ).squeeze(1)  # [chunk, seq_len]
 
             # Combine 1-hop (direct) and 2-hop (indirect) for QI
-            # gamma controls the weight of multi-hop paths
-            effective_gamma = gamma ** (num_iterations / 2)
-            result_qi = query_attn + effective_gamma * two_hop  # [chunk, seq_len]
+            # v7.6.0: Asymmetric gamma - separate gammas for QI and HI
+            qi_g = qi_gamma if qi_gamma is not None else gamma
+            hi_g = hi_gamma if hi_gamma is not None else gamma
+            effective_qi_gamma = qi_g ** (num_iterations / 2)
+            effective_hi_gamma = hi_g ** (num_iterations / 2)
+            result_qi = query_attn + effective_qi_gamma * two_hop  # [chunk, seq_len]
 
             # Extract transient portion (exclude sink)
             result_qi = result_qi[:, sink_size:]  # [chunk, n_transient]
@@ -2344,7 +2354,7 @@ class CircuitKVCluster():
                 position_idx = torch.arange(n_transient, device=device, dtype=torch.float32)
                 hi_weights = (n_transient - position_idx) / n_transient  # [n_transient]
                 hi_weights = hi_weights.unsqueeze(0)  # [1, n_transient]
-                result_hi = query_attn_transient * hi_weights * effective_gamma + query_attn_transient
+                result_hi = query_attn_transient * hi_weights * effective_hi_gamma + query_attn_transient
 
             # Map back to full sequence [chunk, seq_len]
             qi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
@@ -3307,6 +3317,8 @@ class CircuitKVCluster():
                 gamma=self.neumann_gamma,
                 head_chunk_size=getattr(self, 'head_chunk_size', 8),
                 true_hub_hi=getattr(self, 'true_hub_hi', False),
+                qi_gamma=getattr(self, 'qi_gamma', None),
+                hi_gamma=getattr(self, 'hi_gamma', None),
             )
 
             # Truncate to non-window portion

@@ -15,7 +15,6 @@ Ralph/
 res.tar.gz
 
 *.csv
-*.jsonl
 # =============================================================================
 # CircuitKV Build Artifacts - MUST be excluded for fresh builds on clone
 # =============================================================================
