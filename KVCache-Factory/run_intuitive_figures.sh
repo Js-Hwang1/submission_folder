@@ -2,7 +2,7 @@
 #SBATCH --job-name=intuitive_figs
 #SBATCH --output=/lustre/nvwulf/scratch/jungshwang/submission_folder/KVCache-Factory/logs/intuitive_figures_%j.out
 #SBATCH --error=/lustre/nvwulf/scratch/jungshwang/submission_folder/KVCache-Factory/logs/intuitive_figures_%j.err
-#SBATCH --partition=a100
+#SBATCH --partition=debug-b40x4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
