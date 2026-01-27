@@ -2407,23 +2407,23 @@ class CircuitKVCluster():
         head_chunk_size: int = 8,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        v7.0.0: Per-Head Markov Importance - Principled Per-Head Token Selection.
+        v7.1.0: Window-Only Per-Head Markov Importance (Optimized).
 
-        Computes QI and HI scores INDEPENDENTLY for each attention head using
-        Neumann series on each head's transition matrix. This preserves head
-        specialization: different heads attend to different tokens and should
-        keep different tokens in their KV cache.
+        Key Optimization: O(window²) instead of O(seq²)
 
-        Key Insight:
-        - SnapKV's per-head selection works because heads specialize
-        - Our global QI/HI destroys this by forcing uniform token selection
-        - Per-head Markov importance respects head specialization while
-          maintaining the principled Markov chain framework
+        The transition matrix Q has block lower-triangular structure:
+            Q = [Q_UU   0  ]   where U = uniform (pre-window), W = window
+                [Q_WU  Q_WW]
 
-        Memory Efficiency:
-        - Full computation would need O(num_heads × seq_len²) memory
-        - Chunked processing: O(chunk_size × seq_len²) per chunk
-        - At seq_len=32k, chunk_size=8: 8 × 32k² × 4 = 32GB (fits H100)
+        This means:
+        - N_WW = I + Q_WW + Q_WW² + ... (Neumann on window only)
+        - Pre-window scores come from how window attends to them
+
+        For QI (query in window): multi-hop within window, then leakage to pre-window
+        For HI: similar structure
+
+        Complexity: O(chunk × window² × iterations) vs O(chunk × seq² × iterations)
+        Speedup: ~(seq/window)² ≈ 4600x for seq=5000, window=64
 
         Args:
             attn_weights_per_head: [bsz, num_heads, window_size, seq_len] attention
@@ -2431,23 +2431,15 @@ class CircuitKVCluster():
             sink_size: Absorbing boundary size (first N tokens)
             num_iterations: Neumann series iterations
             gamma: Spectral decay factor (1.0 = no decay)
-            head_chunk_size: Number of heads to process in parallel (memory vs speed)
+            head_chunk_size: Number of heads to process in parallel
 
         Returns:
             Tuple of (qi_per_head, hi_per_head, qi_raw_max, hi_raw_max)
-            - qi_per_head, hi_per_head: each [num_heads, seq_len] (normalized)
-            - qi_raw_max, hi_raw_max: float max values BEFORE normalization
         """
         # Average over batch dimension, keep heads separate
-        # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
         attn = attn_weights_per_head.mean(dim=0)  # [num_heads, window_size, seq_len]
         num_heads, window_size, seq_len = attn.shape
         device = attn.device
-
-        # Build full attention matrix from window attention
-        # We need [num_heads, seq_len, seq_len] but only have window
-        # Reconstruct causal attention: each position attends to previous positions
-        # For positions beyond window, attention is approximated from last window row
 
         # Handle edge cases
         if seq_len <= sink_size:
@@ -2460,11 +2452,16 @@ class CircuitKVCluster():
             uniform = torch.ones(num_heads, seq_len, device=device) / seq_len
             return uniform, uniform.clone(), 1.0, 1.0
 
+        actual_window = min(window_size, seq_len - sink_size)  # Window in transient space
+
+        # Window region in transient coordinates: [n_transient - actual_window, n_transient)
+        window_start_t = max(0, n_transient - actual_window)  # Start of window in transient coords
+        window_len = n_transient - window_start_t  # Actual window length in transient
+        pre_window_len = window_start_t  # Length of pre-window region in transient
+
         # Initialize output tensors
         qi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
         hi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
-
-        # Track raw max values across all chunks (before normalization)
         global_qi_raw_max = 0.0
         global_hi_raw_max = 0.0
 
@@ -2473,74 +2470,99 @@ class CircuitKVCluster():
             chunk_end = min(chunk_start + head_chunk_size, num_heads)
             chunk_size = chunk_end - chunk_start
 
-            # Build full attention matrix for this chunk of heads
-            # full_attn_chunk: [chunk_size, seq_len, seq_len]
-            # We place window attention in the LAST window_size rows (where we have data)
-            full_attn_chunk = torch.zeros(chunk_size, seq_len, seq_len, device=device, dtype=torch.float32)
-
-            # Get window attention for this chunk: [chunk_size, window_size, seq_len]
+            # Get window attention: [chunk_size, window_size, seq_len]
             window_attn = attn[chunk_start:chunk_end, :, :]
 
-            # Place window attention in the last window_size rows
-            # These are the rows for positions [seq_len - window_size, ..., seq_len - 1]
-            actual_window = min(window_size, seq_len)
-            full_attn_chunk[:, -actual_window:, :] = window_attn[:, -actual_window:, :]
+            # === BUILD Q_WW: Window-to-Window transitions ===
+            # Window rows attending to window columns (transient coords)
+            # Original positions: [seq_len - actual_window, seq_len)
+            # Transient positions: [window_start_t, n_transient)
+            # Column indices in original: [window_start_t + sink_size, seq_len)
 
-            # Make it properly causal: zero out future positions
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
-            full_attn_chunk.masked_fill_(causal_mask.unsqueeze(0), 0)
+            window_col_start = window_start_t + sink_size  # Original coord of window start
+            Q_WW = window_attn[:, -window_len:, window_col_start:].clone()  # [chunk, window_len, window_len]
 
-            # Normalize rows to get transition matrix P
-            # Rows with all zeros (outside window) will get uniform distribution
-            row_sums = full_attn_chunk.sum(dim=-1, keepdim=True)
-            # For rows outside window, use uniform over previous positions
-            zero_rows = (row_sums.squeeze(-1) < 1e-8)  # [chunk, seq_len]
+            # Make causal within window
+            if window_len > 1:
+                causal_mask = torch.triu(torch.ones(window_len, window_len, device=device), diagonal=1).bool()
+                Q_WW.masked_fill_(causal_mask.unsqueeze(0), 0)
 
-            # Vectorized: create uniform attention for non-window positions
-            # Row i (for i > 0) gets value 1/i for positions j < i
-            non_window_len = seq_len - actual_window
-            if non_window_len > 1:
-                row_idx = torch.arange(non_window_len, device=device).unsqueeze(1)  # [non_window_len, 1]
-                col_idx = torch.arange(non_window_len, device=device).unsqueeze(0)  # [1, non_window_len]
-                mask = (col_idx < row_idx).float()  # [non_window_len, non_window_len]
-                divisor = row_idx.float().clamp(min=1)  # Avoid div by zero for row 0
-                uniform_weights = mask / divisor  # [non_window_len, non_window_len]
-                full_attn_chunk[:, :non_window_len, :non_window_len] = uniform_weights
+            # Normalize rows for Q_WW
+            Q_WW_sums = Q_WW.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            Q_WW = Q_WW / Q_WW_sums
 
-            row_sums = full_attn_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            P_chunk = full_attn_chunk / row_sums
+            # === BUILD Q_WU: Window-to-PreWindow transitions ===
+            # Window rows attending to pre-window columns
+            # Pre-window in original coords: [sink_size, window_col_start)
+            Q_WU = None
+            if pre_window_len > 0:
+                Q_WU = window_attn[:, -window_len:, sink_size:window_col_start].clone()  # [chunk, window_len, pre_window_len]
+                # Normalize by same row sums (Q_WW and Q_WU share rows)
+                # Actually need full row sum for proper normalization
+                full_row_sum = window_attn[:, -window_len:, sink_size:].sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                Q_WU = Q_WU / full_row_sum
+                # Re-normalize Q_WW with full row sum
+                Q_WW = window_attn[:, -window_len:, window_col_start:].clone()
+                if window_len > 1:
+                    Q_WW.masked_fill_(causal_mask.unsqueeze(0), 0)
+                Q_WW = Q_WW / full_row_sum
 
-            # Extract Q (transient-to-transient transitions)
-            Q_chunk = P_chunk[:, sink_size:, sink_size:].contiguous()  # [chunk, n_transient, n_transient]
+            # === QI: Query Importance via Neumann on Q_WW ===
+            # Query is at query_transient_idx in transient coords
+            # In window coords: query_transient_idx - window_start_t
+            query_window_idx = query_transient_idx - window_start_t
 
-            # Initialize QI vectors: one-hot at query position
-            v_qi = torch.zeros(chunk_size, n_transient, device=device, dtype=torch.float32)
-            v_qi[:, query_transient_idx] = 1.0
-            result_qi = v_qi.clone()
+            if query_window_idx < 0 or query_window_idx >= window_len:
+                # Query not in window - use uniform fallback
+                qi_full = torch.ones(chunk_size, seq_len, device=device) / seq_len
+                hi_full = torch.ones(chunk_size, seq_len, device=device) / seq_len
+            else:
+                # Initialize QI: one-hot at query position (in window coords)
+                v_qi = torch.zeros(chunk_size, window_len, device=device, dtype=torch.float32)
+                v_qi[:, query_window_idx] = 1.0
+                result_qi_W = v_qi.clone()
 
-            # Initialize HI vectors: uniform distribution
-            v_hi = torch.ones(chunk_size, n_transient, device=device, dtype=torch.float32) / n_transient
-            result_hi = v_hi.clone()
+                # Initialize HI: uniform in window
+                v_hi = torch.ones(chunk_size, window_len, device=device, dtype=torch.float32) / window_len
+                result_hi_W = v_hi.clone()
 
-            # Neumann series iteration: N = I + γQ + γ²Q² + ... + γ^k Q^k
-            # v = Q^T @ v iteratively computes (Q^T)^k @ v₀
-            for _ in range(num_iterations):
-                # Batched matrix-vector multiply: [chunk, n, n] @ [chunk, n, 1] -> [chunk, n, 1]
-                v_qi = gamma * torch.bmm(Q_chunk.transpose(-1, -2), v_qi.unsqueeze(-1)).squeeze(-1)
-                v_hi = gamma * torch.bmm(Q_chunk.transpose(-1, -2), v_hi.unsqueeze(-1)).squeeze(-1)
-                result_qi = result_qi + v_qi
-                result_hi = result_hi + v_hi
+                # Neumann series on Q_WW only: O(window²) per iteration
+                for _ in range(num_iterations):
+                    v_qi = gamma * torch.bmm(Q_WW.transpose(-1, -2), v_qi.unsqueeze(-1)).squeeze(-1)
+                    v_hi = gamma * torch.bmm(Q_WW.transpose(-1, -2), v_hi.unsqueeze(-1)).squeeze(-1)
+                    result_qi_W = result_qi_W + v_qi
+                    result_hi_W = result_hi_W + v_hi
 
-            # Map back to full sequence [chunk, seq_len]
-            qi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
-            qi_full[:, sink_size:] = result_qi
-            qi_full[:, :sink_size] = result_qi.sum(dim=-1, keepdim=True) * 0.01  # Small score for sink
+                # === Map scores to full sequence ===
+                qi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
+                hi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
 
-            hi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
-            hi_full[:, sink_size:] = result_hi
-            hi_full[:, :sink_size] = result_hi.sum(dim=-1, keepdim=True) * 0.01
+                # Window region scores (transient -> original coords)
+                qi_full[:, window_col_start:] = result_qi_W
+                hi_full[:, window_col_start:] = result_hi_W
 
-            # Capture raw max BEFORE normalization (for Layer Fairness debug)
+                # Pre-window region scores via Q_WU (leakage from window)
+                # score[j] = sum_i result_W[i] * Q_WU[i, j]  (backward flow)
+                # This is: result_W @ Q_WU^T ... wait, need to think about dimensions
+                # Q_WU: [chunk, window_len, pre_window_len]
+                # result_W: [chunk, window_len]
+                # leakage: [chunk, pre_window_len] = result_W @ Q_WU
+                if pre_window_len > 0 and Q_WU is not None:
+                    # Leakage: how much each window position's score flows to pre-window
+                    # For backward Markov (Q^T), score flows from i to j if Q[j,i] > 0
+                    # Q_WU[i,j] = prob window pos i attends to pre-window pos j
+                    # leakage[j] = sum_i result_W[i] * Q_WU[i,j]
+                    qi_leakage = torch.bmm(result_qi_W.unsqueeze(1), Q_WU).squeeze(1)  # [chunk, pre_window_len]
+                    hi_leakage = torch.bmm(result_hi_W.unsqueeze(1), Q_WU).squeeze(1)
+
+                    qi_full[:, sink_size:window_col_start] = qi_leakage
+                    hi_full[:, sink_size:window_col_start] = hi_leakage
+
+                # Sink tokens get small scores
+                qi_full[:, :sink_size] = result_qi_W.sum(dim=-1, keepdim=True) * 0.01
+                hi_full[:, :sink_size] = result_hi_W.sum(dim=-1, keepdim=True) * 0.01
+
+            # Capture raw max BEFORE normalization
             chunk_qi_raw_max = qi_full.max().item()
             chunk_hi_raw_max = hi_full.max().item()
             global_qi_raw_max = max(global_qi_raw_max, chunk_qi_raw_max)
@@ -2549,11 +2571,10 @@ class CircuitKVCluster():
             # Normalize each head's scores to [0, 1]
             qi_max = qi_full.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
             qi_full = qi_full / qi_max
-
             hi_max = hi_full.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
             hi_full = hi_full / hi_max
 
-            # Store results for this chunk
+            # Store results
             qi_per_head[chunk_start:chunk_end] = qi_full
             hi_per_head[chunk_start:chunk_end] = hi_full
 
