@@ -3313,7 +3313,21 @@ class CircuitKVCluster():
             qi_per_head = qi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
             hi_per_head = hi_per_head[:, :non_window_len]  # [num_heads, non_window_len]
 
-            # Rank normalize per head
+            # Apply smoothing BEFORE rank normalization (smoothing diffuses spikes to neighbors)
+            # Must be done on raw scores where spikes exist, not after rank normalization
+            smooth_kernel = self.smoothing_kernel if self.smoothing_kernel > 0 else max(self.qi_kernel_size, self.hi_kernel_size)
+            if smooth_kernel > 1:
+                for h in range(num_heads):
+                    qi_per_head[h] = self._apply_smoothing(
+                        qi_per_head[h], smooth_kernel,
+                        use_gaussian=True, sigma=self.gaussian_sigma
+                    )
+                    hi_per_head[h] = self._apply_smoothing(
+                        hi_per_head[h], smooth_kernel,
+                        use_gaussian=True, sigma=self.gaussian_sigma
+                    )
+
+            # Rank normalize per head (AFTER smoothing)
             qi_rank_per_head = torch.zeros_like(qi_per_head)
             hi_rank_per_head = torch.zeros_like(hi_per_head)
             for h in range(num_heads):
@@ -3338,28 +3352,6 @@ class CircuitKVCluster():
             else:
                 # Default: MAX(QI, HI) per head - the principled approach
                 per_head_scores = torch.maximum(qi_rank_per_head, hi_rank_per_head)
-
-            # Apply Gaussian smoothing for spatial coherence (optional)
-            # Use smoothing_kernel as primary, fall back to qi/hi kernel sizes
-            smooth_kernel = self.smoothing_kernel if self.smoothing_kernel > 0 else max(self.qi_kernel_size, self.hi_kernel_size)
-            if smooth_kernel > 1:
-                # Apply Gaussian smoothing per head
-                per_head_scores_smooth = self._apply_smoothing(
-                    per_head_scores.view(-1),  # Flatten
-                    smooth_kernel,
-                    use_gaussian=True,
-                    sigma=self.gaussian_sigma
-                ).view(num_heads, -1)  # Reshape back
-                # Actually, need to smooth each head separately
-                per_head_scores_smooth = torch.zeros_like(per_head_scores)
-                for h in range(num_heads):
-                    per_head_scores_smooth[h] = self._apply_smoothing(
-                        per_head_scores[h],
-                        smooth_kernel,
-                        use_gaussian=True,
-                        sigma=self.gaussian_sigma
-                    )
-                per_head_scores = per_head_scores_smooth
 
             # Per-head top-k selection
             # Budget for non-window tokens
