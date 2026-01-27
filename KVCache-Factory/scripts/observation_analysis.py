@@ -182,8 +182,14 @@ def plot_entropy_distribution(all_results, output_dir):
 
     for result in all_results:
         for layer_idx, layer_data in result["layers"].items():
-            entropy_by_layer[layer_idx].extend(layer_data["entropy_per_head"].tolist())
-            all_entropy.extend(layer_data["entropy_per_head"].tolist())
+            # Filter out NaN values
+            valid_entropy = [e for e in layer_data["entropy_per_head"].tolist() if not np.isnan(e)]
+            entropy_by_layer[layer_idx].extend(valid_entropy)
+            all_entropy.extend(valid_entropy)
+
+    if not all_entropy:
+        print("Warning: No valid entropy values found!")
+        return {"entropy_min": 0, "entropy_max": 0, "entropy_mean": 0, "entropy_std": 0}
 
     # Plot 1: Overall entropy distribution
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -201,8 +207,8 @@ def plot_entropy_distribution(all_results, output_dir):
     # Entropy by layer
     ax = axes[1]
     layer_indices = sorted(entropy_by_layer.keys())
-    layer_means = [np.mean(entropy_by_layer[l]) for l in layer_indices]
-    layer_stds = [np.std(entropy_by_layer[l]) for l in layer_indices]
+    layer_means = [np.nanmean(entropy_by_layer[l]) if entropy_by_layer[l] else 0 for l in layer_indices]
+    layer_stds = [np.nanstd(entropy_by_layer[l]) if entropy_by_layer[l] else 0 for l in layer_indices]
 
     ax.errorbar(layer_indices, layer_means, yerr=layer_stds, marker='o', capsize=3)
     ax.set_xlabel('Layer Index', fontsize=12)
@@ -219,16 +225,19 @@ def plot_entropy_distribution(all_results, output_dir):
     print(f"Entropy mean: {np.mean(all_entropy):.2f}, std: {np.std(all_entropy):.2f}")
 
     return {
-        "entropy_min": np.min(all_entropy),
-        "entropy_max": np.max(all_entropy),
-        "entropy_mean": np.mean(all_entropy),
-        "entropy_std": np.std(all_entropy),
+        "entropy_min": float(np.min(all_entropy)),
+        "entropy_max": float(np.max(all_entropy)),
+        "entropy_mean": float(np.mean(all_entropy)),
+        "entropy_std": float(np.std(all_entropy)),
     }
 
 
-def plot_hub_analysis(all_results, all_tokens, output_dir):
+def plot_hub_analysis(all_results, all_tokens, output_dir, sink_size=4):
     """
     Figure 2b: Hub token analysis.
+
+    Args:
+        sink_size: Number of initial tokens to exclude (attention sink tokens)
     """
     # Collect hub scores and token types
     hub_by_token_type = defaultdict(list)
@@ -239,10 +248,15 @@ def plot_hub_analysis(all_results, all_tokens, output_dir):
         mid_layer = len(result["layers"]) // 2
         hub_scores = result["layers"][mid_layer]["hub_scores"]
 
+        # Skip sink tokens (first sink_size positions)
         for i, (token, hub_score) in enumerate(zip(tokens, hub_scores)):
+            if i < sink_size:
+                continue  # Skip attention sink tokens
             all_hub_scores.append(hub_score)
 
-            # Categorize token type
+            # Categorize token type (skip sink tokens)
+            if i < sink_size:
+                continue
             if token in [".", ",", "!", "?", ":", ";"]:
                 hub_by_token_type["Punctuation"].append(hub_score)
             elif token in ["<s>", "</s>", "<|endoftext|>", "[CLS]", "[SEP]"]:
@@ -303,9 +317,12 @@ def plot_hub_analysis(all_results, all_tokens, output_dir):
     return hub_by_token_type
 
 
-def plot_multihop_analysis(all_results, output_dir):
+def plot_multihop_analysis(all_results, output_dir, sink_size=4):
     """
     Figure 2a/2d: Multi-hop reachability analysis.
+
+    Args:
+        sink_size: Number of initial tokens to exclude (attention sink tokens)
     """
     # Collect one-hop vs two-hop statistics
     one_hop_all = []
@@ -319,17 +336,22 @@ def plot_multihop_analysis(all_results, output_dir):
         one_hop = layer_data["one_hop"]
         two_hop = layer_data["two_hop"]
 
+        # Exclude sink tokens
+        one_hop_no_sink = one_hop[sink_size:]
+        two_hop_no_sink = two_hop[sink_size:]
+
         # For positions where one-hop is low, check if two-hop is higher
-        low_onehop_mask = one_hop < np.percentile(one_hop, 50)
+        if len(one_hop_no_sink) > 0:
+            low_onehop_mask = one_hop_no_sink < np.percentile(one_hop_no_sink, 50)
 
-        if low_onehop_mask.sum() > 0:
-            avg_onehop_low = one_hop[low_onehop_mask].mean()
-            avg_twohop_low = two_hop[low_onehop_mask].mean()
-            if avg_onehop_low > 0:
-                improvement_ratios.append(avg_twohop_low / avg_onehop_low)
+            if low_onehop_mask.sum() > 0:
+                avg_onehop_low = one_hop_no_sink[low_onehop_mask].mean()
+                avg_twohop_low = two_hop_no_sink[low_onehop_mask].mean()
+                if avg_onehop_low > 1e-8:
+                    improvement_ratios.append(avg_twohop_low / avg_onehop_low)
 
-        one_hop_all.extend(one_hop.tolist())
-        two_hop_all.extend(two_hop.tolist())
+        one_hop_all.extend(one_hop_no_sink.tolist())
+        two_hop_all.extend(two_hop_no_sink.tolist())
 
     # Plot
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -378,9 +400,12 @@ def plot_multihop_analysis(all_results, output_dir):
     return {"correlation": corr, "improvement_ratios": improvement_ratios}
 
 
-def plot_hero_figure(result, tokens, output_dir):
+def plot_hero_figure(result, tokens, output_dir, sink_size=4):
     """
     Generate a detailed hero figure showing the key concepts.
+
+    Args:
+        sink_size: Number of initial tokens to exclude (attention sink tokens)
     """
     mid_layer = len(result["layers"]) // 2
     layer_data = result["layers"][mid_layer]
@@ -394,47 +419,72 @@ def plot_hero_figure(result, tokens, output_dir):
     ax1 = fig.add_subplot(gs[0, 0])
     entropy = layer_data["entropy_per_head"]
     num_heads = len(entropy)
-    colors = plt.cm.RdYlGn_r(entropy / entropy.max())
-    bars = ax1.bar(range(num_heads), entropy, color=colors, edgecolor='black', linewidth=0.5)
-    ax1.axhline(np.median(entropy), color='blue', linestyle='--', label=f'Median: {np.median(entropy):.2f}')
+
+    # Handle NaN values in entropy
+    valid_entropy = entropy[~np.isnan(entropy)]
+    if len(valid_entropy) > 0:
+        entropy_max = np.nanmax(entropy)
+        entropy_min = np.nanmin(entropy)
+        # Normalize for colors, handling NaN
+        entropy_normalized = np.nan_to_num((entropy - entropy_min) / (entropy_max - entropy_min + 1e-8), nan=0.5)
+        colors = plt.cm.RdYlGn_r(entropy_normalized)
+        median_val = np.nanmedian(entropy)
+    else:
+        colors = plt.cm.RdYlGn_r(np.zeros(num_heads))
+        median_val = 0
+
+    bars = ax1.bar(range(num_heads), np.nan_to_num(entropy), color=colors, edgecolor='black', linewidth=0.5)
+    ax1.axhline(median_val, color='blue', linestyle='--', label=f'Median: {median_val:.2f}')
     ax1.set_xlabel('Head Index', fontsize=11)
     ax1.set_ylabel('Entropy (nats)', fontsize=11)
     ax1.set_title('(a) Attention Entropy Varies Across Heads', fontsize=12, fontweight='bold')
     ax1.legend(fontsize=9)
 
     # Add annotations for sharp vs diffuse heads
-    sharp_idx = np.argmin(entropy)
-    diffuse_idx = np.argmax(entropy)
-    ax1.annotate('Sharp', (sharp_idx, entropy[sharp_idx]),
-                 textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9,
-                 arrowprops=dict(arrowstyle='->', color='green'))
-    ax1.annotate('Diffuse', (diffuse_idx, entropy[diffuse_idx]),
-                 textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9,
-                 arrowprops=dict(arrowstyle='->', color='red'))
+    valid_mask = ~np.isnan(entropy)
+    if valid_mask.any():
+        entropy_safe = np.where(valid_mask, entropy, np.inf)
+        sharp_idx = np.argmin(entropy_safe)
+        entropy_safe = np.where(valid_mask, entropy, -np.inf)
+        diffuse_idx = np.argmax(entropy_safe)
 
-    # Panel (b): Hub scores
+        if not np.isnan(entropy[sharp_idx]):
+            ax1.annotate('Sharp', (sharp_idx, entropy[sharp_idx]),
+                         textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9,
+                         arrowprops=dict(arrowstyle='->', color='green'))
+        if not np.isnan(entropy[diffuse_idx]):
+            ax1.annotate('Diffuse', (diffuse_idx, entropy[diffuse_idx]),
+                         textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9,
+                         arrowprops=dict(arrowstyle='->', color='red'))
+
+    # Panel (b): Hub scores - EXCLUDE sink tokens for visualization
     ax2 = fig.add_subplot(gs[0, 1])
     hub_scores = layer_data["hub_scores"]
-    seq_len = min(200, len(hub_scores))  # Show first 200 tokens
-    ax2.bar(range(seq_len), hub_scores[:seq_len], alpha=0.7, width=1.0)
-    threshold = np.percentile(hub_scores, 90)
+    # Exclude sink tokens for better visualization
+    hub_scores_no_sink = hub_scores[sink_size:]
+    seq_len = min(200, len(hub_scores_no_sink))
+    ax2.bar(range(sink_size, sink_size + seq_len), hub_scores_no_sink[:seq_len], alpha=0.7, width=1.0)
+    threshold = np.percentile(hub_scores_no_sink, 90)
     ax2.axhline(threshold, color='red', linestyle='--', label=f'Top 10% threshold')
-    ax2.set_xlabel('Token Position', fontsize=11)
+    ax2.set_xlabel('Token Position (excluding sink tokens)', fontsize=11)
     ax2.set_ylabel('Hub Score (Column Sum)', fontsize=11)
     ax2.set_title('(b) Hub Tokens Receive High Attention From Many Positions', fontsize=12, fontweight='bold')
     ax2.legend(fontsize=9)
 
-    # Panel (c): One-hop vs Combined
+    # Panel (c): One-hop vs Combined - EXCLUDE sink tokens
     ax3 = fig.add_subplot(gs[1, 0])
     one_hop = layer_data["one_hop"]
     combined = layer_data["combined"]
-    seq_len = min(200, len(one_hop))
+    # Exclude sink tokens
+    one_hop_no_sink = one_hop[sink_size:]
+    combined_no_sink = combined[sink_size:]
+    seq_len = min(200, len(one_hop_no_sink))
 
-    x = np.arange(seq_len)
+    x = np.arange(sink_size, sink_size + seq_len)
     width = 0.35
-    ax3.bar(x - width/2, one_hop[:seq_len], width, label='One-Hop (H2O)', alpha=0.7)
-    ax3.bar(x + width/2, combined[:seq_len], width, label='Combined (Ours)', alpha=0.7)
-    ax3.set_xlabel('Token Position', fontsize=11)
+    ax3.bar(x - width/2, one_hop_no_sink[:seq_len], width, label='One-Hop (H2O)', alpha=0.7)
+    ax3.bar(x + width/2, combined_no_sink[:seq_len], width, label='Combined (Ours)', alpha=0.7)
+    ax3.set_xlabel('Token Position (excluding sink tokens)', fontsize=11)
     ax3.set_ylabel('Importance Score', fontsize=11)
     ax3.set_title('(c) Multi-Hop Captures Indirect Dependencies', fontsize=12, fontweight='bold')
     ax3.legend(fontsize=9)
