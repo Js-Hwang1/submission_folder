@@ -3340,9 +3340,9 @@ class CircuitKVCluster():
                 per_head_scores = torch.maximum(qi_rank_per_head, hi_rank_per_head)
 
             # Apply Gaussian smoothing for spatial coherence (optional)
-            # Use the existing kernel settings
-            smooth_kernel = max(self.qi_kernel_size, self.hi_kernel_size)
-            if smooth_kernel > 1 and self.use_gaussian:
+            # Use smoothing_kernel as primary, fall back to qi/hi kernel sizes
+            smooth_kernel = self.smoothing_kernel if self.smoothing_kernel > 0 else max(self.qi_kernel_size, self.hi_kernel_size)
+            if smooth_kernel > 1:
                 # Apply Gaussian smoothing per head
                 per_head_scores_smooth = self._apply_smoothing(
                     per_head_scores.view(-1),  # Flatten
