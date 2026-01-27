@@ -67,12 +67,15 @@ def get_attention_and_entropy(model, tokenizer, text: str, device='cuda'):
     entropy_per_head = np.zeros((n_layers, n_heads))
 
     for layer_idx, attn in enumerate(attentions):
-        attn_np = attn[0].cpu().numpy()  # (n_heads, seq_len, seq_len)
+        attn_np = attn[0].cpu().float().numpy()  # (n_heads, seq_len, seq_len)
         for head_idx in range(n_heads):
             # Compute entropy for the last token's attention (query position)
             attn_dist = attn_np[head_idx, -1, :]  # attention from last position
+            # Handle NaN and zero values
+            attn_dist = np.nan_to_num(attn_dist, nan=1e-10, posinf=1e-10, neginf=1e-10)
             attn_dist = np.clip(attn_dist, 1e-10, 1.0)
-            entropy = -np.sum(attn_dist * np.log(attn_dist))
+            attn_dist = attn_dist / attn_dist.sum()  # Renormalize
+            entropy = -np.sum(attn_dist * np.log(attn_dist + 1e-10))
             entropy_per_head[layer_idx, head_idx] = entropy
 
     tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
@@ -270,12 +273,11 @@ def compute_token_importance_overlap(model, tokenizer, text: str, device='cuda')
         late_importance += attn_np.sum(axis=0)
     late_importance = late_importance / late_importance.sum()
 
-    # Top-k overlap analysis
-    results = {'k': [], 'qi_overlap': [], 'h2o_overlap': [], 'random_overlap': []}
+    # Top-k overlap analysis using PERCENTAGE of tokens (consistent across lengths)
+    results = {'pct': [], 'qi_overlap': [], 'h2o_overlap': [], 'random_overlap': []}
 
-    for k in [5, 10, 15, 20, 25, 30]:
-        if k >= seq_len:
-            continue
+    for pct in [0.1, 0.2, 0.3, 0.4, 0.5]:  # Top 10%, 20%, 30%, 40%, 50%
+        k = max(1, int(seq_len * pct))
 
         # Top-k by each method
         qi_topk = set(np.argsort(early_qi)[-k:])
@@ -290,7 +292,7 @@ def compute_token_importance_overlap(model, tokenizer, text: str, device='cuda')
         h2o_overlap = len(h2o_topk & late_topk) / k
         random_overlap = len(random_topk & late_topk) / k
 
-        results['k'].append(k)
+        results['pct'].append(pct)
         results['qi_overlap'].append(qi_overlap)
         results['h2o_overlap'].append(h2o_overlap)
         results['random_overlap'].append(random_overlap)
@@ -302,13 +304,13 @@ def create_ablation_figure(overlap_results: List[Dict], output_dir: str):
     """
     Create ablation figure showing QI finds better bridge tokens than H2O.
 
-    X-axis: Number of tokens selected (k)
+    X-axis: Percentage of tokens selected
     Y-axis: Overlap with late-layer important tokens
     """
     fig, ax = plt.subplots(figsize=(5, 5))
 
     # Aggregate results across examples
-    k_values = overlap_results[0]['k']
+    pct_values = np.array(overlap_results[0]['pct']) * 100  # Convert to percentage
     qi_overlaps = np.mean([r['qi_overlap'] for r in overlap_results], axis=0)
     h2o_overlaps = np.mean([r['h2o_overlap'] for r in overlap_results], axis=0)
     random_overlaps = np.mean([r['random_overlap'] for r in overlap_results], axis=0)
@@ -319,14 +321,14 @@ def create_ablation_figure(overlap_results: List[Dict], output_dir: str):
     random_std = np.std([r['random_overlap'] for r in overlap_results], axis=0)
 
     # Plot
-    ax.errorbar(k_values, qi_overlaps, yerr=qi_std, marker='o', markersize=8,
+    ax.errorbar(pct_values, qi_overlaps, yerr=qi_std, marker='o', markersize=8,
                 linewidth=2.5, capsize=4, color=GREEN, label='QI (Ours)')
-    ax.errorbar(k_values, h2o_overlaps, yerr=h2o_std, marker='s', markersize=8,
+    ax.errorbar(pct_values, h2o_overlaps, yerr=h2o_std, marker='s', markersize=8,
                 linewidth=2.5, capsize=4, color=ORANGE, label='H2O')
-    ax.errorbar(k_values, random_overlaps, yerr=random_std, marker='^', markersize=8,
+    ax.errorbar(pct_values, random_overlaps, yerr=random_std, marker='^', markersize=8,
                 linewidth=2.5, capsize=4, color=GRAY, label='Random')
 
-    ax.set_xlabel('Number of Tokens Selected (k)', fontsize=12)
+    ax.set_xlabel('Top-k% of Tokens Selected', fontsize=12)
     ax.set_ylabel('Overlap with Late-Layer Important Tokens', fontsize=12)
     ax.legend(loc='lower right', framealpha=0.95)
     ax.set_ylim(0, 1.0)
