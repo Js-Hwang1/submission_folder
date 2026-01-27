@@ -2266,18 +2266,21 @@ class CircuitKVCluster():
         hi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
 
         # =====================================================================
-        # OPTIMIZATION: Closed-form Neumann series for replicated-row structure
+        # v7.4.0: TRUE 2-HOP MULTI-HOP ATTENTION
         # =====================================================================
-        # Key insight: Since we replicate query's attention for all rows, then
-        # apply causal mask, row i has: P[i,j] = attn[j] / cumsum[i] for j < i
+        # Key insight: We have actual attention patterns for positions in the
+        # window, not just the query's pattern. Use these for true multi-hop!
         #
-        # This special structure allows O(seq) computation instead of O(seq²):
-        # 1. Compute cumulative attention sums (for normalization factors)
-        # 2. QI score[j] ≈ attn[j] * (multi-hop amplification factor)
-        # 3. HI score[j] ≈ attn[j] * (uniform-start amplification)
+        # True 2-hop from query to position k:
+        #   1-hop: query → k with weight query_attn[k]
+        #   2-hop: query → j → k where:
+        #          - query → j uses query's attention
+        #          - j → k uses j's ACTUAL attention pattern (from window)
         #
-        # The Neumann series on this structure converges to a weighted version
-        # of the original attention, where weights depend on position.
+        # This captures "tokens reachable through query's preferred intermediates"
+        # Unlike approximations that replicate query's pattern for all hops.
+        #
+        # Complexity: O(chunk × window × seq) = O(seq) since window is constant
         # =====================================================================
 
         # Process heads in chunks for memory efficiency
@@ -2285,52 +2288,63 @@ class CircuitKVCluster():
             chunk_end = min(chunk_start + head_chunk_size, num_heads)
             chunk_size = chunk_end - chunk_start
 
-            # Get attention for this chunk of heads (query's attention pattern)
-            attn_chunk = attn[chunk_start:chunk_end, -1, :]  # [chunk, seq_len]
+            # Get full window attention for this chunk
+            # attn shape: [num_heads, window_size, seq_len]
+            # Row i = attention from position (seq_len - window_size + i)
+            window_attn_chunk = attn[chunk_start:chunk_end, :, :]  # [chunk, window, seq_len]
 
-            # Extract transient attention (exclude sink)
-            attn_transient = attn_chunk[:, sink_size:]  # [chunk, n_transient]
+            # Query's attention (last row of window)
+            query_attn = window_attn_chunk[:, -1, :]  # [chunk, seq_len]
 
-            # Compute cumulative sums for causal normalization
-            # cumsum[i] = sum(attn[0:i+1]) = normalization factor for row i
-            cumsum = torch.cumsum(attn_transient, dim=-1).clamp(min=1e-8)  # [chunk, n_transient]
-
-            # Normalized attention per position: q[i,j] = attn[j] / cumsum[i] for j <= i
-            # For Neumann series with this structure:
+            # =====================================================================
+            # TRUE 2-HOP QI: Use actual attention patterns from window positions
+            # =====================================================================
+            # For 2-hop from query to position k:
+            #   1-hop: query attends to j with weight query_attn[j]
+            #   2-hop: position j attends to k with weight window_attn[j_row, k]
             #
-            # QI: Starting from query position, backward flow amplifies based on
-            #     how much attention each position receives relative to positions after it
-            # HI: Uniform start amplifies positions that are "hubs" in the attention graph
+            # This captures: "tokens reachable through query's preferred intermediates"
+            # Unlike our previous approximation which used query's pattern for ALL hops,
+            # this uses each position's ACTUAL attention pattern.
             #
-            # Closed-form approximation (preserves ranking, ~10x faster):
-            # QI[k] = attn[k] * (1 + γ * sum_{j>k}(attn[j]/cumsum[j]))  -- true 2-hop reachability
-            # HI[j] = attn[j] * (n-j) / n  (positions attended by more rows get higher scores)
+            # Complexity: O(chunk * window * seq) = O(seq) since window is constant
+            # =====================================================================
 
-            # Compute position weights for QI (true 2-hop reachability from query)
-            # 2-hop[k] = attn[k] * sum_{j>k}(attn[j]/cumsum[j])
-            # This captures: probability flows through intermediates j that query attends to
-            weighted_attn = attn_transient / cumsum  # attn[j]/cumsum[j] for each j
-            # Reverse cumsum to get sum_{j>k}(attn[j]/cumsum[j]) for each k
-            qi_weights = torch.flip(torch.cumsum(torch.flip(weighted_attn, [-1]), dim=-1), [-1])
+            # Query's attention to positions within the window
+            # These are the positions for which we have actual attention patterns
+            window_start_pos = seq_len - window_size
+            query_attn_to_window = query_attn[:, window_start_pos:seq_len]  # [chunk, window_size]
 
-            # Apply Neumann-equivalent scoring for QI
-            # gamma factor for multi-hop decay
-            effective_gamma = gamma ** (num_iterations / 2)  # Approximate multi-hop decay
-            result_qi = attn_transient * qi_weights * effective_gamma + attn_transient
+            # True 2-hop: weighted combination of window rows by query's attention
+            # two_hop[k] = sum over window positions j of (query_attn[j] * window_attn[j_row, k])
+            # Matrix form: [chunk, 1, window] @ [chunk, window, seq] = [chunk, 1, seq]
+            two_hop = torch.bmm(
+                query_attn_to_window.unsqueeze(1),  # [chunk, 1, window]
+                window_attn_chunk  # [chunk, window, seq]
+            ).squeeze(1)  # [chunk, seq_len]
+
+            # Combine 1-hop (direct) and 2-hop (indirect) for QI
+            # gamma controls the weight of multi-hop paths
+            effective_gamma = gamma ** (num_iterations / 2)
+            result_qi = query_attn + effective_gamma * two_hop  # [chunk, seq_len]
+
+            # Extract transient portion (exclude sink)
+            result_qi = result_qi[:, sink_size:]  # [chunk, n_transient]
 
             # Compute HI scores
             if true_hub_hi:
                 # v7.3.0: True hub detection - column sums of window attention
                 # Positions that many window positions attend to are true hubs
                 # No position bias - fair treatment for facts anywhere in context
-                window_attn_chunk = attn[chunk_start:chunk_end, :, sink_size:]  # [chunk, window, n_transient]
-                result_hi = window_attn_chunk.sum(dim=1)  # [chunk, n_transient] - column sums
+                result_hi = window_attn_chunk[:, :, sink_size:].sum(dim=1)  # [chunk, n_transient]
             else:
                 # Original: Position-based weighting (earlier positions favored)
+                # Use query's attention as base, weight by position
+                query_attn_transient = query_attn[:, sink_size:]  # [chunk, n_transient]
                 position_idx = torch.arange(n_transient, device=device, dtype=torch.float32)
                 hi_weights = (n_transient - position_idx) / n_transient  # [n_transient]
                 hi_weights = hi_weights.unsqueeze(0)  # [1, n_transient]
-                result_hi = attn_transient * hi_weights * effective_gamma + attn_transient
+                result_hi = query_attn_transient * hi_weights * effective_gamma + query_attn_transient
 
             # Map back to full sequence [chunk, seq_len]
             qi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
