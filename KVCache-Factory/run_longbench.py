@@ -345,6 +345,8 @@ def main(args):
                 model.model.layers[i].self_attn.config.per_head_eviction = args.per_head_eviction
                 model.model.layers[i].self_attn.config.head_chunk_size = args.head_chunk_size
                 model.model.layers[i].self_attn.config.true_hub_hi = args.true_hub_hi
+                # v7.7.0: Entropy-Adaptive QI/HI weighting
+                model.model.layers[i].self_attn.config.entropy_adaptive = args.entropy_adaptive
                 # v6.1.0: Smoothing kernel
                 model.model.layers[i].self_attn.config.smoothing_kernel = args.smoothing_kernel
                 # v6.2.0: Asymmetric Gaussian Smoothing
@@ -510,6 +512,9 @@ if __name__ == "__main__":
                         help="v7.0.0: Number of heads to process in parallel for per-head Markov importance. Lower values reduce memory usage for long sequences (default: 8)")
     parser.add_argument("--true_hub_hi", action="store_true",
                         help="v7.3.0: Use true hub detection for HI (column sums of window attention) instead of position-based weighting. Removes position bias that hurts retrieval tasks.")
+    # v7.7.0: Entropy-Adaptive Per-Head QI/HI Weighting
+    parser.add_argument("--entropy_adaptive", action=argparse.BooleanOptionalAction, default=True,
+                        help="v7.7.0: Adapt QI vs HI weight per head based on attention entropy. Sharp heads (low entropy) trust QI more, diffuse heads trust HI more. Addresses trade-off between retrieval (QI) and structure (HI).")
     # v6.1.0: Smoothing kernel
     parser.add_argument("--smoothing_kernel", type=int, default=0, help="Smoothing kernel size (0=disabled, 5=recommended). Preserves phrase structure by promoting neighbors of important tokens.")
     # v6.2.0: Asymmetric Gaussian Smoothing

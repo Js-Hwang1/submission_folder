@@ -1301,6 +1301,7 @@ class CircuitKVCluster():
         per_head_eviction: bool = False,  # If True, each head computes its own QI/HI
         head_chunk_size: int = 8,  # Number of heads to process in parallel (memory vs speed)
         true_hub_hi: bool = False,  # v7.3.0: Use column sums for HI (true hub detection, no position bias)
+        entropy_adaptive: bool = True,  # v7.7.0: Adapt QI vs HI weight per head based on attention entropy
         # v6.1.0: Smoothing Kernel for phrase preservation
         smoothing_kernel: int = 0,  # Kernel size for score smoothing (0=disabled, 5=recommended)
         # v6.2.0: Asymmetric Gaussian Smoothing
@@ -1364,6 +1365,8 @@ class CircuitKVCluster():
         self.per_head_eviction = per_head_eviction
         self.head_chunk_size = head_chunk_size
         self.true_hub_hi = true_hub_hi
+        # v7.7.0: Entropy-Adaptive QI/HI weighting
+        self.entropy_adaptive = entropy_adaptive
         # v6.1.0: Smoothing Kernel
         self.smoothing_kernel = smoothing_kernel
         # v6.2.0: Asymmetric Gaussian Smoothing
@@ -3366,14 +3369,51 @@ class CircuitKVCluster():
                 for h in range(num_heads):
                     per_head_scores[h] = self._rank_normalize(h2o_per_head[h])
             else:
-                # Default: Per-head QI + Global HI (hybrid approach)
-                # Global HI: average across heads for consensus hub detection
-                global_hi = hi_per_head.mean(dim=0)  # [non_window_len]
-                global_hi_rank = self._rank_normalize(global_hi)
-                # Broadcast global HI to all heads
-                global_hi_broadcast = global_hi_rank.unsqueeze(0).expand(num_heads, -1)
-                # Each head: max of its QI and the global HI
-                per_head_scores = torch.maximum(qi_rank_per_head, global_hi_broadcast)
+                # v7.7.0: Entropy-Adaptive Per-Head QI/HI Weighting
+                # Novel approach: adapt QI vs HI weight based on head's attention entropy
+                # Sharp heads (low entropy) trust their QI more - they know what's important
+                # Diffuse heads (high entropy) trust HI more - fall back to structural importance
+                #
+                # This is principled: entropy measures head's "confidence" in its attention
+                # Sharp attention = precise retrieval → use QI
+                # Diffuse attention = uncertain → use global structure (HI)
+
+                if getattr(self, 'entropy_adaptive', True):
+                    # Compute attention entropy per head from original attention
+                    # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
+                    attn_mean = attn_weights_per_head.mean(dim=0)  # [num_heads, window, seq]
+                    # Use last window's attention to query position
+                    query_attn_for_entropy = attn_mean[:, -1, :]  # [num_heads, seq_len]
+                    # Compute entropy: H = -sum(p * log(p))
+                    eps = 1e-10
+                    entropy_per_head = -(query_attn_for_entropy * (query_attn_for_entropy + eps).log()).sum(dim=-1)  # [num_heads]
+
+                    # Normalize entropy to [0, 1] range
+                    # Low entropy → high QI weight (sharp heads trust their QI)
+                    # High entropy → high HI weight (diffuse heads use structure)
+                    entropy_min = entropy_per_head.min()
+                    entropy_max = entropy_per_head.max()
+                    if entropy_max > entropy_min:
+                        qi_weight = 1.0 - (entropy_per_head - entropy_min) / (entropy_max - entropy_min)
+                    else:
+                        qi_weight = torch.ones_like(entropy_per_head) * 0.5
+
+                    # qi_weight: [num_heads], range [0, 1]
+                    # high qi_weight = trust QI (sharp head)
+                    # low qi_weight = trust HI (diffuse head)
+                    qi_weight = qi_weight.unsqueeze(-1)  # [num_heads, 1]
+
+                    # Weighted combination: qi_weight * QI + (1 - qi_weight) * HI
+                    per_head_scores = qi_weight * qi_rank_per_head + (1 - qi_weight) * hi_rank_per_head
+                else:
+                    # Fallback: Per-head QI + Global HI (hybrid approach)
+                    # Global HI: average across heads for consensus hub detection
+                    global_hi = hi_per_head.mean(dim=0)  # [non_window_len]
+                    global_hi_rank = self._rank_normalize(global_hi)
+                    # Broadcast global HI to all heads
+                    global_hi_broadcast = global_hi_rank.unsqueeze(0).expand(num_heads, -1)
+                    # Each head: max of its QI and the global HI
+                    per_head_scores = torch.maximum(qi_rank_per_head, global_hi_broadcast)
 
             # Per-head top-k selection
             # Budget for non-window tokens
@@ -3925,6 +3965,8 @@ def init_circuitkv(self):
         per_head_eviction=self.config.per_head_eviction,
         head_chunk_size=self.config.head_chunk_size,
         true_hub_hi=getattr(self.config, 'true_hub_hi', False),
+        # v7.7.0: Entropy-Adaptive QI/HI weighting
+        entropy_adaptive=getattr(self.config, 'entropy_adaptive', True),
         # v5.0.0: Union Selection
         qi_ratio=self.config.qi_ratio,
         # v6.1.0: Smoothing Kernel
