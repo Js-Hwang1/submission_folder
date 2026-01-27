@@ -2260,6 +2260,9 @@ class CircuitKVCluster():
         qi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
         hi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
 
+        # Pre-compute causal mask once (optimization: avoid recreating in loop)
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+
         # Process heads in chunks for memory efficiency
         for chunk_start in range(0, num_heads, head_chunk_size):
             chunk_end = min(chunk_start + head_chunk_size, num_heads)
@@ -2275,10 +2278,10 @@ class CircuitKVCluster():
             # P[i, j] = probability of transitioning from i to j
             # For causal attention, we approximate P using the query's attention pattern
             # replicated for all positions (simplification that works empirically)
-            P_chunk = attn_chunk.unsqueeze(1).expand(-1, seq_len, -1).clone()  # [chunk, seq, seq]
+            # Optimization: use expand + contiguous instead of expand + clone
+            P_chunk = attn_chunk.unsqueeze(1).expand(-1, seq_len, -1).contiguous()  # [chunk, seq, seq]
 
             # Make it properly causal: zero out future positions
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
             P_chunk.masked_fill_(causal_mask.unsqueeze(0), 0)
 
             # Re-normalize rows to sum to 1
@@ -2287,6 +2290,9 @@ class CircuitKVCluster():
 
             # Extract Q (transient-to-transient transitions)
             Q_chunk = P_chunk[:, sink_size:, sink_size:].contiguous()  # [chunk, n_transient, n_transient]
+
+            # Pre-transpose Q for Neumann iteration (optimization: avoid repeated transpose)
+            Q_chunk_T = Q_chunk.transpose(-1, -2).contiguous()
 
             # Initialize QI vectors: one-hot at query position
             v_qi = torch.zeros(chunk_size, n_transient, device=device, dtype=torch.float32)
@@ -2301,8 +2307,8 @@ class CircuitKVCluster():
             # v = Q^T @ v iteratively computes (Q^T)^k @ v₀
             for _ in range(num_iterations):
                 # Batched matrix-vector multiply: [chunk, n, n] @ [chunk, n, 1] -> [chunk, n, 1]
-                v_qi = gamma * torch.bmm(Q_chunk.transpose(-1, -2), v_qi.unsqueeze(-1)).squeeze(-1)
-                v_hi = gamma * torch.bmm(Q_chunk.transpose(-1, -2), v_hi.unsqueeze(-1)).squeeze(-1)
+                v_qi = gamma * torch.bmm(Q_chunk_T, v_qi.unsqueeze(-1)).squeeze(-1)
+                v_hi = gamma * torch.bmm(Q_chunk_T, v_hi.unsqueeze(-1)).squeeze(-1)
                 result_qi = result_qi + v_qi
                 result_hi = result_hi + v_hi
 
