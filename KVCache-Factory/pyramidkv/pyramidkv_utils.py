@@ -3334,14 +3334,18 @@ class CircuitKVCluster():
                 qi_rank_per_head[h] = self._rank_normalize(qi_per_head[h])
                 hi_rank_per_head[h] = self._rank_normalize(hi_per_head[h])
 
-            # v7.0.0: Per-head MAX(QI, HI) - same DIS logic but per head
-            # Each head keeps tokens important to EITHER its QI or HI
+            # v7.5.0: Hybrid - Per-head QI + Global HI
+            # QI is head-specific (each head has different query relevance)
+            # HI is global (hubs are important to ALL heads - safety net)
+            # This preserves head specialization while keeping globally important tokens
             if self.ablate_hi and not self.ablate_qi:
                 # QI-ONLY mode
                 per_head_scores = qi_rank_per_head
             elif not self.ablate_hi and self.ablate_qi:
-                # HI-ONLY mode
-                per_head_scores = hi_rank_per_head
+                # HI-ONLY mode (global)
+                global_hi = hi_per_head.mean(dim=0)  # [non_window_len]
+                global_hi_rank = self._rank_normalize(global_hi)
+                per_head_scores = global_hi_rank.unsqueeze(0).expand(num_heads, -1)
             elif self.ablate_hi and self.ablate_qi:
                 # Both ablated: fallback to H2O per-head (SnapKV-style)
                 h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)
@@ -3350,8 +3354,14 @@ class CircuitKVCluster():
                 for h in range(num_heads):
                     per_head_scores[h] = self._rank_normalize(h2o_per_head[h])
             else:
-                # Default: MAX(QI, HI) per head - the principled approach
-                per_head_scores = torch.maximum(qi_rank_per_head, hi_rank_per_head)
+                # Default: Per-head QI + Global HI (hybrid approach)
+                # Global HI: average across heads for consensus hub detection
+                global_hi = hi_per_head.mean(dim=0)  # [non_window_len]
+                global_hi_rank = self._rank_normalize(global_hi)
+                # Broadcast global HI to all heads
+                global_hi_broadcast = global_hi_rank.unsqueeze(0).expand(num_heads, -1)
+                # Each head: max of its QI and the global HI
+                per_head_scores = torch.maximum(qi_rank_per_head, global_hi_broadcast)
 
             # Per-head top-k selection
             # Budget for non-window tokens
