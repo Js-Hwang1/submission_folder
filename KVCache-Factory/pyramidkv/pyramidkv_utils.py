@@ -2298,14 +2298,15 @@ class CircuitKVCluster():
             # HI: Uniform start amplifies positions that are "hubs" in the attention graph
             #
             # Closed-form approximation (preserves ranking, ~10x faster):
-            # QI[j] = attn[j] * sum_{i>j}(1/cumsum[i]) ≈ attn[j] * log(n/j)
+            # QI[k] = attn[k] * (1 + γ * sum_{j>k}(attn[j]/cumsum[j]))  -- true 2-hop reachability
             # HI[j] = attn[j] * (n-j) / n  (positions attended by more rows get higher scores)
 
-            # Compute position weights for QI (backward reachability from query)
-            # Weight[j] = sum over rows i > j of (1 / cumsum[i])
-            inv_cumsum = 1.0 / cumsum  # [chunk, n_transient]
-            # Reverse cumsum to get sum of 1/cumsum[i] for i >= j
-            qi_weights = torch.flip(torch.cumsum(torch.flip(inv_cumsum, [-1]), dim=-1), [-1])
+            # Compute position weights for QI (true 2-hop reachability from query)
+            # 2-hop[k] = attn[k] * sum_{j>k}(attn[j]/cumsum[j])
+            # This captures: probability flows through intermediates j that query attends to
+            weighted_attn = attn_transient / cumsum  # attn[j]/cumsum[j] for each j
+            # Reverse cumsum to get sum_{j>k}(attn[j]/cumsum[j]) for each k
+            qi_weights = torch.flip(torch.cumsum(torch.flip(weighted_attn, [-1]), dim=-1), [-1])
 
             # Compute position weights for HI (reachability from uniform start)
             # Positions earlier in sequence are reachable from more starting positions
