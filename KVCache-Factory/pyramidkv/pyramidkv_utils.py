@@ -30,66 +30,41 @@ except ImportError:
     BREAKTHROUGHS_AVAILABLE = False
 
 # =============================================================================
-# Module-level debug logging for CircuitKV - JSONL Diagnostic System
+# Module-level debug logging for CircuitKV (singleton pattern)
 # =============================================================================
-import json
-
 _CIRCUITKV_DEBUG_LOG = None
 _CIRCUITKV_DEBUG_INITIALIZED = False
 _CIRCUITKV_SAMPLE_COUNTER = 0
-_CIRCUITKV_LAYER_COUNTER = 0
-_CIRCUITKV_CURRENT_DATASET = None
-_CIRCUITKV_CURRENT_SEQ_LEN = 0
-_CIRCUITKV_CURRENT_BUDGET = 0
-
-# Comprehensive per-layer diagnostic data for current sample
-_CIRCUITKV_SAMPLE_DATA = {
-    "sample_id": 0,
-    "dataset": None,
-    "seq_len": 0,
-    "budget": 0,
-    "layers": []
-}
+_CIRCUITKV_LAYER_COUNTER = 0  # Track which layer we're on within a sample
+_CIRCUITKV_CURRENT_DATASET = None  # Track current dataset for diagnostics
 
 def _set_circuitkv_dataset(dataset_name: str):
     """Set the current dataset name for debug logging."""
     global _CIRCUITKV_CURRENT_DATASET
     _CIRCUITKV_CURRENT_DATASET = dataset_name
 
-def _set_circuitkv_sample_info(seq_len: int, budget: int):
-    """Set current sample info for diagnostics."""
-    global _CIRCUITKV_CURRENT_SEQ_LEN, _CIRCUITKV_CURRENT_BUDGET
-    _CIRCUITKV_CURRENT_SEQ_LEN = seq_len
-    _CIRCUITKV_CURRENT_BUDGET = budget
-
 def _get_circuitkv_debug_log():
-    """Get or create the JSONL debug log file."""
+    """Get or create the shared debug log file."""
     global _CIRCUITKV_DEBUG_LOG, _CIRCUITKV_DEBUG_INITIALIZED
     if not _CIRCUITKV_DEBUG_INITIALIZED:
-        log_path = os.path.join(os.getcwd(), "circuitkv_diagnostic.jsonl")
+        log_path = os.path.join(os.getcwd(), "longbench_CKV_dbg.log")
         _CIRCUITKV_DEBUG_LOG = open(log_path, "w")
+        _CIRCUITKV_DEBUG_LOG.write("[LOG_HEADER]\n")
+        _CIRCUITKV_DEBUG_LOG.write("version=4.5.0\n")
+        _CIRCUITKV_DEBUG_LOG.write("format=structured\n")
+        _CIRCUITKV_DEBUG_LOG.write("algorithm=MAX(rank(QI*DA), rank(HI*DA))\n")
+        _CIRCUITKV_DEBUG_LOG.write("QI=Query Importance from Neumann N[query_row]\n")
+        _CIRCUITKV_DEBUG_LOG.write("HI=Hub Importance = column_sums(N)\n")
+        _CIRCUITKV_DEBUG_LOG.write("DA=Direct Attention = column_sums(window_attention)\n")
+        _CIRCUITKV_DEBUG_LOG.write("N=Fundamental Matrix (I-Q)^(-1)\n\n")
         _CIRCUITKV_DEBUG_INITIALIZED = True
     return _CIRCUITKV_DEBUG_LOG
 
 def _circuitkv_debug_next_sample():
-    """Dump current sample data and prepare for next sample."""
-    global _CIRCUITKV_SAMPLE_COUNTER, _CIRCUITKV_LAYER_COUNTER, _CIRCUITKV_SAMPLE_DATA
-
-    # Dump previous sample's data
-    if _CIRCUITKV_SAMPLE_DATA["layers"]:
-        _dump_sample_diagnostic()
-
+    """Increment sample counter and reset layer counter."""
+    global _CIRCUITKV_SAMPLE_COUNTER, _CIRCUITKV_LAYER_COUNTER
     _CIRCUITKV_SAMPLE_COUNTER += 1
     _CIRCUITKV_LAYER_COUNTER = 0
-
-    # Reset sample data
-    _CIRCUITKV_SAMPLE_DATA = {
-        "sample_id": _CIRCUITKV_SAMPLE_COUNTER,
-        "dataset": _CIRCUITKV_CURRENT_DATASET,
-        "seq_len": _CIRCUITKV_CURRENT_SEQ_LEN,
-        "budget": _CIRCUITKV_CURRENT_BUDGET,
-        "layers": []
-    }
     return _CIRCUITKV_SAMPLE_COUNTER
 
 def _circuitkv_debug_next_layer():
@@ -97,216 +72,6 @@ def _circuitkv_debug_next_layer():
     global _CIRCUITKV_LAYER_COUNTER
     _CIRCUITKV_LAYER_COUNTER += 1
     return _CIRCUITKV_LAYER_COUNTER
-
-def _record_layer_diagnostic(
-    layer_idx: int,
-    seq_len: int,
-    budget: int,
-    sink_size: int,
-    window_size: int,
-    # CircuitKV data
-    qi_raw_max: float,
-    hi_raw_max: float,
-    qi_scores: torch.Tensor,
-    hi_scores: torch.Tensor,
-    combined_scores: torch.Tensor,
-    circuitkv_kept_positions: list,
-    # SnapKV baseline data
-    snapkv_scores: torch.Tensor,
-    snapkv_kept_positions: list,
-    # Attention data for analysis
-    attn_column_sums: torch.Tensor = None,
-):
-    """Record comprehensive per-layer diagnostic data."""
-    global _CIRCUITKV_SAMPLE_DATA
-
-    # Compute overlap metrics
-    ckv_set = set(circuitkv_kept_positions)
-    skv_set = set(snapkv_kept_positions)
-
-    overlap = ckv_set & skv_set
-    ckv_only = ckv_set - skv_set  # CircuitKV keeps but SnapKV doesn't
-    skv_only = skv_set - ckv_set  # SnapKV keeps but CircuitKV doesn't (CRITICAL)
-
-    overlap_ratio = len(overlap) / len(ckv_set) if ckv_set else 0.0
-
-    # Get top positions by each score type (excluding sink and window)
-    middle_start = sink_size
-    middle_end = seq_len - window_size
-
-    def get_top_k_middle(scores, k=50):
-        """Get top-k positions from middle region."""
-        if scores is None or len(scores) == 0:
-            return []
-        middle_scores = scores[middle_start:middle_end].clone()
-        if len(middle_scores) == 0:
-            return []
-        k = min(k, len(middle_scores))
-        _, top_idx = middle_scores.topk(k)
-        return (top_idx + middle_start).cpu().tolist()
-
-    # Score statistics for middle region
-    def get_score_stats(scores):
-        if scores is None or len(scores) == 0:
-            return {"max": 0, "min": 0, "mean": 0, "std": 0}
-        middle = scores[middle_start:middle_end]
-        if len(middle) == 0:
-            return {"max": 0, "min": 0, "mean": 0, "std": 0}
-        return {
-            "max": middle.max().item(),
-            "min": middle.min().item(),
-            "mean": middle.mean().item(),
-            "std": middle.std().item() if len(middle) > 1 else 0
-        }
-
-    layer_data = {
-        "layer_idx": layer_idx,
-        "seq_len": seq_len,
-        "budget": budget,
-        "sink_size": sink_size,
-        "window_size": window_size,
-        "middle_region": [middle_start, middle_end],
-
-        # CircuitKV scores
-        "circuitkv": {
-            "qi_raw_max": qi_raw_max,
-            "hi_raw_max": hi_raw_max,
-            "qi_stats": get_score_stats(qi_scores),
-            "hi_stats": get_score_stats(hi_scores),
-            "combined_stats": get_score_stats(combined_scores),
-            "qi_top50": get_top_k_middle(qi_scores, 50),
-            "hi_top50": get_top_k_middle(hi_scores, 50),
-            "kept_count": len(circuitkv_kept_positions),
-            "kept_middle_count": len([p for p in circuitkv_kept_positions if middle_start <= p < middle_end]),
-        },
-
-        # SnapKV baseline
-        "snapkv": {
-            "score_stats": get_score_stats(snapkv_scores),
-            "top50": get_top_k_middle(snapkv_scores, 50),
-            "kept_count": len(snapkv_kept_positions),
-            "kept_middle_count": len([p for p in snapkv_kept_positions if middle_start <= p < middle_end]),
-        },
-
-        # Comparison metrics
-        "comparison": {
-            "overlap_ratio": overlap_ratio,
-            "overlap_count": len(overlap),
-            "circuitkv_only_count": len(ckv_only),
-            "snapkv_only_count": len(skv_only),
-            # CRITICAL: positions SnapKV keeps but CircuitKV evicts (potential errors)
-            "evicted_by_circuitkv": sorted(list(skv_only))[:100],  # Limit to 100
-            # Positions CircuitKV keeps but SnapKV doesn't (our additions)
-            "added_by_circuitkv": sorted(list(ckv_only))[:100],
-        },
-
-        # H2O baseline (column sums)
-        "h2o": {
-            "stats": get_score_stats(attn_column_sums) if attn_column_sums is not None else None,
-            "top50": get_top_k_middle(attn_column_sums, 50) if attn_column_sums is not None else [],
-        }
-    }
-
-    _CIRCUITKV_SAMPLE_DATA["layers"].append(layer_data)
-
-def _dump_sample_diagnostic():
-    """Dump current sample's diagnostic data as a single JSONL line."""
-    global _CIRCUITKV_SAMPLE_DATA
-
-    if not _CIRCUITKV_SAMPLE_DATA["layers"]:
-        return
-
-    log = _get_circuitkv_debug_log()
-
-    # Add summary statistics across layers
-    layers = _CIRCUITKV_SAMPLE_DATA["layers"]
-    _CIRCUITKV_SAMPLE_DATA["summary"] = {
-        "num_layers": len(layers),
-        "avg_overlap_ratio": sum(l["comparison"]["overlap_ratio"] for l in layers) / len(layers),
-        "total_snapkv_only": sum(l["comparison"]["snapkv_only_count"] for l in layers),
-        "layers_with_low_hi": sum(1 for l in layers if l["circuitkv"]["hi_raw_max"] < 0.05),
-        "avg_qi_raw_max": sum(l["circuitkv"]["qi_raw_max"] for l in layers) / len(layers),
-        "avg_hi_raw_max": sum(l["circuitkv"]["hi_raw_max"] for l in layers) / len(layers),
-    }
-
-    log.write(json.dumps(_CIRCUITKV_SAMPLE_DATA) + "\n")
-    log.flush()
-
-def _compute_snapkv_baseline(
-    attn_weights: torch.Tensor,
-    seq_len: int,
-    budget: int,
-    sink_size: int,
-    window_size: int,
-    kernel_size: int = 7,
-) -> tuple:
-    """
-    Compute what SnapKV would select for comparison.
-
-    SnapKV algorithm:
-    1. Sum attention from last window_size queries to all keys
-    2. Apply avgpool smoothing
-    3. Select top-k per head, then aggregate
-
-    Returns:
-        snapkv_scores: [seq_len] aggregated scores
-        snapkv_kept_positions: list of positions SnapKV would keep
-    """
-    # attn_weights: [bsz, num_heads, window_size, seq_len]
-    bsz, num_heads, ws, sl = attn_weights.shape
-
-    # Sum attention across window queries (what SnapKV does)
-    # [bsz, num_heads, seq_len-window]
-    attn_sum = attn_weights[:, :, :, :-window_size].sum(dim=2)
-
-    # Apply avgpool smoothing (SnapKV default)
-    # Need to reshape for F.avg_pool1d: [batch*heads, 1, seq_len-window]
-    attn_flat = attn_sum.view(bsz * num_heads, 1, -1)
-    attn_smoothed = F.avg_pool1d(
-        attn_flat,
-        kernel_size=kernel_size,
-        padding=kernel_size // 2,
-        stride=1
-    )
-    attn_smoothed = attn_smoothed.view(bsz, num_heads, -1)
-
-    # SnapKV does per-head selection, but for comparison we aggregate
-    # Take mean across heads to get shared importance
-    snapkv_scores_middle = attn_smoothed.mean(dim=(0, 1))  # [seq_len - window]
-
-    # Create full score tensor
-    snapkv_scores = torch.zeros(seq_len, device=attn_weights.device)
-    snapkv_scores[:len(snapkv_scores_middle)] = snapkv_scores_middle
-
-    # Compute what SnapKV would keep
-    # Budget allocation: sink + middle_select + window
-    middle_budget = budget - sink_size - window_size
-
-    if middle_budget > 0:
-        # SnapKV selects from non-sink, non-window region
-        middle_scores = snapkv_scores[sink_size:seq_len - window_size].clone()
-        if len(middle_scores) > 0:
-            k = min(middle_budget, len(middle_scores))
-            _, top_idx = middle_scores.topk(k)
-            middle_kept = (top_idx + sink_size).cpu().tolist()
-        else:
-            middle_kept = []
-    else:
-        middle_kept = []
-
-    # Full kept positions: sink + selected middle + window
-    kept_positions = list(range(sink_size)) + middle_kept + list(range(seq_len - window_size, seq_len))
-
-    return snapkv_scores, sorted(kept_positions)
-
-# Legacy compatibility functions
-def _record_layer_fairness(layer_idx: int, kept_count: int, raw_max_qi: float, raw_max_hi: float, raw_max_combined: float):
-    """Legacy function - now a no-op, use _record_layer_diagnostic instead."""
-    pass
-
-def _reset_layer_fairness():
-    """Legacy function - now a no-op."""
-    pass
 
 def key_pruner_query_driven(kv_states, q_states, recent_size=128, ratio=0.3):
     _, _, seqlen, head_dim = kv_states.shape
@@ -1559,16 +1324,6 @@ class CircuitKVCluster():
         # v6.10.0: Bridge Importance (BI) via A² - captures 2-hop attention paths for cross-document reasoning
         use_bridge_importance: bool = False,  # Enable A² bridge importance for multi-hop
         bi_kernel_size: int = 5,  # Smoothing kernel for BI (bridges need context)
-        # v6.12.0: HI Signal Gating - silence noisy HI in deep layers
-        hi_signal_threshold: float = 0.0,  # If max(hi_raw) < threshold, zero out hi_rank (0=disabled)
-        # v6.12.1: HI Soft Scaling - scale rank by raw max (automatic dampening)
-        hi_scale_by_max: bool = False,  # If True, hi_rank = rank_normalize(hi) * hi_raw_max
-        # v6.13.0: Bidirectional Markov Chain - symmetrize attention for proper centrality
-        use_bidirectional_markov: bool = False,  # If True, use A_sym = (A + A^T)/2 for Markov chain
-        bidirectional_gamma: float = 0.9,  # Discount factor for bidirectional Neumann series
-        # v6.14.0: Query-Distance Weighting - favor tokens near query position
-        use_query_distance_weight: bool = False,  # If True, multiply scores by exp(-dist/temp)
-        query_distance_temp: float = 1000.0,  # Temperature for distance decay (higher = slower decay)
     ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
@@ -1628,16 +1383,6 @@ class CircuitKVCluster():
         # v6.10.0: Bridge Importance
         self.use_bridge_importance = use_bridge_importance
         self.bi_kernel_size = bi_kernel_size
-        # v6.12.0: HI Signal Gating
-        self.hi_signal_threshold = hi_signal_threshold
-        # v6.12.1: HI Soft Scaling
-        self.hi_scale_by_max = hi_scale_by_max
-        # v6.13.0: Bidirectional Markov Chain
-        self.use_bidirectional_markov = use_bidirectional_markov
-        self.bidirectional_gamma = bidirectional_gamma
-        # v6.14.0: Query-Distance Weighting
-        self.use_query_distance_weight = use_query_distance_weight
-        self.query_distance_temp = query_distance_temp
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
@@ -1659,7 +1404,6 @@ class CircuitKVCluster():
         self.debug = debug
         self._debug_log = None
         self._sample_counter = 0
-        self._version_printed = False  # Only print version info once
 
         # Lazy initialization of CUDA graph
         self._graph = None
@@ -1794,6 +1538,22 @@ class CircuitKVCluster():
     def _init_debug_log(self):
         """Initialize debug log (uses module-level singleton)."""
         log = _get_circuitkv_debug_log()
+        # Only write config on first init (layer 0)
+        if _CIRCUITKV_LAYER_COUNTER == 0:
+            log.write(f"⚙️  CONFIGURATION (v2.0.0):\n")
+            log.write(f"  Algorithm: MAX(rank_h2o, rank_influence)\n")
+            log.write(f"  \n")
+            log.write(f"  KV Cache Budget:\n")
+            log.write(f"    max_capacity_prompt: {self.max_capacity_prompt}\n")
+            log.write(f"    window_size:         {self.window_size} (local tokens always kept)\n")
+            log.write(f"    sink_size:           {self.sink_size} (sink tokens always kept)\n")
+            log.write(f"  \n")
+            log.write(f"  Influence Walker:\n")
+            log.write(f"    num_walkers:         {self.num_walkers}\n")
+            log.write(f"    max_steps:           {self.max_steps}\n")
+            log.write(f"  \n")
+            log.write("\n" + "=" * 80 + "\n\n")
+            log.flush()
 
     def _log_debug(
         self,
@@ -1804,57 +1564,268 @@ class CircuitKVCluster():
         full_attn: torch.Tensor,
         qi_scores: torch.Tensor = None,
         hi_scores: torch.Tensor = None,
-        attn_weights_per_head: torch.Tensor = None,
-        layer_idx: int = 1,
-        qi_raw_max: float = 0.0,
-        hi_raw_max: float = 0.0,
     ):
-        """
-        Comprehensive debug logging with SnapKV baseline comparison.
-
-        Outputs JSONL with per-layer diagnostic data including:
-        - CircuitKV scores (QI, HI, combined) and kept positions
-        - SnapKV baseline scores and kept positions
-        - Overlap analysis to identify selection divergence
-        """
+        """Log structured debug data for AI analysis. Machine-parseable format."""
         if not self.debug:
             return
 
-        # Get CircuitKV kept positions
-        circuitkv_kept = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
+        log = _get_circuitkv_debug_log()
+        layer_num = _circuitkv_debug_next_layer()
 
-        # Compute SnapKV baseline for comparison
-        if attn_weights_per_head is not None:
-            snapkv_scores, snapkv_kept = _compute_snapkv_baseline(
-                attn_weights_per_head,
-                seq_len=q_len,
-                budget=self.max_capacity_prompt,
-                sink_size=self.sink_size,
-                window_size=self.window_size,
-                kernel_size=7,  # SnapKV default
-            )
-        else:
-            # Fallback: use H2O scores as proxy
-            snapkv_scores = h2o_scores[:q_len] if h2o_scores is not None else None
-            snapkv_kept = circuitkv_kept  # No comparison possible
+        if layer_num == 1:
+            sample_num = _circuitkv_debug_next_sample()
+            dataset = _CIRCUITKV_CURRENT_DATASET or "unknown"
+            compression_ratio = 100 * (1 - self.max_capacity_prompt / q_len)
 
-        # Record comprehensive diagnostic data
-        _record_layer_diagnostic(
-            layer_idx=layer_idx,
-            seq_len=q_len,
-            budget=self.max_capacity_prompt,
-            sink_size=self.sink_size,
-            window_size=self.window_size,
-            qi_raw_max=qi_raw_max,
-            hi_raw_max=hi_raw_max,
-            qi_scores=qi_scores,
-            hi_scores=hi_scores,
-            combined_scores=combined_scores,
-            circuitkv_kept_positions=circuitkv_kept,
-            snapkv_scores=snapkv_scores,
-            snapkv_kept_positions=snapkv_kept,
-            attn_column_sums=h2o_scores[:q_len] if h2o_scores is not None else None,
-        )
+            # =====================================================================
+            # HEADER
+            # =====================================================================
+            log.write(f"\n[SAMPLE {sample_num}]\n")
+            log.write(f"dataset={dataset}\n")
+            log.write(f"seq_len={q_len}\n")
+            log.write(f"budget={self.max_capacity_prompt}\n")
+            log.write(f"sink={self.sink_size}\n")
+            log.write(f"window={self.window_size}\n")
+            log.write(f"competitive_slots={self.max_capacity_prompt - self.sink_size - self.window_size}\n")
+            log.write(f"compression_pct={compression_ratio:.1f}\n")
+            log.write(f"neumann_k={self.neumann_iterations}\n")
+            log.write(f"temperature={self.neumann_temperature}\n")
+            log.write(f"combination_mode={self.combination_mode}\n\n")
+
+            # Get tensors
+            h2o_cpu = h2o_scores[:q_len].cpu().float()
+            combined_cpu = combined_scores[:q_len].cpu().float()
+            kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
+            evicted_positions = (~keep_mask).nonzero(as_tuple=True)[0].cpu().tolist()
+
+            # =====================================================================
+            # HI / QI SCORES (if available from DIS mode)
+            # =====================================================================
+            if qi_scores is not None and hi_scores is not None:
+                qi_cpu = qi_scores[:q_len].cpu().float()
+                hi_cpu = hi_scores[:q_len].cpu().float()
+
+                # Rank normalize
+                qi_ranks = torch.argsort(torch.argsort(qi_cpu)).float() / (q_len - 1)
+                hi_ranks = torch.argsort(torch.argsort(hi_cpu)).float() / (q_len - 1)
+                max_ranks = torch.maximum(qi_ranks, hi_ranks)
+
+                log.write(f"[QI_SCORES] (Query Importance from Neumann N[q,:])\n")
+                log.write(f"qi_mean={qi_cpu.mean().item():.6f}\n")
+                log.write(f"qi_std={qi_cpu.std().item():.6f}\n")
+                log.write(f"qi_min={qi_cpu.min().item():.6f}\n")
+                log.write(f"qi_max={qi_cpu.max().item():.6f}\n")
+                log.write(f"qi_p50={torch.quantile(qi_cpu, 0.5).item():.6f}\n")
+                log.write(f"qi_p95={torch.quantile(qi_cpu, 0.95).item():.6f}\n")
+                log.write(f"qi_zeros={int((qi_cpu == 0).sum().item())}\n")
+
+                log.write(f"\n[HI_SCORES] (Hub Importance = column sums of N)\n")
+                log.write(f"hi_mean={hi_cpu.mean().item():.6f}\n")
+                log.write(f"hi_std={hi_cpu.std().item():.6f}\n")
+                log.write(f"hi_min={hi_cpu.min().item():.6f}\n")
+                log.write(f"hi_max={hi_cpu.max().item():.6f}\n")
+                log.write(f"hi_p50={torch.quantile(hi_cpu, 0.5).item():.6f}\n")
+                log.write(f"hi_p95={torch.quantile(hi_cpu, 0.95).item():.6f}\n")
+                log.write(f"hi_zeros={int((hi_cpu == 0).sum().item())}\n")
+
+                # QI vs HI correlation
+                if qi_cpu.std() > 0 and hi_cpu.std() > 0:
+                    qi_hi_corr = torch.corrcoef(torch.stack([qi_cpu, hi_cpu]))[0, 1].item()
+                    log.write(f"qi_hi_correlation={qi_hi_corr:.4f}\n")
+
+                # Who dominates in MAX(QI, HI)?
+                qi_wins = (qi_ranks > hi_ranks).sum().item()
+                hi_wins = (hi_ranks > qi_ranks).sum().item()
+                ties = q_len - qi_wins - hi_wins
+                log.write(f"qi_dominates_n={qi_wins}\n")
+                log.write(f"hi_dominates_n={hi_wins}\n")
+                log.write(f"ties_n={ties}\n")
+
+                # Top-20 by QI
+                qi_topk_vals, qi_topk_idx = torch.topk(qi_cpu, min(20, q_len))
+                log.write(f"\n[QI_TOP20]\n")
+                for i in range(min(20, q_len)):
+                    pos = qi_topk_idx[i].item()
+                    log.write(f"rank={i+1} pos={pos} qi={qi_cpu[pos].item():.6f} hi={hi_cpu[pos].item():.6f} max_rank={max_ranks[pos].item():.4f}\n")
+
+                # Top-20 by HI
+                hi_topk_vals, hi_topk_idx = torch.topk(hi_cpu, min(20, q_len))
+                log.write(f"\n[HI_TOP20]\n")
+                for i in range(min(20, q_len)):
+                    pos = hi_topk_idx[i].item()
+                    log.write(f"rank={i+1} pos={pos} qi={qi_cpu[pos].item():.6f} hi={hi_cpu[pos].item():.6f} max_rank={max_ranks[pos].item():.4f}\n")
+
+                # Divergence analysis: tokens where QI >> HI or HI >> QI
+                log.write(f"\n[QI_HI_DIVERGENCE] (tokens where one signal >> other)\n")
+                rank_diff = qi_ranks - hi_ranks
+                high_qi_low_hi = (rank_diff > 0.3).nonzero(as_tuple=True)[0][:10]
+                high_hi_low_qi = (rank_diff < -0.3).nonzero(as_tuple=True)[0][:10]
+                log.write(f"high_qi_low_hi_positions={high_qi_low_hi.tolist()}\n")
+                log.write(f"high_hi_low_qi_positions={high_hi_low_qi.tolist()}\n")
+
+            else:
+                # Fallback: use H2O as proxy (non-DIS mode)
+                log.write(f"[H2O_SCORES] (column sums of attention A, not from N)\n")
+                log.write(f"h2o_mean={h2o_cpu.mean().item():.6f}\n")
+                log.write(f"h2o_std={h2o_cpu.std().item():.6f}\n")
+                log.write(f"h2o_min={h2o_cpu.min().item():.6f}\n")
+                log.write(f"h2o_max={h2o_cpu.max().item():.6f}\n")
+                log.write(f"h2o_p50={torch.quantile(h2o_cpu, 0.5).item():.6f}\n")
+                log.write(f"h2o_p95={torch.quantile(h2o_cpu, 0.95).item():.6f}\n")
+
+            # =====================================================================
+            # COMBINED/MAX SCORES
+            # =====================================================================
+            log.write(f"\n[COMBINED_SCORES] (final selection criterion)\n")
+            log.write(f"combined_mean={combined_cpu.mean().item():.6f}\n")
+            log.write(f"combined_std={combined_cpu.std().item():.6f}\n")
+            log.write(f"combined_min={combined_cpu.min().item():.6f}\n")
+            log.write(f"combined_max={combined_cpu.max().item():.6f}\n")
+            log.write(f"combined_p50={torch.quantile(combined_cpu, 0.5).item():.6f}\n")
+            log.write(f"combined_p95={torch.quantile(combined_cpu, 0.95).item():.6f}\n")
+
+            # Top-20 by combined
+            comb_topk_vals, comb_topk_idx = torch.topk(combined_cpu, min(20, q_len))
+            log.write(f"\n[COMBINED_TOP20]\n")
+            for i in range(min(20, q_len)):
+                pos = comb_topk_idx[i].item()
+                log.write(f"rank={i+1} pos={pos} combined={combined_cpu[pos].item():.6f}\n")
+
+            # =====================================================================
+            # POSITION COVERAGE
+            # =====================================================================
+            log.write(f"\n[POSITION_COVERAGE]\n")
+            log.write(f"kept_count={len(kept_positions)}\n")
+            log.write(f"evicted_count={len(evicted_positions)}\n")
+
+            n_segments = 10
+            segment_size = q_len // n_segments
+            segment_coverage = []
+            for seg in range(n_segments):
+                seg_start = seg * segment_size
+                seg_end = (seg + 1) * segment_size if seg < n_segments - 1 else q_len
+                kept_in_seg = sum(1 for p in kept_positions if seg_start <= p < seg_end)
+                total_in_seg = seg_end - seg_start
+                coverage_pct = 100 * kept_in_seg / total_in_seg if total_in_seg > 0 else 0
+                segment_coverage.append(coverage_pct)
+                log.write(f"seg{seg}_range=[{seg_start},{seg_end}] kept={kept_in_seg} coverage_pct={coverage_pct:.1f}\n")
+
+            middle_coverage = sum(segment_coverage[2:8]) / 6
+            log.write(f"middle_coverage_avg={middle_coverage:.1f}\n")
+
+            # =====================================================================
+            # ATTENTION ANALYSIS
+            # =====================================================================
+            log.write(f"\n[ATTENTION_ANALYSIS]\n")
+            attn_row = full_attn[-1, :q_len].cpu()
+            attn_row_norm = attn_row / (attn_row.sum() + 1e-8)
+            entropy = -(attn_row_norm * torch.log(attn_row_norm + 1e-10)).sum().item()
+            max_entropy = math.log(q_len)
+            log.write(f"query_attn_entropy={entropy:.4f}\n")
+            log.write(f"max_entropy={max_entropy:.4f}\n")
+            log.write(f"entropy_ratio={entropy/max_entropy:.4f}\n")
+
+            attn_topk_vals, attn_topk_idx = torch.topk(attn_row, min(20, q_len))
+            log.write(f"query_top20_attn_positions={attn_topk_idx.tolist()}\n")
+
+            attn_top_kept = sum(1 for p in attn_topk_idx[:10].tolist() if p in kept_positions)
+            log.write(f"top10_attn_kept={attn_top_kept}\n")
+
+            total_attn_mass = attn_row.sum().item()
+            kept_attn_mass = sum(attn_row[p].item() for p in kept_positions if p < q_len)
+            log.write(f"total_attn_mass={total_attn_mass:.6f}\n")
+            log.write(f"kept_attn_mass={kept_attn_mass:.6f}\n")
+            log.write(f"kept_attn_pct={100*kept_attn_mass/max(total_attn_mass,1e-8):.1f}\n")
+
+            # =====================================================================
+            # SNAPKV COMPARISON
+            # =====================================================================
+            log.write(f"\n[SNAPKV_COMPARISON]\n")
+            snapkv_budget = self.max_capacity_prompt - self.window_size - self.sink_size
+            middle_start = self.sink_size
+            middle_end = q_len - self.window_size
+
+            if snapkv_budget > 0 and middle_end > middle_start:
+                snapkv_scores = h2o_cpu.clone()
+                if len(snapkv_scores) > 5:
+                    snapkv_scores_smooth = F.avg_pool1d(
+                        snapkv_scores.unsqueeze(0).unsqueeze(0),
+                        kernel_size=5, padding=2, stride=1
+                    ).squeeze()
+                else:
+                    snapkv_scores_smooth = snapkv_scores
+
+                snapkv_middle = snapkv_scores_smooth[middle_start:middle_end]
+                _, snapkv_topk_idx = torch.topk(snapkv_middle, min(snapkv_budget, len(snapkv_middle)))
+                snapkv_selected = set((snapkv_topk_idx + middle_start).tolist())
+                circuitkv_middle = set(p for p in kept_positions if middle_start <= p < middle_end)
+
+                overlap = circuitkv_middle & snapkv_selected
+                only_ckv = circuitkv_middle - snapkv_selected
+                only_snap = snapkv_selected - circuitkv_middle
+
+                log.write(f"snapkv_would_select={len(snapkv_selected)}\n")
+                log.write(f"circuitkv_selected={len(circuitkv_middle)}\n")
+                log.write(f"overlap={len(overlap)}\n")
+                log.write(f"only_circuitkv={len(only_ckv)}\n")
+                log.write(f"only_snapkv={len(only_snap)}\n")
+                log.write(f"overlap_pct={100*len(overlap)/max(len(snapkv_selected),1):.1f}\n")
+
+                if len(only_ckv) > 0:
+                    log.write(f"circuitkv_only_positions={sorted(only_ckv)[:20]}\n")
+                if len(only_snap) > 0:
+                    log.write(f"snapkv_only_positions={sorted(only_snap)[:20]}\n")
+
+            # =====================================================================
+            # EVICTION DETAILS
+            # =====================================================================
+            log.write(f"\n[TOP_EVICTIONS] (highest-scored tokens that were evicted)\n")
+            evicted_with_scores = [(pos, combined_cpu[pos].item()) for pos in evicted_positions if pos < q_len]
+            evicted_with_scores.sort(key=lambda x: x[1], reverse=True)
+            for pos, score in evicted_with_scores[:20]:
+                region = "early" if pos < q_len//4 else "mid" if pos < 3*q_len//4 else "late"
+                log.write(f"pos={pos} combined={score:.6f} region={region}\n")
+
+            # =====================================================================
+            # SCORE DISCRIMINATION
+            # =====================================================================
+            log.write(f"\n[SCORE_DISCRIMINATION]\n")
+            kept_scores = torch.tensor([combined_cpu[p].item() for p in kept_positions if p < q_len])
+            evicted_scores = torch.tensor([combined_cpu[p].item() for p in evicted_positions if p < q_len])
+
+            if len(kept_scores) > 0 and len(evicted_scores) > 0:
+                log.write(f"kept_mean={kept_scores.mean().item():.6f}\n")
+                log.write(f"evicted_mean={evicted_scores.mean().item():.6f}\n")
+                log.write(f"score_gap={kept_scores.mean().item() - evicted_scores.mean().item():.6f}\n")
+                log.write(f"kept_min={kept_scores.min().item():.6f}\n")
+                log.write(f"evicted_max={evicted_scores.max().item():.6f}\n")
+
+                if evicted_scores.max() > kept_scores.min():
+                    n_bad_evict = (evicted_scores > kept_scores.min()).sum().item()
+                    log.write(f"score_overlap_count={n_bad_evict}\n")
+                else:
+                    log.write(f"score_overlap_count=0\n")
+
+            # =====================================================================
+            # ISSUE FLAGS
+            # =====================================================================
+            log.write(f"\n[ISSUE_FLAGS]\n")
+            issues = []
+            if middle_coverage < 10:
+                issues.append("LOW_MIDDLE_COVERAGE")
+            if attn_top_kept < 7:
+                issues.append("MISSING_HIGH_ATTN_TOKENS")
+            if kept_attn_mass / max(total_attn_mass, 1e-8) < 0.7:
+                issues.append("LOW_ATTN_MASS_CAPTURED")
+            if qi_scores is not None and hi_scores is not None:
+                if qi_wins > 0.8 * q_len:
+                    issues.append("QI_OVER_DOMINATES")
+                if hi_wins > 0.8 * q_len:
+                    issues.append("HI_OVER_DOMINATES")
+            log.write(f"issues={issues}\n")
+
+            log.write(f"\n{'='*60}\n\n")
+            log.flush()
 
     def _lazy_init(self, device, seq_len: int):
         """Initialize CUDA graph on first use (only needed for random walk mode)."""
@@ -2213,10 +2184,6 @@ class CircuitKVCluster():
         hi_scores[sink_size:] = result_hi
         hi_scores[:sink_size] = result_hi.sum() * 0.01  # Small score for sink
 
-        # Capture raw max values BEFORE normalization (for Layer Fairness debug)
-        qi_raw_max = qi_scores.max().item()
-        hi_raw_max = hi_scores.max().item()
-
         # Normalize each to [0, 1]
         qi_max = qi_scores.max()
         if qi_max > 0:
@@ -2226,176 +2193,7 @@ class CircuitKVCluster():
         if hi_max > 0:
             hi_scores = hi_scores / hi_max
 
-        return qi_scores, hi_scores, qi_raw_max, hi_raw_max
-
-    def _compute_bidirectional_importance_scores(
-        self,
-        attention: torch.Tensor,
-        query_idx: int,
-        sink_size: int = 4,
-        num_iterations: int = 10,
-        temperature: float = 1.0,
-        gamma: float = 0.9,
-    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
-        """
-        v6.13.0: Bidirectional Markov Chain for Importance Scoring.
-
-        Key Insight:
-        ------------
-        Standard causal attention creates a LOWER-TRIANGULAR transition matrix,
-        causing the Neumann series to systematically bias toward early positions.
-        This is because probability mass can only flow backward, and early tokens
-        accumulate visits from the ENTIRE sequence.
-
-        Solution:
-        ---------
-        Symmetrize the attention matrix to model BIDIRECTIONAL information flow:
-        - Forward: attention[i,j] = "position i attends to j" (what I need)
-        - Backward: attention[j,i] = "position j attends to i" (who needs me)
-        - Symmetric: (forward + backward) / 2 = bidirectional importance
-
-        This restores proper Markov chain dynamics where both early AND late
-        tokens can have high centrality based on their semantic role, not just
-        their position.
-
-        Mathematical Foundation:
-        ------------------------
-        Let A be the causal attention matrix (lower triangular after masking).
-
-        1. Symmetrize: A_sym = (A + A^T) / 2
-           - A_sym[i,j] captures bidirectional attention between i and j
-           - For i < j: A_sym[i,j] = A[j,i] / 2 (j attends to i)
-           - For i > j: A_sym[i,j] = A[i,j] / 2 (i attends to j)
-
-        2. Row-normalize: Q_bi = A_sym / rowsum(A_sym)
-           - Creates proper stochastic transition matrix
-           - Each row sums to 1 (probability distribution)
-
-        3. Neumann series: N = I + γQ + γ²Q² + ... + γ^k Q^k
-           - Computes discounted expected visits
-           - γ < 1 ensures convergence and favors direct connections
-
-        4. QI = N[query, :] (expected visits from query)
-           HI = mean(N, dim=0) (average visits from all positions)
-
-        Args:
-            attention: Causal attention matrix [seq_len, seq_len]
-            query_idx: Query position (typically seq_len - 1)
-            sink_size: Number of sink tokens (absorbing states)
-            num_iterations: Neumann series iterations (k)
-            temperature: Attention sharpening (lower = sharper)
-            gamma: Discount factor for multi-hop paths (0.9 recommended)
-
-        Returns:
-            Tuple of (qi_scores, hi_scores, qi_raw_max, hi_raw_max)
-        """
-        n = attention.shape[0]
-        device = attention.device
-        dtype = torch.float32
-
-        # Handle edge cases
-        if n <= sink_size:
-            uniform = torch.ones(n, device=device, dtype=dtype) / n
-            return uniform, uniform, 1.0, 1.0
-
-        # =====================================================================
-        # STEP 1: Apply temperature scaling (optional sharpening)
-        # =====================================================================
-        if temperature != 1.0 and temperature > 0:
-            attn_scaled = attention ** (1.0 / temperature)
-        else:
-            attn_scaled = attention.clone()
-
-        # =====================================================================
-        # STEP 2: Symmetrize attention matrix
-        # A_sym = (A_forward + A_backward) / 2
-        # This models bidirectional information flow
-        # =====================================================================
-        A_sym = (attn_scaled + attn_scaled.t()) / 2.0
-
-        # =====================================================================
-        # STEP 3: Extract transient submatrix (exclude sink tokens)
-        # =====================================================================
-        n_transient = n - sink_size
-        A_trans = A_sym[sink_size:, sink_size:].contiguous()  # [n_transient, n_transient]
-
-        # =====================================================================
-        # STEP 4: Row-normalize to get stochastic transition matrix Q_bi
-        # =====================================================================
-        row_sums = A_trans.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        Q_bi = A_trans / row_sums  # [n_transient, n_transient]
-
-        # =====================================================================
-        # STEP 5: Query position in transient space
-        # =====================================================================
-        query_transient_idx = query_idx - sink_size
-        if query_transient_idx < 0:
-            uniform = torch.ones(n, device=device, dtype=dtype) / n
-            return uniform, uniform, 1.0, 1.0
-
-        # =====================================================================
-        # STEP 6: Neumann series for QI and HI
-        # QI: Start from one-hot at query position
-        # HI: Start from uniform distribution (average importance)
-        #
-        # Iterate: result = I + γQ + γ²Q² + ...
-        # Using: v_{k+1} = γ * Q^T @ v_k (for row of N)
-        # =====================================================================
-
-        # Initialize QI: one-hot at query
-        v_qi = torch.zeros(n_transient, device=device, dtype=dtype)
-        v_qi[query_transient_idx] = 1.0
-        result_qi = v_qi.clone()
-
-        # Initialize HI: uniform (average over all starting points)
-        v_hi = torch.ones(n_transient, device=device, dtype=dtype) / n_transient
-        result_hi = v_hi.clone()
-
-        # Iterate Neumann series with discount factor gamma
-        # result = I + γQ + γ²Q² + ... (discounted multi-hop paths)
-        for k in range(num_iterations):
-            # For row q of N = I + γQ + γ²Q² + ..., we compute:
-            # (N)[q,:] = e_q + γ * e_q @ Q + γ² * e_q @ Q² + ...
-            # Iteratively: v_{k+1} = γ * Q^T @ v_k (transpose for row access)
-            v_qi = gamma * torch.mv(Q_bi.t(), v_qi)
-            v_hi = gamma * torch.mv(Q_bi.t(), v_hi)
-
-            result_qi = result_qi + v_qi
-            result_hi = result_hi + v_hi
-
-            # Early stopping if converged
-            if v_qi.abs().max().item() < 1e-8 and v_hi.abs().max().item() < 1e-8:
-                break
-
-        # =====================================================================
-        # STEP 7: Map back to full sequence
-        # =====================================================================
-        qi_scores = torch.zeros(n, device=device, dtype=dtype)
-        qi_scores[sink_size:] = result_qi
-        qi_scores[:sink_size] = result_qi.mean() * 0.1  # Small score for sink
-
-        hi_scores = torch.zeros(n, device=device, dtype=dtype)
-        hi_scores[sink_size:] = result_hi
-        hi_scores[:sink_size] = result_hi.mean() * 0.1  # Small score for sink
-
-        # =====================================================================
-        # STEP 8: Capture raw max BEFORE normalization (for diagnostics)
-        # =====================================================================
-        qi_raw_max = qi_scores.max().item()
-        hi_raw_max = hi_scores.max().item()
-
-        # =====================================================================
-        # STEP 9: Normalize to [0, 1] range
-        # =====================================================================
-        qi_max = qi_scores.max()
-        if qi_max > 0:
-            qi_scores = qi_scores / qi_max
-
-        hi_max = hi_scores.max()
-        if hi_max > 0:
-            hi_scores = hi_scores / hi_max
-
-        return qi_scores, hi_scores, qi_raw_max, hi_raw_max
+        return qi_scores, hi_scores
 
     def _compute_per_head_markov_importance(
         self,
@@ -2434,9 +2232,7 @@ class CircuitKVCluster():
             head_chunk_size: Number of heads to process in parallel (memory vs speed)
 
         Returns:
-            Tuple of (qi_per_head, hi_per_head, qi_raw_max, hi_raw_max)
-            - qi_per_head, hi_per_head: each [num_heads, seq_len] (normalized)
-            - qi_raw_max, hi_raw_max: float max values BEFORE normalization
+            Tuple of (qi_per_head, hi_per_head), each [num_heads, seq_len]
         """
         # Average over batch dimension, keep heads separate
         # attn_weights_per_head: [bsz, num_heads, window_size, seq_len]
@@ -2444,64 +2240,50 @@ class CircuitKVCluster():
         num_heads, window_size, seq_len = attn.shape
         device = attn.device
 
+        # Build full attention matrix from window attention
+        # We need [num_heads, seq_len, seq_len] but only have window
+        # Reconstruct causal attention: each position attends to previous positions
+        # For positions beyond window, attention is approximated from last window row
+
         # Handle edge cases
         if seq_len <= sink_size:
             uniform = torch.ones(num_heads, seq_len, device=device) / seq_len
-            return uniform, uniform.clone(), 1.0, 1.0
+            return uniform, uniform.clone()
 
         n_transient = seq_len - sink_size
         query_transient_idx = query_idx - sink_size
         if query_transient_idx < 0:
             uniform = torch.ones(num_heads, seq_len, device=device) / seq_len
-            return uniform, uniform.clone(), 1.0, 1.0
+            return uniform, uniform.clone()
 
         # Initialize output tensors
         qi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
         hi_per_head = torch.zeros(num_heads, seq_len, device=device, dtype=torch.float32)
-
-        # Track raw max values across all chunks (before normalization)
-        global_qi_raw_max = 0.0
-        global_hi_raw_max = 0.0
 
         # Process heads in chunks for memory efficiency
         for chunk_start in range(0, num_heads, head_chunk_size):
             chunk_end = min(chunk_start + head_chunk_size, num_heads)
             chunk_size = chunk_end - chunk_start
 
-            # Build full attention matrix for this chunk of heads
-            # full_attn_chunk: [chunk_size, seq_len, seq_len]
-            # We place window attention in the LAST window_size rows (where we have data)
-            full_attn_chunk = torch.zeros(chunk_size, seq_len, seq_len, device=device, dtype=torch.float32)
+            # Get attention for this chunk of heads
+            # Use the last row of window (most recent query position's attention)
+            # This is [chunk_size, seq_len] - the attention distribution from query
+            attn_chunk = attn[chunk_start:chunk_end, -1, :]  # [chunk, seq_len]
 
-            # Get window attention for this chunk: [chunk_size, window_size, seq_len]
-            window_attn = attn[chunk_start:chunk_end, :, :]
-
-            # Place window attention in the last window_size rows
-            # These are the rows for positions [seq_len - window_size, ..., seq_len - 1]
-            actual_window = min(window_size, seq_len)
-            full_attn_chunk[:, -actual_window:, :] = window_attn[:, -actual_window:, :]
+            # Build transition matrix P from attention (row-stochastic)
+            # Each row sums to 1 (attention is already softmaxed)
+            # P[i, j] = probability of transitioning from i to j
+            # For causal attention, we approximate P using the query's attention pattern
+            # replicated for all positions (simplification that works empirically)
+            P_chunk = attn_chunk.unsqueeze(1).expand(-1, seq_len, -1).clone()  # [chunk, seq, seq]
 
             # Make it properly causal: zero out future positions
             causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
-            full_attn_chunk.masked_fill_(causal_mask.unsqueeze(0), 0)
+            P_chunk.masked_fill_(causal_mask.unsqueeze(0), 0)
 
-            # Normalize rows to get transition matrix P
-            # Rows with all zeros (outside window) will get uniform distribution
-            row_sums = full_attn_chunk.sum(dim=-1, keepdim=True)
-
-            # Vectorized: create uniform attention for non-window positions
-            # Row i (for i > 0) gets value 1/i for positions j < i
-            non_window_len = seq_len - actual_window
-            if non_window_len > 1:
-                row_idx = torch.arange(non_window_len, device=device).unsqueeze(1)  # [non_window_len, 1]
-                col_idx = torch.arange(non_window_len, device=device).unsqueeze(0)  # [1, non_window_len]
-                mask = (col_idx < row_idx).float()  # [non_window_len, non_window_len]
-                divisor = row_idx.float().clamp(min=1)  # Avoid div by zero for row 0
-                uniform_weights = mask / divisor  # [non_window_len, non_window_len]
-                full_attn_chunk[:, :non_window_len, :non_window_len] = uniform_weights
-
-            row_sums = full_attn_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            P_chunk = full_attn_chunk / row_sums
+            # Re-normalize rows to sum to 1
+            row_sums = P_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            P_chunk = P_chunk / row_sums
 
             # Extract Q (transient-to-transient transitions)
             Q_chunk = P_chunk[:, sink_size:, sink_size:].contiguous()  # [chunk, n_transient, n_transient]
@@ -2533,12 +2315,6 @@ class CircuitKVCluster():
             hi_full[:, sink_size:] = result_hi
             hi_full[:, :sink_size] = result_hi.sum(dim=-1, keepdim=True) * 0.01
 
-            # Capture raw max BEFORE normalization (for Layer Fairness debug)
-            chunk_qi_raw_max = qi_full.max().item()
-            chunk_hi_raw_max = hi_full.max().item()
-            global_qi_raw_max = max(global_qi_raw_max, chunk_qi_raw_max)
-            global_hi_raw_max = max(global_hi_raw_max, chunk_hi_raw_max)
-
             # Normalize each head's scores to [0, 1]
             qi_max = qi_full.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
             qi_full = qi_full / qi_max
@@ -2550,7 +2326,7 @@ class CircuitKVCluster():
             qi_per_head[chunk_start:chunk_end] = qi_full
             hi_per_head[chunk_start:chunk_end] = hi_full
 
-        return qi_per_head, hi_per_head, global_qi_raw_max, global_hi_raw_max
+        return qi_per_head, hi_per_head
 
     def _detect_instruction_anchors_heuristic(
         self,
@@ -2976,10 +2752,6 @@ class CircuitKVCluster():
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        # Layer Fairness Debug: Initialize raw score trackers
-        _raw_max_qi = 0.0
-        _raw_max_hi = 0.0
-
         mode = "Neumann" if self.use_neumann else "RandomWalk"
         if self.combination_mode == "union":
             comb = f"Union(QI:{self.qi_ratio:.0%},HI:{1-self.qi_ratio:.0%})"  # v5.0: Union selection (no DA)
@@ -3033,6 +2805,8 @@ class CircuitKVCluster():
         else:
             version = "v4.5.0"
             da_note = ", DA-weighted"
+        print(f"CircuitKV {version} ({mode}, k={self.neumann_iterations}, {comb}{da_note}, {evict_mode}{ablation_info}) budget={self.max_capacity_prompt}")
+
         # If sequence is shorter than budget, no eviction needed
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
@@ -3220,43 +2994,15 @@ class CircuitKVCluster():
             # - QI → late-position tokens (81% late) on paths FROM query
             # - HI → early-position tokens (67% early) that are global hubs
             # By taking union, we guarantee coverage from both perspectives.
-
-            # v6.13.0: Bidirectional Markov Chain - fixes early-position bias
-            use_bidirectional = getattr(self, 'use_bidirectional_markov', False)
-            if use_bidirectional:
-                bi_gamma = getattr(self, 'bidirectional_gamma', 0.9)
-                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_bidirectional_importance_scores(
-                    full_attn[:q_len, :q_len].contiguous(),
-                    current_idx,
-                    sink_size=self.sink_size,
-                    num_iterations=self.neumann_iterations,
-                    temperature=self.neumann_temperature,
-                    gamma=bi_gamma,
-                )
-            else:
-                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
-                    full_attn[:q_len, :q_len].contiguous(),
-                    current_idx,
-                    sink_size=self.sink_size,
-                    num_iterations=self.neumann_iterations,
-                    temperature=self.neumann_temperature,
-                    attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
-                    gamma=self.neumann_gamma,
-                )
-
-            # v6.14.0: Query-Distance Weighting - favor tokens near query
-            use_qdw = getattr(self, 'use_query_distance_weight', False)
-            if use_qdw:
-                qdw_temp = getattr(self, 'query_distance_temp', 1000.0)
-                positions = torch.arange(q_len, device=qi_scores.device, dtype=qi_scores.dtype)
-                # Distance from query (query is at current_idx = q_len - 1)
-                distance = (current_idx - positions).float()
-                # Exponential decay: closer to query = higher weight
-                # weight[query_pos] = 1.0, weight decays as we go earlier
-                distance_weight = torch.exp(-distance / qdw_temp)
-                # Apply to both QI and HI
-                qi_scores = qi_scores * distance_weight
-                hi_scores = hi_scores * distance_weight
+            qi_scores, hi_scores = self._compute_dual_importance_scores(
+                full_attn[:q_len, :q_len].contiguous(),
+                current_idx,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                temperature=self.neumann_temperature,
+                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                gamma=self.neumann_gamma,
+            )
 
             # Store QI and HI for union selection (called in STEP 3)
             self._qi_scores_for_union = qi_scores
@@ -3265,26 +3011,7 @@ class CircuitKVCluster():
             # For compatibility with scoring path, use MAX(rank(QI), rank(HI))
             # This is only used for debug logging, not for selection
             qi_rank = self._rank_normalize(qi_scores)
-
-            # v6.12.0/v6.12.1: HI Signal Gating/Scaling - handle noisy HI in deep layers
-            hi_scale_by_max = getattr(self, 'hi_scale_by_max', False)
-            hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
-            if hi_scale_by_max:
-                # v6.12.1: Soft scaling - scale rank by layer's raw max
-                # Automatically dampens noisy layers without threshold tuning
-                hi_rank = self._rank_normalize(hi_scores) * _raw_max_hi
-                if getattr(self, 'hi_log_head_stats', False):
-                    print(f"[HI-SCALE] layer={getattr(self, '_layer_idx', '?')} "
-                          f"scaled by max={_raw_max_hi:.4f}")
-            elif hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
-                # v6.12.0: Hard gating - silence layer entirely
-                hi_rank = torch.zeros_like(hi_scores)
-                if getattr(self, 'hi_log_head_stats', False):
-                    print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
-                          f"silenced (max={_raw_max_hi:.4f} < {hi_signal_threshold})")
-            else:
-                hi_rank = self._rank_normalize(hi_scores)
-
+            hi_rank = self._rank_normalize(hi_scores)
             combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging
@@ -3298,39 +3025,15 @@ class CircuitKVCluster():
             # v5.1.0: Union Selection WITH DA weighting
             # Same as union but multiply by Direct Attention to preserve query relevance.
             # This keeps the attention grounding that helped v4.5.0 on TREC/classification.
-
-            # v6.13.0: Bidirectional Markov Chain - fixes early-position bias
-            use_bidirectional = getattr(self, 'use_bidirectional_markov', False)
-            if use_bidirectional:
-                bi_gamma = getattr(self, 'bidirectional_gamma', 0.9)
-                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_bidirectional_importance_scores(
-                    full_attn[:q_len, :q_len].contiguous(),
-                    current_idx,
-                    sink_size=self.sink_size,
-                    num_iterations=self.neumann_iterations,
-                    temperature=self.neumann_temperature,
-                    gamma=bi_gamma,
-                )
-            else:
-                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
-                    full_attn[:q_len, :q_len].contiguous(),
-                    current_idx,
-                    sink_size=self.sink_size,
-                    num_iterations=self.neumann_iterations,
-                    temperature=self.neumann_temperature,
-                    attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
-                    gamma=self.neumann_gamma,
-                )
-
-            # v6.14.0: Query-Distance Weighting - favor tokens near query
-            use_qdw = getattr(self, 'use_query_distance_weight', False)
-            if use_qdw:
-                qdw_temp = getattr(self, 'query_distance_temp', 1000.0)
-                positions = torch.arange(q_len, device=qi_scores.device, dtype=qi_scores.dtype)
-                distance = (current_idx - positions).float()
-                distance_weight = torch.exp(-distance / qdw_temp)
-                qi_scores = qi_scores * distance_weight
-                hi_scores = hi_scores * distance_weight
+            qi_scores, hi_scores = self._compute_dual_importance_scores(
+                full_attn[:q_len, :q_len].contiguous(),
+                current_idx,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                temperature=self.neumann_temperature,
+                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                gamma=self.neumann_gamma,
+            )
 
             # Compute Direct Attention (DA) - what the window actually attends to
             da_scores = full_attn[-self.window_size:, :q_len].sum(dim=0)
@@ -3346,25 +3049,7 @@ class CircuitKVCluster():
 
             # For compatibility with scoring path
             qi_rank = self._rank_normalize(qi_weighted)
-
-            # v6.12.0/v6.12.1: HI Signal Gating/Scaling - handle noisy HI in deep layers
-            hi_scale_by_max = getattr(self, 'hi_scale_by_max', False)
-            hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
-            if hi_scale_by_max:
-                # v6.12.1: Soft scaling - scale rank by layer's raw max
-                hi_rank = self._rank_normalize(hi_weighted) * _raw_max_hi
-                if getattr(self, 'hi_log_head_stats', False):
-                    print(f"[HI-SCALE] layer={getattr(self, '_layer_idx', '?')} "
-                          f"scaled by max={_raw_max_hi:.4f}")
-            elif hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
-                # v6.12.0: Hard gating - silence layer entirely
-                hi_rank = torch.zeros_like(hi_weighted)
-                if getattr(self, 'hi_log_head_stats', False):
-                    print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
-                          f"silenced (max={_raw_max_hi:.4f} < {hi_signal_threshold})")
-            else:
-                hi_rank = self._rank_normalize(hi_weighted)
-
+            hi_rank = self._rank_normalize(hi_weighted)
             combined_scores = torch.maximum(qi_rank, hi_rank)
 
             # Store for debugging
@@ -3379,40 +3064,15 @@ class CircuitKVCluster():
             # QI and HI from fundamental matrix N, combined via MAX(rank)
             # Analysis shows DA weighting HURTS performance: 42.24 (with DA) vs 42.42 (without DA)
             # DA hurts multi-hop QA (multifieldqa -1.06, narrativeqa -0.89) and retrieval tasks
-
-            # v6.13.0: Bidirectional Markov Chain - fixes early-position bias
-            use_bidirectional = getattr(self, 'use_bidirectional_markov', False)
-            if use_bidirectional:
-                bi_gamma = getattr(self, 'bidirectional_gamma', 0.9)
-                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_bidirectional_importance_scores(
-                    full_attn[:q_len, :q_len].contiguous(),
-                    current_idx,
-                    sink_size=self.sink_size,
-                    num_iterations=self.neumann_iterations,
-                    temperature=self.neumann_temperature,
-                    gamma=bi_gamma,
-                )
-            else:
-                qi_scores, hi_scores, _raw_max_qi, _raw_max_hi = self._compute_dual_importance_scores(
-                    full_attn[:q_len, :q_len].contiguous(),
-                    current_idx,
-                    sink_size=self.sink_size,
-                    num_iterations=self.neumann_iterations,
-                    temperature=self.neumann_temperature,
-                    attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
-                    gamma=self.neumann_gamma,
-                )
-            # _raw_max_qi and _raw_max_hi are now returned from the function (pre-normalization)
-
-            # v6.14.0: Query-Distance Weighting - favor tokens near query
-            use_qdw = getattr(self, 'use_query_distance_weight', False)
-            if use_qdw:
-                qdw_temp = getattr(self, 'query_distance_temp', 1000.0)
-                positions = torch.arange(q_len, device=qi_scores.device, dtype=qi_scores.dtype)
-                distance = (current_idx - positions).float()
-                distance_weight = torch.exp(-distance / qdw_temp)
-                qi_scores = qi_scores * distance_weight
-                hi_scores = hi_scores * distance_weight
+            qi_scores, hi_scores = self._compute_dual_importance_scores(
+                full_attn[:q_len, :q_len].contiguous(),
+                current_idx,
+                sink_size=self.sink_size,
+                num_iterations=self.neumann_iterations,
+                temperature=self.neumann_temperature,
+                attention_for_hi=full_attn_hi[:q_len, :q_len].contiguous() if full_attn_hi is not None else None,
+                gamma=self.neumann_gamma,
+            )
 
             # v6.2.0: Asymmetric Gaussian Smoothing for Frequency Separation
             #
@@ -3461,29 +3121,8 @@ class CircuitKVCluster():
 
             # v6.0.0: Direct rank normalization WITHOUT DA weighting
             # Pure Markov chain signals preserve transitive reasoning paths
-
             qi_rank = self._rank_normalize(qi_scores)
-
-            # v6.12.0/v6.12.1: HI Signal Gating/Scaling - handle noisy HI in deep layers
-            # If raw HI max is below threshold, the HI scores are just noise that would
-            # be stretched to [0,1] by rank normalization, evicting valid QI signals.
-            hi_scale_by_max = getattr(self, 'hi_scale_by_max', False)
-            hi_signal_threshold = getattr(self, 'hi_signal_threshold', 0.0)
-            if hi_scale_by_max:
-                # v6.12.1: Soft scaling - scale rank by layer's raw max
-                # Automatically dampens noisy layers without threshold tuning
-                hi_rank = self._rank_normalize(hi_scores) * _raw_max_hi
-                if getattr(self, 'hi_log_head_stats', False):
-                    print(f"[HI-SCALE] layer={getattr(self, '_layer_idx', '?')} "
-                          f"scaled by max={_raw_max_hi:.4f}")
-            elif hi_signal_threshold > 0 and _raw_max_hi < hi_signal_threshold:
-                # v6.12.0: Hard gating - silence layer entirely
-                hi_rank = torch.zeros_like(hi_scores)
-                if getattr(self, 'hi_log_head_stats', False):
-                    print(f"[HI-GATE] layer={getattr(self, '_layer_idx', '?')} "
-                          f"silenced (max={_raw_max_hi:.4f} < {hi_signal_threshold})")
-            else:
-                hi_rank = self._rank_normalize(hi_scores)
+            hi_rank = self._rank_normalize(hi_scores)
 
             # v6.10.0: Rank normalize BI if enabled
             bi_rank = None
@@ -3603,27 +3242,30 @@ class CircuitKVCluster():
 
         if self.per_head_eviction:
             # =====================================================================
-            # v7.0.0: PER-HEAD MARKOV IMPORTANCE (FIXED)
-            # Each head computes its own QI/HI using Neumann series on its own
-            # attention pattern, then selects tokens via MAX(QI, HI).
+            # v7.0.0: PER-HEAD MARKOV IMPORTANCE
+            # Principled per-head token selection using Markov chain analysis.
             #
-            # Key fix: Build full attention matrix per head using ALL window rows,
-            # not just the last row. For positions outside window, use uniform
-            # attention over previous positions.
+            # Key insight: Different attention heads specialize in different patterns.
+            # Global QI/HI forces all heads to keep the same tokens, destroying
+            # head specialization. Per-head Markov importance computes QI and HI
+            # independently for each head using its own attention pattern.
+            #
+            # This is scientifically principled (same Markov chain theory) while
+            # respecting that heads have different roles and should keep different
+            # tokens in their KV cache.
             # =====================================================================
 
             non_window_len = q_len - self.window_size
 
             # Compute per-head Markov importance scores
             # qi_per_head, hi_per_head: [num_heads, seq_len]
-            # _raw_max_qi, _raw_max_hi: raw max values BEFORE normalization
-            qi_per_head, hi_per_head, _raw_max_qi, _raw_max_hi = self._compute_per_head_markov_importance(
+            qi_per_head, hi_per_head = self._compute_per_head_markov_importance(
                 attn_weights_per_head,
                 query_idx=q_len - 1,
                 sink_size=self.sink_size,
                 num_iterations=self.neumann_iterations,
                 gamma=self.neumann_gamma,
-                head_chunk_size=getattr(self, 'head_chunk_size', 4),
+                head_chunk_size=getattr(self, 'head_chunk_size', 8),
             )
 
             # Truncate to non-window portion
@@ -3637,25 +3279,37 @@ class CircuitKVCluster():
                 qi_rank_per_head[h] = self._rank_normalize(qi_per_head[h])
                 hi_rank_per_head[h] = self._rank_normalize(hi_per_head[h])
 
-            # Per-head MAX(QI, HI)
+            # v7.0.0: Per-head MAX(QI, HI) - same DIS logic but per head
+            # Each head keeps tokens important to EITHER its QI or HI
             if self.ablate_hi and not self.ablate_qi:
+                # QI-ONLY mode
                 per_head_scores = qi_rank_per_head
             elif not self.ablate_hi and self.ablate_qi:
+                # HI-ONLY mode
                 per_head_scores = hi_rank_per_head
             elif self.ablate_hi and self.ablate_qi:
-                # Both ablated: pure per-head H2O (SnapKV-style)
-                h2o_per_head = attn_weights_per_head[:, :, :, :non_window_len].sum(dim=2)
+                # Both ablated: fallback to H2O per-head (SnapKV-style)
+                h2o_per_head = attn_weights_per_head[:, :, :, :-self.window_size].sum(dim=2)
                 h2o_per_head = h2o_per_head.mean(dim=0)  # [num_heads, non_window_len]
                 per_head_scores = torch.zeros_like(h2o_per_head)
                 for h in range(num_heads):
                     per_head_scores[h] = self._rank_normalize(h2o_per_head[h])
             else:
-                # Default: MAX(QI, HI) per head
+                # Default: MAX(QI, HI) per head - the principled approach
                 per_head_scores = torch.maximum(qi_rank_per_head, hi_rank_per_head)
 
             # Apply Gaussian smoothing for spatial coherence (optional)
+            # Use the existing kernel settings
             smooth_kernel = max(self.qi_kernel_size, self.hi_kernel_size)
             if smooth_kernel > 1 and self.use_gaussian:
+                # Apply Gaussian smoothing per head
+                per_head_scores_smooth = self._apply_smoothing(
+                    per_head_scores.view(-1),  # Flatten
+                    smooth_kernel,
+                    use_gaussian=True,
+                    sigma=self.gaussian_sigma
+                ).view(num_heads, -1)  # Reshape back
+                # Actually, need to smooth each head separately
                 per_head_scores_smooth = torch.zeros_like(per_head_scores)
                 for h in range(num_heads):
                     per_head_scores_smooth[h] = self._apply_smoothing(
@@ -3714,13 +3368,6 @@ class CircuitKVCluster():
             key_states = torch.cat([k_past_compress, k_cur], dim=2)
             value_states = torch.cat([v_past_compress, v_cur], dim=2)
 
-            # Layer Fairness Diagnostic for per-head mode
-            if self.debug:
-                layer_idx = _circuitkv_debug_next_layer()
-                # For per-head, count average middle tokens kept across heads
-                middle_kept = num_select if middle_len > 0 and non_window_budget > 0 else 0
-                _record_layer_fairness(layer_idx, middle_kept, _raw_max_qi, _raw_max_hi, 0.0)
-
         else:
             # =====================================================================
             # Original shared eviction (same tokens for all heads)
@@ -3743,26 +3390,14 @@ class CircuitKVCluster():
                     q_len
                 )
 
-            # Layer Fairness Diagnostic: record per-layer stats and detailed debug
+            # Debug logging
             if self.debug:
-                layer_idx = _circuitkv_debug_next_layer()
-                # Count only MIDDLE tokens (between sink and window) for Layer Fairness test
-                kept_positions = keep_mask.nonzero(as_tuple=True)[0].cpu().tolist()
-                middle_kept = sum(1 for p in kept_positions if self.sink_size <= p < q_len - self.window_size)
-                # Use raw max scores captured before smoothing/normalization
-                raw_max_combined = scores.max().item() if scores is not None else 0.0
-                _record_layer_fairness(layer_idx, middle_kept, _raw_max_qi, _raw_max_hi, raw_max_combined)
-
-                # Comprehensive diagnostic logging with SnapKV comparison
+                # Compute H2O scores (column sums) for comparison
                 h2o_scores_debug = full_attn.sum(dim=0)
+                # Pass HI and QI if available (from DIS mode)
                 qi_debug = locals().get('qi_scores', None)
                 hi_debug = locals().get('hi_scores', None)
-                self._log_debug(
-                    q_len, h2o_scores_debug, scores, keep_mask, full_attn,
-                    qi_debug, hi_debug, attn_weights_per_head, layer_idx,
-                    qi_raw_max=_raw_max_qi,
-                    hi_raw_max=_raw_max_hi,
-                )
+                self._log_debug(q_len, h2o_scores_debug, scores, keep_mask, full_attn, qi_debug, hi_debug)
 
             # Apply eviction - shared across all heads
             # Get indices of tokens to keep (excluding local window which is appended)
@@ -4259,14 +3894,4 @@ def init_circuitkv(self):
         # v6.10.0: Bridge Importance via A²
         use_bridge_importance=getattr(self.config, 'use_bridge_importance', False),
         bi_kernel_size=getattr(self.config, 'bi_kernel_size', 5),
-        # v6.12.0: HI Signal Gating
-        hi_signal_threshold=getattr(self.config, 'hi_signal_threshold', 0.0),
-        # v6.12.1: HI Soft Scaling
-        hi_scale_by_max=getattr(self.config, 'hi_scale_by_max', False),
-        # v6.13.0: Bidirectional Markov Chain
-        use_bidirectional_markov=getattr(self.config, 'use_bidirectional_markov', False),
-        bidirectional_gamma=getattr(self.config, 'bidirectional_gamma', 0.9),
-        # v6.14.0: Query-Distance Weighting
-        use_query_distance_weight=getattr(self.config, 'use_query_distance_weight', False),
-        query_distance_temp=getattr(self.config, 'query_distance_temp', 1000.0),
     )
