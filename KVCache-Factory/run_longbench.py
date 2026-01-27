@@ -344,6 +344,7 @@ def main(args):
                 # v7.0.0: Per-head Markov importance
                 model.model.layers[i].self_attn.config.per_head_eviction = args.per_head_eviction
                 model.model.layers[i].self_attn.config.head_chunk_size = args.head_chunk_size
+                model.model.layers[i].self_attn.config.true_hub_hi = args.true_hub_hi
                 # v6.1.0: Smoothing kernel
                 model.model.layers[i].self_attn.config.smoothing_kernel = args.smoothing_kernel
                 # v6.2.0: Asymmetric Gaussian Smoothing
@@ -504,6 +505,8 @@ if __name__ == "__main__":
                         help="v7.0.0: Enable per-head Markov importance. Each head computes its own QI/HI using Neumann series on its attention pattern, then selects tokens via MAX(QI,HI). Respects head specialization unlike global selection.")
     parser.add_argument("--head_chunk_size", type=int, default=8,
                         help="v7.0.0: Number of heads to process in parallel for per-head Markov importance. Lower values reduce memory usage for long sequences (default: 8)")
+    parser.add_argument("--true_hub_hi", action="store_true",
+                        help="v7.3.0: Use true hub detection for HI (column sums of window attention) instead of position-based weighting. Removes position bias that hurts retrieval tasks.")
     # v6.1.0: Smoothing kernel
     parser.add_argument("--smoothing_kernel", type=int, default=0, help="Smoothing kernel size (0=disabled, 5=recommended). Preserves phrase structure by promoting neighbors of important tokens.")
     # v6.2.0: Asymmetric Gaussian Smoothing

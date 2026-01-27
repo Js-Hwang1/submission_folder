@@ -1298,6 +1298,7 @@ class CircuitKVCluster():
         # v7.0.0: Per-head Markov importance (principled per-head selection)
         per_head_eviction: bool = False,  # If True, each head computes its own QI/HI
         head_chunk_size: int = 8,  # Number of heads to process in parallel (memory vs speed)
+        true_hub_hi: bool = False,  # v7.3.0: Use column sums for HI (true hub detection, no position bias)
         # v6.1.0: Smoothing Kernel for phrase preservation
         smoothing_kernel: int = 0,  # Kernel size for score smoothing (0=disabled, 5=recommended)
         # v6.2.0: Asymmetric Gaussian Smoothing
@@ -1357,6 +1358,7 @@ class CircuitKVCluster():
         # v7.0.0: Per-head Markov importance
         self.per_head_eviction = per_head_eviction
         self.head_chunk_size = head_chunk_size
+        self.true_hub_hi = true_hub_hi
         # v6.1.0: Smoothing Kernel
         self.smoothing_kernel = smoothing_kernel
         # v6.2.0: Asymmetric Gaussian Smoothing
@@ -2203,6 +2205,7 @@ class CircuitKVCluster():
         num_iterations: int = 10,
         gamma: float = 1.0,
         head_chunk_size: int = 8,
+        true_hub_hi: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         v7.0.0: Per-Head Markov Importance - Principled Per-Head Token Selection.
@@ -2230,6 +2233,8 @@ class CircuitKVCluster():
             num_iterations: Neumann series iterations
             gamma: Spectral decay factor (1.0 = no decay)
             head_chunk_size: Number of heads to process in parallel (memory vs speed)
+            true_hub_hi: If True, use column sums of window attention for HI (true hub detection)
+                        instead of position-based weighting. Better for retrieval tasks.
 
         Returns:
             Tuple of (qi_per_head, hi_per_head), each [num_heads, seq_len]
@@ -2308,18 +2313,24 @@ class CircuitKVCluster():
             # Reverse cumsum to get sum_{j>k}(attn[j]/cumsum[j]) for each k
             qi_weights = torch.flip(torch.cumsum(torch.flip(weighted_attn, [-1]), dim=-1), [-1])
 
-            # Compute position weights for HI (reachability from uniform start)
-            # Positions earlier in sequence are reachable from more starting positions
-            position_idx = torch.arange(n_transient, device=device, dtype=torch.float32)
-            hi_weights = (n_transient - position_idx) / n_transient  # [n_transient]
-            hi_weights = hi_weights.unsqueeze(0)  # [1, n_transient]
-
-            # Apply Neumann-equivalent scoring
+            # Apply Neumann-equivalent scoring for QI
             # gamma factor for multi-hop decay
             effective_gamma = gamma ** (num_iterations / 2)  # Approximate multi-hop decay
-
             result_qi = attn_transient * qi_weights * effective_gamma + attn_transient
-            result_hi = attn_transient * hi_weights * effective_gamma + attn_transient
+
+            # Compute HI scores
+            if true_hub_hi:
+                # v7.3.0: True hub detection - column sums of window attention
+                # Positions that many window positions attend to are true hubs
+                # No position bias - fair treatment for facts anywhere in context
+                window_attn_chunk = attn[chunk_start:chunk_end, :, sink_size:]  # [chunk, window, n_transient]
+                result_hi = window_attn_chunk.sum(dim=1)  # [chunk, n_transient] - column sums
+            else:
+                # Original: Position-based weighting (earlier positions favored)
+                position_idx = torch.arange(n_transient, device=device, dtype=torch.float32)
+                hi_weights = (n_transient - position_idx) / n_transient  # [n_transient]
+                hi_weights = hi_weights.unsqueeze(0)  # [1, n_transient]
+                result_hi = attn_transient * hi_weights * effective_gamma + attn_transient
 
             # Map back to full sequence [chunk, seq_len]
             qi_full = torch.zeros(chunk_size, seq_len, device=device, dtype=torch.float32)
@@ -3281,6 +3292,7 @@ class CircuitKVCluster():
                 num_iterations=self.neumann_iterations,
                 gamma=self.neumann_gamma,
                 head_chunk_size=getattr(self, 'head_chunk_size', 8),
+                true_hub_hi=getattr(self, 'true_hub_hi', False),
             )
 
             # Truncate to non-window portion
@@ -3881,6 +3893,7 @@ def init_circuitkv(self):
         # v7.0.0: Per-head Markov importance
         per_head_eviction=self.config.per_head_eviction,
         head_chunk_size=self.config.head_chunk_size,
+        true_hub_hi=getattr(self.config, 'true_hub_hi', False),
         # v5.0.0: Union Selection
         qi_ratio=self.config.qi_ratio,
         # v6.1.0: Smoothing Kernel
