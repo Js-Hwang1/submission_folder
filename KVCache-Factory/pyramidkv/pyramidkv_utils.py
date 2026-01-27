@@ -2495,9 +2495,18 @@ class CircuitKVCluster():
             row_sums = full_attn_chunk.sum(dim=-1, keepdim=True)
             # For rows outside window, use uniform over previous positions
             zero_rows = (row_sums.squeeze(-1) < 1e-8)  # [chunk, seq_len]
-            for i in range(seq_len - actual_window):
-                if i > 0:  # Position 0 has no previous positions
-                    full_attn_chunk[:, i, :i] = 1.0 / i
+
+            # Vectorized: create uniform attention for non-window positions
+            # Row i (for i > 0) gets value 1/i for positions j < i
+            non_window_len = seq_len - actual_window
+            if non_window_len > 1:
+                row_idx = torch.arange(non_window_len, device=device).unsqueeze(1)  # [non_window_len, 1]
+                col_idx = torch.arange(non_window_len, device=device).unsqueeze(0)  # [1, non_window_len]
+                mask = (col_idx < row_idx).float()  # [non_window_len, non_window_len]
+                divisor = row_idx.float().clamp(min=1)  # Avoid div by zero for row 0
+                uniform_weights = mask / divisor  # [non_window_len, non_window_len]
+                full_attn_chunk[:, :non_window_len, :non_window_len] = uniform_weights
+
             row_sums = full_attn_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             P_chunk = full_attn_chunk / row_sums
 
