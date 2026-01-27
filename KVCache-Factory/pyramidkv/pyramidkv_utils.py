@@ -3910,6 +3910,9 @@ def init_circuitkv(self):
         neumann_iterations=self.config.neumann_iterations,
         neumann_temperature=self.config.neumann_temperature,
         neumann_gamma=getattr(self.config, 'neumann_gamma', 1.0),
+        # v7.6.0: Asymmetric gamma
+        qi_gamma=getattr(self.config, 'qi_gamma', None),
+        hi_gamma=getattr(self.config, 'hi_gamma', None),
         # v4.1.0: Combination tuning
         h2o_weight=self.config.h2o_weight,
         combination_mode=self.config.combination_mode,
